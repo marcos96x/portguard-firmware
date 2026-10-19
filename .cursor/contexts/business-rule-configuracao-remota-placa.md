@@ -29,7 +29,7 @@ Implementada em `script.cpp`.
 ## Ações `intertravamento` e fotocélulas
 - `action_data` (`extraiFlagDoActionData()`): `0`/`false` = desligar, `1`/`true` = ligar. Formato atual da API: texto `"0"` ou `"1"`. Aceita também número ou JSON (`{"value":0}`), normal ou escapado; com chave `value`, o valor é lido dela. Vazio, `null`, ausente ou outro valor = inválido, responde `failed`.
 - `intertravamento`: `defineIntertravamento()` altera `intertravamento_ativo` (ver `business-rule-intertravamento.md`).
-- `fotocelula_1` / `fotocelula_2` / `fotocelula_3` (formato atual da API, `action_data` `"0"`/`"1"`): portão vem do tipo da ação (`extraiPortaoFotocelula(tipo_acao, payload)`).
+- `fotocelula_1` / `fotocelula_2` / `fotocelula_3` e `fotocelula_port_3` (formato atual da API, `action_data` `"0"`/`"1"`): portão vem do número no tipo da ação (`extraiPortaoFotocelula(tipo_acao, payload)`). `fotocelula` sem número também aceita `"port":3` fora do `action_data`. `enabled` vale como `value`.
   - `fotocelula` (sem número, formato antigo) continua aceito: `{"port":N,"value":V}`; sem `port` = portão 1; `1`, `2` ou `3` = aquele portão; outro número = inválido, responde `failed`.
   - `defineAlimentacaoFotocelula(numero_portao, alimentar)` altera `fotocelula_portao_1_alimentada` (SAÍDA 4, canal 4 / bit 3), `fotocelula_portao_2_alimentada` (SAÍDA 5, canal 5 / bit 4) ou `fotocelula_portao_3_alimentada` (SAÍDA 6, canal 6 / bit 5). `0` desenergiza o relé e `1` energiza; as outras fotocélulas não mudam. A tarefa dos portões aplica em até 10 ms.
 - As flags são persistidas na Preferences (`salvaConfiguracaoPortoes()`, chaves `intertravamento`, `fotocelula` (portão 1), `fotocelula_2` (portão 2) e `fotocelula_3` (portão 3), namespace `portguard`) e carregadas no `setup()` (`carregaConfiguracaoPortoes()`, padrão `true`) antes de aplicar as saídas.
@@ -37,7 +37,8 @@ Implementada em `script.cpp`.
 - `processarAlteracaoFlagPortoes(queue_id, tipo_acao, payload)` trata intertravamento, fotocélulas e manutenção.
 
 ## Modo manutenção
-- Ações `set_maintenance` / `unset_maintenance` também passam por `processarAlteracaoFlagPortoes()`. Ver `business-rule-modo-manutencao.md`.
+- Ações `maintenance_port_1`, `maintenance_port_2` e `maintenance_port_3` (`action_data` `"0"` ou `"1"`) passam por `processarAlteracaoFlagPortoes()`. `set_maintenance` e `unset_maintenance` aplicam o estado a todos os portões da placa. Ver `business-rule-modo-manutencao.md`.
+- Fotocélula ou manutenção de um portão que a placa não tem responde `failed`.
 
 ## Testes
 - `teste_fila_api_formato_atual` (em `teste_completo()`): payloads reais do `/list` (id numérico, `fotocelula_2`, `down_siren`, `open_or_close_gate` com `"2"`) e a validade de 60 s das ações imediatas (recente, antiga, sem relógio, no futuro, sem `created_at`).

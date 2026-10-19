@@ -31,7 +31,8 @@
   SAÍDA 5 / canal 5 / bit 4 - fotocélula portão 2  (repouso HIGH)
   SAÍDA 6 / canal 6 / bit 5 - fotocélula portão 3  (repouso HIGH)
   SAÍDA 7 / canal 7 / bit 6 - sirene                (repouso LOW)
-  SAÍDA 8 / canal 8 / bit 7 - central de alarme, inverso da sirene (repouso HIGH)
+  SAÍDA 8 / canal 8 / bit 7 - central de alarme, inverso da sirene (repouso HIGH).
+                       Quando a sirene dispara, o relé 8 desenergiza e o contato abre.
 
   Campo continua no PCA9534 (8 entradas e 8 saídas). GPIO do ESP32-S3 fica no
   I2C, Ethernet, USB, RTC e RF433; não há borne direto sobrando para o portão 3.
@@ -59,10 +60,12 @@
 
   1. Comando na receptora do portão:
      - Motor do portão recebe pulso de 1 segundo.
-     - Com o portão fechado, libera janela de 3 segundos para abertura.
+     - Com o portão fechado, libera janela de 8 segundos para abertura.
+       Repique do sensor enquanto o relé do motor está atracado não gasta essa autorização.
      - Intertravamento (intertravamento_ativo): comando de abertura é
-       ignorado enquanto qualquer outro portão estiver aberto. Fechamento nunca
-       é bloqueado.
+       ignorado enquanto qualquer outro portão da placa estiver aberto.
+       Placa de 1 portão não intertrava. Placa de 2 portões só olha 1 e 2.
+       Portão em manutenção não entra na conta. Fechamento nunca é bloqueado.
 
   2. Sensor abre sem autorização:
      - Sirene contínua enquanto o portão estiver aberto.
@@ -106,10 +109,11 @@
        fotocelula (sem número) aceita {"port":N,"value":V} ou só 0/1 (portão 1).
      - Toda ação lida é respondida (completed/failed) para a fila andar; se a
        API continuar devolvendo uma ação já tratada, o status é reenviado.
-     - set_maintenance / unset_maintenance: liga / desliga o modo manutenção
-       (persistido). Em manutenção a sirene nunca toca, abertura sem
-       autorização não arma alarme e nenhum evento/log (nem heartbeat) é
-       enviado para a API; a fila continua sendo consultada e executada.
+     - maintenance_port_1 / _2 / _3: action_data 0 tira e 1 coloca aquele portão
+       em manutenção (persistido). set_maintenance / unset_maintenance aplicam
+       o mesmo a todos os portões que a placa tem. Em manutenção aquele portão
+       não toca sirene, não arma alarme e não envia evento. Os outros portões
+       e o heartbeat seguem normais. A fila continua sendo consultada.
   ============================================================
 */
 
@@ -128,6 +132,12 @@
 // ============================================================
 
 const String plaque_serial = "1port-7PWV7S9536CF";
+
+// Quantidade de portões ligados nesta placa. O serial (1port-...) só identifica a placa na API
+// e não pode reduzir isso: com 1 a entrada 6 e a saída 3 ficam mortas.
+// Placa de 1 portão usa 1; placa de 2 portões usa 2; esta placa está cabeada para 3.
+const uint8_t quantidade_portoes_configurada = 3;
+uint8_t quantidade_portoes_placa = quantidade_portoes_configurada;
 const String api_url = "https://portguard.milesmp.com.br/api/v1";
 const String api_token = "bananapratadoisreaisoquilo";
 
@@ -261,7 +271,7 @@ const uint8_t byte_entradas_repouso_seguro_pca9534 = 0x15;
 // ============================================================
 
 const unsigned long tempo_pulso_motor_ms = 1000;
-const unsigned long janela_comando_autorizado_ms = 3000;
+const unsigned long janela_comando_autorizado_ms = 8000;
 const unsigned long tempo_sirene_apos_fechamento_abertura_indevida_ms = 120000;
 const unsigned long tempo_maximo_portao_aberto_ms = 60000;
 const unsigned long tempo_sirene_ligada_alerta_ms = 1000;
@@ -332,9 +342,11 @@ volatile bool fotocelula_portao_3_alimentada = true;
 // Quando true, comando de abertura de um portão é ignorado enquanto o outro estiver aberto
 // (comandos de fechamento nunca são bloqueados).
 volatile bool intertravamento_ativo = true;
-// Quando true (set_maintenance), a sirene nunca toca e nenhum evento/log é enviado para a API.
-// A fila de ações continua sendo consultada e executada normalmente.
-volatile bool modo_manutencao_ativo = false;
+// Manutenção é por portão (maintenance_port_1, _2 e _3). O portão em manutenção não toca sirene,
+// não arma alarme, não envia evento e não participa do intertravamento. Os outros seguem normais.
+volatile bool manutencao_portao_1 = false;
+volatile bool manutencao_portao_2 = false;
+volatile bool manutencao_portao_3 = false;
 
 uint8_t ultimo_byte_entradas_pca9534 = byte_entradas_repouso_seguro_pca9534;
 bool leitura_entradas_pca9534_valida = false;
@@ -757,10 +769,55 @@ uint8_t montaByteSaidasPca9534(const NiveisSaidas &niveis) {
   if (niveis.fotocelula_portao_3 == HIGH) {
     byte_saidas |= (uint8_t)(1 << (canal_saida_fotocelula_portao_3 - 1));
   }
-  if (niveis.central_alarme == HIGH) {
+  // Relé 8 é o inverso da sirene. Sirene disparada (bit 6 em 1) deixa o relé 8 desenergizado
+  // (bit 7 em 0): o contato da central abre. Em repouso o relé 8 fica energizado (contato fechado).
+  if (niveis.sirene != HIGH) {
     byte_saidas |= (uint8_t)(1 << (canal_saida_central_alarme - 1));
   }
   return byte_saidas;
+}
+
+// Só um rótulo curto ("1port", "2port", "3port") define a quantidade. O serial da API,
+// por exemplo "1port-7PWV7S9536CF", identifica a placa e continua valendo 3 portões.
+uint8_t quantidadePortoesDoSerial(const String &serial) {
+  if (serial == "1port" || serial == "1port-") {
+    return 1;
+  }
+  if (serial == "2port" || serial == "2port-") {
+    return 2;
+  }
+  if (serial == "3port" || serial == "3port-") {
+    return 3;
+  }
+  return 3;
+}
+
+// Diz se este número de portão existe nesta placa.
+bool portaoExisteNaPlaca(uint8_t numero_portao) {
+  return numero_portao >= 1 && numero_portao <= quantidade_portoes_placa;
+}
+
+// Diz se o portão está em manutenção. Portão que a placa não tem nunca está em manutenção.
+bool portaoEmManutencao(uint8_t numero_portao) {
+  if (!portaoExisteNaPlaca(numero_portao)) {
+    return false;
+  }
+  if (numero_portao == 2) {
+    return manutencao_portao_2;
+  }
+  if (numero_portao == 3) {
+    return manutencao_portao_3;
+  }
+  return manutencao_portao_1;
+}
+
+// Diz se o sensor deste portão deve impedir a abertura de outro.
+// Placa de 1 portão não intertrava. Portão inexistente, em manutenção ou fechado não bloqueia.
+bool sensorBloqueiaIntertravamento(uint8_t numero_portao, bool sensor_fechado) {
+  if (quantidade_portoes_placa < 2 || !portaoExisteNaPlaca(numero_portao) || portaoEmManutencao(numero_portao)) {
+    return false;
+  }
+  return !sensor_fechado;
 }
 
 // Mantém o PCA9534 de entradas em alta impedância, com o latch em alto.
@@ -879,8 +936,8 @@ void registraEventoPortao(EstadoPortao &portao, const char *tipo_evento) {
     return;
   }
 
-  if (modo_manutencao_ativo) {
-    print_log("Modo manutencao: evento " + String(tipo_evento) + " do portao " + String(portao.numero_portao) +
+  if (portaoEmManutencao(portao.numero_portao)) {
+    print_log("Portao " + String(portao.numero_portao) + " em manutencao: evento " + String(tipo_evento) +
               " nao sera enviado para a API.");
     return;
   }
@@ -916,7 +973,10 @@ bool processaPortao(EstadoPortao &portao, bool receptora_acionada, bool sensor_f
   String origem_comando = comando_remoto ? " (via API)" : "";
 
   bool comando_recebido = (receptora_acionada && !portao.receptora_anterior) || comando_remoto;
-  bool comando_bloqueado = comando_recebido && sensor_fechado && intertravamento_ativo && outro_portao_aberto;
+  // O portão estava fechado no ciclo anterior: o comando é de abertura, mesmo que o sensor
+  // já apareça aberto neste ciclo (o pulso do relé não pode transformar essa abertura em arrombamento).
+  bool comando_de_abertura = comando_recebido && portao.sensor_fechado_anterior;
+  bool comando_bloqueado = comando_de_abertura && intertravamento_ativo && outro_portao_aberto && !modo_manutencao;
 
   if (comando_bloqueado) {
     print_log(prefixo_log + "Comando de abertura" + origem_comando +
@@ -925,7 +985,7 @@ bool processaPortao(EstadoPortao &portao, bool receptora_acionada, bool sensor_f
     portao.motor_acionado = true;
     portao.momento_inicio_pulso_motor = agora;
 
-    if (sensor_fechado) {
+    if (comando_de_abertura) {
       portao.abertura_autorizada = true;
       portao.momento_autorizacao = agora;
       print_log(prefixo_log + "Comando autorizado recebido" + origem_comando + ". Pulso no motor e abertura liberada por " +
@@ -935,11 +995,6 @@ bool processaPortao(EstadoPortao &portao, bool receptora_acionada, bool sensor_f
     }
   }
   portao.receptora_anterior = receptora_acionada;
-
-  if (portao.motor_acionado && agora - portao.momento_inicio_pulso_motor >= tempo_pulso_motor_ms) {
-    portao.motor_acionado = false;
-    print_log(prefixo_log + "Pulso do motor encerrado.");
-  }
 
   if (!sensor_fechado && portao.sensor_fechado_anterior) {
     portao.portao_aberto = true;
@@ -953,6 +1008,11 @@ bool processaPortao(EstadoPortao &portao, bool receptora_acionada, bool sensor_f
 
     if (autorizacao_valida) {
       portao.contador_possivel_falha_sensor = 0;
+      // Enquanto o relé do motor está atracado, um repique na entrada do sensor não gasta a autorização.
+      // A abertura que continuar depois do pulso é que confirma o comando.
+      if (portao.motor_acionado) {
+        portao.abertura_autorizada = true;
+      }
       print_log(prefixo_log + "Abertura autorizada.");
     } else if (modo_manutencao) {
       print_log(prefixo_log + "Modo manutencao: abertura sem autorizacao ignorada (sem alarme e sem gate_broken).");
@@ -967,7 +1027,12 @@ bool processaPortao(EstadoPortao &portao, bool receptora_acionada, bool sensor_f
 
   if (sensor_fechado && !portao.sensor_fechado_anterior) {
     portao.portao_aberto = false;
-    portao.abertura_autorizada = false;
+    bool autorizacao_acompanha_pulso = portao.abertura_autorizada && portao.motor_acionado &&
+                                       portao.momento_autorizacao != 0 &&
+                                       agora - portao.momento_autorizacao <= janela_comando_autorizado_ms;
+    if (!autorizacao_acompanha_pulso) {
+      portao.abertura_autorizada = false;
+    }
     print_log(prefixo_log + "Sensor fechou: portao fechado.");
     registraEventoPortao(portao, "gate_close");
 
@@ -987,6 +1052,14 @@ bool processaPortao(EstadoPortao &portao, bool receptora_acionada, bool sensor_f
   }
   portao.sensor_fechado_anterior = sensor_fechado;
 
+  if (portao.motor_acionado && agora - portao.momento_inicio_pulso_motor >= tempo_pulso_motor_ms) {
+    portao.motor_acionado = false;
+    if (!sensor_fechado && portao.abertura_autorizada) {
+      portao.abertura_autorizada = false;
+    }
+    print_log(prefixo_log + "Pulso do motor encerrado.");
+  }
+
   if (portao.abertura_autorizada && agora - portao.momento_autorizacao > janela_comando_autorizado_ms) {
     portao.abertura_autorizada = false;
     portao.contador_possivel_falha_sensor++;
@@ -994,8 +1067,9 @@ bool processaPortao(EstadoPortao &portao, bool receptora_acionada, bool sensor_f
               String(portao.contador_possivel_falha_sensor) + "/" + String(limite_possivel_falha_sensor));
 
     if (portao.contador_possivel_falha_sensor >= limite_possivel_falha_sensor) {
-      print_log(prefixo_log + "Limite atingido. Enviando need_maintenance.");
-      registraEventoPortao(portao, "need_maintenance");
+      print_log(prefixo_log + "Limite atingido. Falha de leitura no sensor de fim de curso do portao " +
+                String(portao.numero_portao) + ".");
+      registraEventoPortao(portao, "plaque_problem");
       portao.contador_possivel_falha_sensor = 0;
     }
   }
@@ -1035,16 +1109,23 @@ bool processaPortao(EstadoPortao &portao, bool receptora_acionada, bool sensor_f
 // Abertura indevida deixa a sirene contínua enquanto o portão estiver aberto e por
 // tempo_sirene_apos_fechamento_abertura_indevida_ms após fechar; tempo excessivo aberto faz a sirene intermitente.
 // Com modo_manutencao a sirene fica sempre desligada (e a SAÍDA 8, inversa, em HIGH).
+// quantidade_portoes abaixo de 3 ignora o estado dos portões que a placa não tem.
 // portao_3 nulo mantém o motor do portão 3 desligado (testes que só exercitam dois portões).
 NiveisSaidas calculaSaidas(const EstadoPortao &portao_1, const EstadoPortao &portao_2, bool alimentar_fotocelula_portao_1,
                            bool alimentar_fotocelula_portao_2, unsigned long agora, bool modo_manutencao = false,
-                           const EstadoPortao *portao_3 = nullptr, bool alimentar_fotocelula_portao_3 = true) {
-  const EstadoPortao *portoes[] = {&portao_1, &portao_2, portao_3};
-  const int quantidade_portoes = portao_3 != nullptr ? 3 : 2;
+                           const EstadoPortao *portao_3 = nullptr, bool alimentar_fotocelula_portao_3 = true,
+                           uint8_t quantidade_portoes = 3) {
   const unsigned long ciclo_sirene_alerta_ms = tempo_sirene_ligada_alerta_ms + tempo_sirene_desligada_alerta_ms;
+  bool considerar_portao_2 = quantidade_portoes >= 2;
+  bool considerar_portao_3 = quantidade_portoes >= 3 && portao_3 != nullptr;
+  bool fotocelula_portao_2_da_placa = quantidade_portoes >= 2;
+  bool fotocelula_portao_3_da_placa = quantidade_portoes >= 3;
+  const EstadoPortao *portoes[] = {&portao_1, considerar_portao_2 ? &portao_2 : nullptr,
+                                   considerar_portao_3 ? portao_3 : nullptr};
+  const int quantidade_considerada = considerar_portao_3 ? 3 : (considerar_portao_2 ? 2 : 1);
   bool sirene_ligada = false;
 
-  for (int indice = 0; indice < quantidade_portoes; indice++) {
+  for (int indice = 0; indice < quantidade_considerada; indice++) {
     const EstadoPortao *portao = portoes[indice];
     if (portao->alarme_abertura_indevida_ativo || portao->sirene_apos_fechamento_indevido_ativa) {
       sirene_ligada = true;
@@ -1059,12 +1140,12 @@ NiveisSaidas calculaSaidas(const EstadoPortao &portao_1, const EstadoPortao &por
 
   NiveisSaidas niveis;
   niveis.motor_portao_1 = portao_1.motor_acionado ? HIGH : LOW;
-  niveis.motor_portao_2 = portao_2.motor_acionado ? HIGH : LOW;
-  niveis.motor_portao_3 = portao_3 != nullptr && portao_3->motor_acionado ? HIGH : LOW;
+  niveis.motor_portao_2 = considerar_portao_2 && portao_2.motor_acionado ? HIGH : LOW;
+  niveis.motor_portao_3 = considerar_portao_3 && portao_3->motor_acionado ? HIGH : LOW;
   niveis.sirene = sirene_ligada ? HIGH : LOW;
   niveis.fotocelula_portao_1 = alimentar_fotocelula_portao_1 ? HIGH : LOW;
-  niveis.fotocelula_portao_2 = alimentar_fotocelula_portao_2 ? HIGH : LOW;
-  niveis.fotocelula_portao_3 = alimentar_fotocelula_portao_3 ? HIGH : LOW;
+  niveis.fotocelula_portao_2 = !fotocelula_portao_2_da_placa || alimentar_fotocelula_portao_2 ? HIGH : LOW;
+  niveis.fotocelula_portao_3 = !fotocelula_portao_3_da_placa || alimentar_fotocelula_portao_3 ? HIGH : LOW;
   niveis.central_alarme = sirene_ligada ? LOW : HIGH;
   return niveis;
 }
@@ -1083,7 +1164,15 @@ void aplicaSaidas(const NiveisSaidas &niveis) {
 
   if (niveis.sirene != ultimo_nivel_sirene) {
     ultimo_nivel_sirene = niveis.sirene;
-    print_log(niveis.sirene == HIGH ? "Sirene ligada (SAIDA 8 em LOW)." : "Sirene desligada (SAIDA 8 em HIGH).");
+    print_log(niveis.sirene == HIGH ? "Sirene ligada (SAIDA 7 em HIGH). Rele 8 aberto (SAIDA 8 em LOW)."
+                                   : "Sirene desligada (SAIDA 7 em LOW). Rele 8 fechado (SAIDA 8 em HIGH).");
+  }
+
+  static uint8_t ultimo_nivel_fotocelula_portao_3 = HIGH;
+  if (niveis.fotocelula_portao_3 != ultimo_nivel_fotocelula_portao_3) {
+    ultimo_nivel_fotocelula_portao_3 = niveis.fotocelula_portao_3;
+    print_log(niveis.fotocelula_portao_3 == HIGH ? "Fotocelula do portao 3 alimentada (SAIDA 6 em HIGH)."
+                                                : "Fotocelula do portao 3 desligada (SAIDA 6 em LOW).");
   }
 }
 
@@ -1134,11 +1223,20 @@ void defineIntertravamento(bool ativo) {
   print_log(ativo ? "Intertravamento ativado." : "Intertravamento desativado.");
 }
 
-// Liga ou desliga o modo manutenção (sem sirene e sem envio de eventos/logs para a API).
-void defineModoManutencao(bool ativo) {
-  modo_manutencao_ativo = ativo;
-  print_log(ativo ? "Modo manutencao ATIVADO: sirene bloqueada e nenhum evento/log sera enviado para a API."
-                  : "Modo manutencao DESATIVADO: sirene e envio de eventos/logs voltam ao normal.");
+// Coloca ou tira um portão da manutenção. Portão fora da placa é ignorado.
+void defineManutencaoPortao(uint8_t numero_portao, bool ativo) {
+  if (!portaoExisteNaPlaca(numero_portao)) {
+    print_log("Manutencao do portao " + String(numero_portao) + " ignorada: a placa nao tem esse portao.");
+    return;
+  }
+  if (numero_portao == 2) {
+    manutencao_portao_2 = ativo;
+  } else if (numero_portao == 3) {
+    manutencao_portao_3 = ativo;
+  } else {
+    manutencao_portao_1 = ativo;
+  }
+  print_log(String("Manutencao do portao ") + String(numero_portao) + (ativo ? " ATIVADA." : " DESATIVADA."));
 }
 
 // Classifica um trem de pulsos curto/longo em um código binário. Ignora o silêncio de sincronismo e ruído sem par curto/longo.
@@ -1343,7 +1441,9 @@ void carregaConfiguracaoPortoes() {
   fotocelula_portao_1_alimentada = preferences.getBool("fotocelula", true);
   fotocelula_portao_2_alimentada = preferences.getBool("fotocelula_2", true);
   fotocelula_portao_3_alimentada = preferences.getBool("fotocelula_3", true);
-  modo_manutencao_ativo = preferences.getBool("manutencao", false);
+  manutencao_portao_1 = preferences.getBool("manutencao_1", preferences.getBool("manutencao", false));
+  manutencao_portao_2 = preferences.getBool("manutencao_2", false);
+  manutencao_portao_3 = preferences.getBool("manutencao_3", false);
   preferences.end();
 
   print_log(String("Intertravamento persistido: ") + (intertravamento_ativo ? "ativo" : "desativado"));
@@ -1353,7 +1453,9 @@ void carregaConfiguracaoPortoes() {
             (fotocelula_portao_2_alimentada ? "alimentada (SAIDA 5 em HIGH)" : "desligada (SAIDA 5 em LOW)"));
   print_log(String("Fotocelula portao 3 persistida: ") +
             (fotocelula_portao_3_alimentada ? "alimentada (SAIDA 6 em HIGH)" : "desligada (SAIDA 6 em LOW)"));
-  print_log(String("Modo manutencao persistido: ") + (modo_manutencao_ativo ? "ativo" : "desativado"));
+  print_log(String("Manutencao portao 1: ") + (manutencao_portao_1 ? "ativa" : "desativada"));
+  print_log(String("Manutencao portao 2: ") + (manutencao_portao_2 ? "ativa" : "desativada"));
+  print_log(String("Manutencao portao 3: ") + (manutencao_portao_3 ? "ativa" : "desativada"));
   carregaCodigoRf433();
 }
 
@@ -1364,7 +1466,9 @@ void salvaConfiguracaoPortoes() {
   preferences.putBool("fotocelula", fotocelula_portao_1_alimentada);
   preferences.putBool("fotocelula_2", fotocelula_portao_2_alimentada);
   preferences.putBool("fotocelula_3", fotocelula_portao_3_alimentada);
-  preferences.putBool("manutencao", modo_manutencao_ativo);
+  preferences.putBool("manutencao_1", manutencao_portao_1);
+  preferences.putBool("manutencao_2", manutencao_portao_2);
+  preferences.putBool("manutencao_3", manutencao_portao_3);
   preferences.end();
   print_log("Configuracao dos portoes (intertravamento, fotocelulas e manutencao) persistida na Preferences.");
 }
@@ -1413,24 +1517,49 @@ void tarefaControlePortoes(void *parametro) {
       xQueueReceive(fila_comandos_remotos_portao, &comando_remoto_recebido, 0);
     }
 
-    bool modo_manutencao = modo_manutencao_ativo;
-    bool portao_1_aberto = !sensor_portao_1_fechado;
-    bool portao_2_aberto = !sensor_portao_2_fechado;
-    bool portao_3_aberto = !sensor_portao_3_fechado;
+    if (quantidade_portoes_placa < 2) {
+      receptora_portao_2_acionada = false;
+      sensor_portao_2_fechado = true;
+    }
+    if (quantidade_portoes_placa < 3) {
+      receptora_portao_3_acionada = false;
+      sensor_portao_3_fechado = true;
+    }
+
+    bool bloqueia_portao_1 = sensorBloqueiaIntertravamento(2, sensor_portao_2_fechado) ||
+                             sensorBloqueiaIntertravamento(3, sensor_portao_3_fechado);
+    bool bloqueia_portao_2 = sensorBloqueiaIntertravamento(1, sensor_portao_1_fechado) ||
+                             sensorBloqueiaIntertravamento(3, sensor_portao_3_fechado);
+    bool bloqueia_portao_3 = sensorBloqueiaIntertravamento(1, sensor_portao_1_fechado) ||
+                             sensorBloqueiaIntertravamento(2, sensor_portao_2_fechado);
     bool comando_portao_1_executado = processaPortao(estado_portao_1, receptora_portao_1_acionada || comando_rf433,
-                                                     sensor_portao_1_fechado, agora, portao_2_aberto || portao_3_aberto,
-                                                     comando_remoto_recebido == 1, modo_manutencao);
-    bool comando_portao_2_executado = processaPortao(estado_portao_2, receptora_portao_2_acionada, sensor_portao_2_fechado,
-                                                     agora, portao_1_aberto || portao_3_aberto, comando_remoto_recebido == 2,
-                                                     modo_manutencao);
-    bool comando_portao_3_executado = processaPortao(estado_portao_3, receptora_portao_3_acionada, sensor_portao_3_fechado,
-                                                     agora, portao_1_aberto || portao_2_aberto, comando_remoto_recebido == 3,
-                                                     modo_manutencao);
+                                                     sensor_portao_1_fechado, agora, bloqueia_portao_1,
+                                                     comando_remoto_recebido == 1, portaoEmManutencao(1));
+    bool comando_portao_2_executado = true;
+    bool comando_portao_3_executado = true;
+    if (portaoExisteNaPlaca(2)) {
+      comando_portao_2_executado = processaPortao(estado_portao_2, receptora_portao_2_acionada, sensor_portao_2_fechado,
+                                                  agora, bloqueia_portao_2, comando_remoto_recebido == 2,
+                                                  portaoEmManutencao(2));
+    } else if (comando_remoto_recebido == 2) {
+      comando_portao_2_executado = false;
+    }
+    if (portaoExisteNaPlaca(3)) {
+      comando_portao_3_executado = processaPortao(estado_portao_3, receptora_portao_3_acionada, sensor_portao_3_fechado,
+                                                  agora, bloqueia_portao_3, comando_remoto_recebido == 3,
+                                                  portaoEmManutencao(3));
+    } else if (comando_remoto_recebido == 3) {
+      comando_portao_3_executado = false;
+    }
 
     if (comando_remoto_recebido == comando_remoto_desligar_sirene) {
       desligaSirenePortao(estado_portao_1, agora);
-      desligaSirenePortao(estado_portao_2, agora);
-      desligaSirenePortao(estado_portao_3, agora);
+      if (portaoExisteNaPlaca(2)) {
+        desligaSirenePortao(estado_portao_2, agora);
+      }
+      if (portaoExisteNaPlaca(3)) {
+        desligaSirenePortao(estado_portao_3, agora);
+      }
     }
 
     if (comando_remoto_recebido != 0 && fila_resultados_comandos_remotos != nullptr) {
@@ -1446,8 +1575,8 @@ void tarefaControlePortoes(void *parametro) {
     }
 
     aplicaSaidas(calculaSaidas(estado_portao_1, estado_portao_2, fotocelula_portao_1_alimentada,
-                               fotocelula_portao_2_alimentada, agora, modo_manutencao, &estado_portao_3,
-                               fotocelula_portao_3_alimentada));
+                               fotocelula_portao_2_alimentada, agora, false, &estado_portao_3,
+                               fotocelula_portao_3_alimentada, quantidade_portoes_placa));
 
     vTaskDelay(pdMS_TO_TICKS(intervalo_tarefa_portoes_ms));
   }
@@ -1817,10 +1946,36 @@ bool gateBrokenDentroDoIntervaloMinimo(unsigned long agora) {
   return gate_broken_ja_enviado && agora - momento_ultimo_gate_broken_enviado < intervalo_minimo_entre_gate_broken_ms;
 }
 
+// Monta o texto enviado no event_data quando o sensor de fim de curso falha.
+String textoFalhaSensorFimDeCurso(uint8_t numero_portao) {
+  return "Falha de leitura no sensor de fim de curso do portão " + String(numero_portao);
+}
+
+// Codifica um texto para o corpo application/x-www-form-urlencoded.
+String codificaTextoParaUrl(const String &texto) {
+  const char *digitos_hexadecimais = "0123456789ABCDEF";
+  String codificado;
+  for (unsigned int indice = 0; indice < texto.length(); indice++) {
+    unsigned char caractere = (unsigned char)texto[indice];
+    bool caractere_simples = (caractere >= 'a' && caractere <= 'z') || (caractere >= 'A' && caractere <= 'Z') ||
+                             (caractere >= '0' && caractere <= '9') || caractere == '-' || caractere == '_' ||
+                             caractere == '.' || caractere == '~';
+    if (caractere_simples) {
+      codificado += (char)caractere;
+    } else {
+      codificado += '%';
+      codificado += digitos_hexadecimais[caractere >> 4];
+      codificado += digitos_hexadecimais[caractere & 0x0F];
+    }
+  }
+  return codificado;
+}
+
 bool enviarEventoLog(const char *eventType, uint8_t numero_portao) {
-  // Em modo manutenção nenhum evento/log (inclusive heartbeat) vai para a API; o evento é descartado.
-  if (modo_manutencao_ativo) {
-    print_log("Modo manutencao: evento " + String(eventType) + " nao enviado para a API.");
+  // Evento de um portão em manutenção é descartado. Heartbeat (sem portão) continua sendo enviado.
+  if (numero_portao > 0 && portaoEmManutencao(numero_portao)) {
+    print_log("Portao " + String(numero_portao) + " em manutencao: evento " + String(eventType) +
+              " nao enviado para a API.");
     return true;
   }
 
@@ -1837,8 +1992,13 @@ bool enviarEventoLog(const char *eventType, uint8_t numero_portao) {
                 + "&serial=" + plaque_serial
                 + "&event_type=" + String(eventType);
 
-  // event_data = {"port":N} já codificado para x-www-form-urlencoded.
-  if (numero_portao > 0) {
+  // Falha do sensor vai como texto, com o número do portão, para a notificação do sistema.
+  // Os demais eventos de portão seguem event_data = {"port":N}.
+  if (strcmp(eventType, "plaque_problem") == 0 && numero_portao > 0) {
+    String texto_falha = textoFalhaSensorFimDeCurso(numero_portao);
+    body += "&event_title=" + codificaTextoParaUrl("Possivel defeito na placa");
+    body += "&event_data=" + codificaTextoParaUrl(texto_falha);
+  } else if (numero_portao > 0) {
     body += "&event_data=%7B%22port%22%3A" + String(numero_portao) + "%7D";
   }
 
@@ -1986,6 +2146,9 @@ int extraiFlagDoActionData(const String &payload) {
   valor_action_data.toLowerCase();
 
   int indice_chave_value = valor_action_data.indexOf("value");
+  if (indice_chave_value < 0) {
+    indice_chave_value = valor_action_data.indexOf("enabled");
+  }
   if (indice_chave_value >= 0) {
     valor_action_data = valor_action_data.substring(indice_chave_value + strlen("value"));
     while (valor_action_data.length() > 0 && !isAlphaNumeric(valor_action_data[0])) {
@@ -2013,27 +2176,35 @@ int extraiFlagDoActionData(const String &payload) {
   return -1;
 }
 
-// Devolve o portão de uma ação de fotocélula: fotocelula_1/2/3 = portão 1/2/3 (formato atual da
-// API). Na ação fotocelula (sem número) lê a chave "port" do action_data ({"port":2,"value":0}): sem "port" = portão 1;
-// 1, 2 ou 3 = esse portão; qualquer outro valor = 0 (inválido).
+// Devolve o portão de uma ação de fotocélula. O número no tipo vale para fotocelula_1/2/3 e também
+// para fotocelula_port_3. Sem número no tipo, lê a chave "port" do action_data ou do payload
+// ({"port":3,"value":1}): sem "port" = portão 1; 1, 2 ou 3 = esse portão; outro valor = 0 (inválido).
 uint8_t extraiPortaoFotocelula(const String &tipo_acao, const String &payload) {
-  if (tipo_acao == "fotocelula_1") {
-    return 1;
-  }
-  if (tipo_acao == "fotocelula_2") {
-    return 2;
-  }
-  if (tipo_acao == "fotocelula_3") {
-    return 3;
+  if (tipo_acao.startsWith("fotocelula")) {
+    String numero_no_tipo = extraiPrimeiroNumeroDoTexto(tipo_acao);
+    if (numero_no_tipo == "1") {
+      return 1;
+    }
+    if (numero_no_tipo == "2") {
+      return 2;
+    }
+    if (numero_no_tipo == "3") {
+      return 3;
+    }
   }
 
   String valor_action_data = extraiValorActionData(payload);
   int indice_chave_port = valor_action_data.indexOf("port");
+  String texto_do_portao = valor_action_data;
+  if (indice_chave_port < 0) {
+    indice_chave_port = payload.indexOf("\"port\"");
+    texto_do_portao = payload;
+  }
   if (indice_chave_port < 0) {
     return 1;
   }
 
-  String numero_portao = extraiPrimeiroNumeroDoTexto(valor_action_data.substring(indice_chave_port + strlen("port")));
+  String numero_portao = extraiPrimeiroNumeroDoTexto(texto_do_portao.substring(indice_chave_port + strlen("port")));
   if (numero_portao == "1") {
     return 1;
   }
@@ -2044,6 +2215,25 @@ uint8_t extraiPortaoFotocelula(const String &tipo_acao, const String &payload) {
     return 3;
   }
   return 0;
+}
+
+// Devolve o portão de maintenance_port_1, _2 ou _3. set/unset e qualquer outro tipo devolvem 0.
+uint8_t numeroPortaoDaAcaoManutencao(const String &tipo_acao) {
+  if (tipo_acao == "maintenance_port_1") {
+    return 1;
+  }
+  if (tipo_acao == "maintenance_port_2") {
+    return 2;
+  }
+  if (tipo_acao == "maintenance_port_3") {
+    return 3;
+  }
+  return 0;
+}
+
+// Diz se a ação da fila é manutenção de portão (por portão ou o par antigo set/unset, aplicado a todos).
+bool acaoEhManutencao(const String &tipo_acao) {
+  return tipo_acao == "set_maintenance" || tipo_acao == "unset_maintenance" || tipo_acao.startsWith("maintenance_port_");
 }
 
 // Diz se uma ação imediata da fila (open_or_close_gate, down_siren) é antiga demais para ser executada:
@@ -2078,12 +2268,15 @@ bool acaoDaFilaExpirada(const String &payload, long long agora_epoch) {
 // - fotocelula_1 / fotocelula_2 / fotocelula_3: action_data 0 coloca a fotocélula do portão 1 (SAÍDA 4) /
 //   portão 2 (SAÍDA 5) / portão 3 (SAÍDA 6) em LOW e 1 em HIGH.
 //   fotocelula (sem número) aceita {"port":N,"value":V} ou só 0/1 (portão 1).
-// - set_maintenance / unset_maintenance: ativam / desativam o modo manutenção (action_data ignorado).
+// - maintenance_port_1 / _2 / _3: action_data 0 tira e 1 coloca aquele portão em manutenção.
+//   set_maintenance / unset_maintenance aplicam o mesmo a todos os portões da placa.
 bool processarAlteracaoFlagPortoes(long queue_id, const String &tipo_acao, const String &payload) {
-  bool acao_manutencao = tipo_acao == "set_maintenance" || tipo_acao == "unset_maintenance";
+  bool acao_manutencao = acaoEhManutencao(tipo_acao);
+  bool manutencao_em_todos = tipo_acao == "set_maintenance" || tipo_acao == "unset_maintenance";
   bool acao_fotocelula = tipo_acao.startsWith("fotocelula");
-  int valor_flag = acao_manutencao ? (tipo_acao == "set_maintenance" ? 1 : 0) : extraiFlagDoActionData(payload);
+  int valor_flag = tipo_acao == "set_maintenance" ? 1 : (tipo_acao == "unset_maintenance" ? 0 : extraiFlagDoActionData(payload));
   uint8_t numero_portao_fotocelula = acao_fotocelula ? extraiPortaoFotocelula(tipo_acao, payload) : 0;
+  uint8_t numero_portao_manutencao = numeroPortaoDaAcaoManutencao(tipo_acao);
   print_log("");
   print_log("Evento " + tipo_acao + " recebido. Valor solicitado: " +
             (valor_flag >= 0 ? String(valor_flag) : String("invalido")));
@@ -2098,14 +2291,23 @@ bool processarAlteracaoFlagPortoes(long queue_id, const String &tipo_acao, const
   }
   ultimoQueueIdNotificado = queue_id;
 
-  if (valor_flag < 0 || (acao_fotocelula && numero_portao_fotocelula == 0)) {
-    print_log(tipo_acao + " com action_data invalido (use 0 ou 1; fotocelula aceita port 1, 2 ou 3).");
+  bool fotocelula_fora_da_placa = acao_fotocelula &&
+                                  (numero_portao_fotocelula == 0 || !portaoExisteNaPlaca(numero_portao_fotocelula));
+  bool manutencao_fora_da_placa = acao_manutencao && !manutencao_em_todos &&
+                                  (numero_portao_manutencao == 0 || !portaoExisteNaPlaca(numero_portao_manutencao));
+  if (valor_flag < 0 || fotocelula_fora_da_placa || manutencao_fora_da_placa) {
+    print_log(tipo_acao + " com action_data invalido ou portao fora desta placa (use 0 ou 1; portao 1 a " +
+              String(quantidade_portoes_placa) + ").");
     atualizarStatusFila(queue_id, "failed");
     return false;
   }
 
-  if (acao_manutencao) {
-    defineModoManutencao(valor_flag == 1);
+  if (manutencao_em_todos) {
+    for (uint8_t numero_portao = 1; numero_portao <= quantidade_portoes_placa; numero_portao++) {
+      defineManutencaoPortao(numero_portao, valor_flag == 1);
+    }
+  } else if (acao_manutencao) {
+    defineManutencaoPortao(numero_portao_manutencao, valor_flag == 1);
   } else if (tipo_acao == "intertravamento") {
     defineIntertravamento(valor_flag == 1);
   } else {
@@ -2156,8 +2358,9 @@ bool processarAbrirOuFecharPortao(long queue_id, const String &payload) {
   }
   ultimoQueueIdNotificado = queue_id;
 
-  if (numero_portao == 0) {
-    print_log("open_or_close_gate com action_data invalido (use vazio, 1, 2 ou 3).");
+  if (numero_portao == 0 || !portaoExisteNaPlaca(numero_portao)) {
+    print_log("open_or_close_gate com action_data invalido ou portao fora desta placa (use 1 a " +
+              String(quantidade_portoes_placa) + ").");
     atualizarStatusFila(queue_id, "failed");
     return false;
   }
@@ -2234,7 +2437,7 @@ bool buscarConfigWifiNaApi() {
 
   bool acao_comando_portoes = actionType == "open_or_close_gate" || actionType == "down_siren" ||
                               actionType == "intertravamento" || actionType.startsWith("fotocelula") ||
-                              actionType == "set_maintenance" || actionType == "unset_maintenance";
+                              acaoEhManutencao(actionType);
   if (acao_comando_portoes) {
     String status_acao = extrairValorJsonString(payload, "action_status");
     if (status_acao.length() > 0 && status_acao != "pending") {
@@ -2289,8 +2492,7 @@ bool buscarConfigWifiNaApi() {
     return processarDesligarSirene(queueId);
   }
 
-  if (actionType == "intertravamento" || actionType.startsWith("fotocelula") || actionType == "set_maintenance" ||
-      actionType == "unset_maintenance") {
+  if (actionType == "intertravamento" || actionType.startsWith("fotocelula") || acaoEhManutencao(actionType)) {
     return processarAlteracaoFlagPortoes(queueId, actionType, payload);
   }
 
@@ -2924,7 +3126,9 @@ bool teste_validade_comando_autorizado() {
   }
 
   return portao.contador_possivel_falha_sensor == 0 &&
-         portao.eventos_registrados_teste == "need_maintenance;";
+         portao.eventos_registrados_teste == "plaque_problem;" &&
+         textoFalhaSensorFimDeCurso(1) == "Falha de leitura no sensor de fim de curso do portão 1" &&
+         textoFalhaSensorFimDeCurso(portao.numero_portao).indexOf("portão 1") >= 0;
 }
 
 // Verifica que os portões 1 e 2 são independentes: comando do portão 2 só aciona a SAÍDA 2 e
@@ -3319,6 +3523,21 @@ bool teste_comando_remoto_portao() {
       break;
     }
 
+    EstadoPortao portao_3;
+    iniciaEstadoPortao(portao_3, 3, false, true, 0, true);
+    if (!processaPortao(portao_3, false, true, 3000, false, true) || !portao_3.motor_acionado ||
+        !portao_3.abertura_autorizada) {
+      print_log("teste_comando_remoto_portao: comando do portao 3 nao liberou a abertura.");
+      break;
+    }
+    processaPortao(portao_3, false, false, 3200, false, false);
+    processaPortao(portao_3, false, true, 3400, false, false);
+    processaPortao(portao_3, false, false, 3000 + tempo_pulso_motor_ms + 500, false, false);
+    if (portao_3.alarme_abertura_indevida_ativo || portao_3.eventos_registrados_teste.indexOf("gate_broken") >= 0) {
+      print_log("teste_comando_remoto_portao: abertura do sensor do portao 3 apos o comando gerou arrombamento.");
+      break;
+    }
+
     resultado = true;
   } while (false);
 
@@ -3374,6 +3593,9 @@ bool teste_comando_flags_placa() {
       {"fotocelula_2", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula_2\",\"action_data\":\"0\"}]}", 2},
       {"fotocelula_2", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula_2\",\"action_data\":\"1\"}]}", 2},
       {"fotocelula_3", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula_3\",\"action_data\":\"0\"}]}", 3},
+      {"fotocelula_3", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula_3\",\"action_data\":\"1\"}]}", 3},
+      {"fotocelula_port_3", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula_port_3\",\"action_data\":\"1\"}]}", 3},
+      {"fotocelula", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula\",\"action_data\":\"1\",\"port\":3}]}", 3},
       {"fotocelula", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula\",\"action_data\":\"0\"}]}", 1},
       {"fotocelula", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula\"}]}", 1},
       {"fotocelula", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula\",\"action_data\":{\"port\":1,\"value\":0}}]}", 1},
@@ -3477,7 +3699,9 @@ bool teste_comando_flags_placa() {
 // tempo aberto recomeça a contar ao sair, comandos continuam funcionando, eventos não entram na fila da API,
 // enviarEventoLog não envia nada e a flag é persistida na Preferences. Restaura o estado original ao final.
 bool teste_modo_manutencao() {
-  bool modo_manutencao_original = modo_manutencao_ativo;
+  bool manutencao_portao_1_original = manutencao_portao_1;
+  bool manutencao_portao_2_original = manutencao_portao_2;
+  bool manutencao_portao_3_original = manutencao_portao_3;
   bool resultado = false;
 
   EstadoPortao portao;
@@ -3540,7 +3764,7 @@ bool teste_modo_manutencao() {
       break;
     }
 
-    defineModoManutencao(true);
+    defineManutencaoPortao(1, true);
     if (fila_eventos_pendentes != nullptr) {
       UBaseType_t eventos_antes = uxQueueMessagesWaiting(fila_eventos_pendentes);
       EstadoPortao portao_real;
@@ -3548,28 +3772,129 @@ bool teste_modo_manutencao() {
       registraEventoPortao(portao_real, "gate_open");
       if (uxQueueMessagesWaiting(fila_eventos_pendentes) != eventos_antes) {
         xQueueReset(fila_eventos_pendentes);
-        print_log("teste_modo_manutencao: evento entrou na fila da API durante a manutencao.");
+        print_log("teste_modo_manutencao: evento do portao 1 entrou na fila durante a manutencao.");
         break;
       }
+      EstadoPortao portao_2_real;
+      iniciaEstadoPortao(portao_2_real, 2, false, true, 0, false);
+      registraEventoPortao(portao_2_real, "gate_open");
+      if (uxQueueMessagesWaiting(fila_eventos_pendentes) != eventos_antes + 1) {
+        xQueueReset(fila_eventos_pendentes);
+        print_log("teste_modo_manutencao: manutencao do portao 1 bloqueou evento do portao 2.");
+        break;
+      }
+      xQueueReset(fila_eventos_pendentes);
     }
-    if (!enviarEventoLog("heartbeat", 0)) {
-      print_log("teste_modo_manutencao: enviarEventoLog nao descartou o evento durante a manutencao.");
+    if (!enviarEventoLog("gate_open", 1)) {
+      print_log("teste_modo_manutencao: evento do portao em manutencao nao foi descartado.");
       break;
     }
 
     salvaConfiguracaoPortoes();
-    modo_manutencao_ativo = false;
+    manutencao_portao_1 = false;
     carregaConfiguracaoPortoes();
-    if (!modo_manutencao_ativo) {
-      print_log("teste_modo_manutencao: modo manutencao nao foi persistido na Preferences.");
+    if (!manutencao_portao_1) {
+      print_log("teste_modo_manutencao: manutencao do portao 1 nao foi persistida na Preferences.");
       break;
     }
 
     resultado = true;
   } while (false);
 
-  modo_manutencao_ativo = modo_manutencao_original;
+  manutencao_portao_1 = manutencao_portao_1_original;
+  manutencao_portao_2 = manutencao_portao_2_original;
+  manutencao_portao_3 = manutencao_portao_3_original;
   salvaConfiguracaoPortoes();
+  return resultado;
+}
+
+// Verifica a quantidade de portões do serial, o intertravamento só entre portões existentes e fora de
+// manutenção, e o relé 8 abrindo (SAÍDA 8 em LOW) quando a sirene dispara.
+bool teste_portoes_da_placa_e_rele_alarme() {
+  uint8_t quantidade_original = quantidade_portoes_placa;
+  bool manutencao_portao_2_original = manutencao_portao_2;
+  bool intertravamento_original = intertravamento_ativo;
+  bool resultado = false;
+
+  do {
+    if (quantidadePortoesDoSerial("1port") != 1 || quantidadePortoesDoSerial("2port") != 2 ||
+        quantidadePortoesDoSerial("3port") != 3 || quantidadePortoesDoSerial(plaque_serial) != 3 ||
+        quantidade_portoes_configurada != 3) {
+      print_log("teste_portoes_da_placa_e_rele_alarme: serial da API desligou o portao 3.");
+      break;
+    }
+
+    quantidade_portoes_placa = 3;
+    EstadoPortao portao_3;
+    iniciaEstadoPortao(portao_3, 3, false, true, 0, true);
+    processaPortao(portao_3, true, true, 100, false);
+    if (!portao_3.motor_acionado) {
+      print_log("teste_portoes_da_placa_e_rele_alarme: comando do portao 3 nao atracou o rele.");
+      break;
+    }
+    iniciaEstadoPortao(portao_3, 3, false, true, 0, true);
+    processaPortao(portao_3, false, false, 200, false);
+    NiveisSaidas niveis_portao_3 = calculaSaidas(portao_3, portao_3, true, true, 200, false, &portao_3, true, 3);
+    if (!portao_3.alarme_abertura_indevida_ativo || portao_3.eventos_registrados_teste.indexOf("gate_broken") < 0 ||
+        niveis_portao_3.sirene != HIGH) {
+      print_log("teste_portoes_da_placa_e_rele_alarme: sensor da entrada 6 nao gerou arrombamento.");
+      break;
+    }
+
+    quantidade_portoes_placa = 1;
+    if (sensorBloqueiaIntertravamento(2, false) || portaoExisteNaPlaca(2) || portaoExisteNaPlaca(3)) {
+      print_log("teste_portoes_da_placa_e_rele_alarme: placa de 1 portao considerou outro portao.");
+      break;
+    }
+
+    quantidade_portoes_placa = 2;
+    manutencao_portao_2 = false;
+    if (!sensorBloqueiaIntertravamento(2, false) || sensorBloqueiaIntertravamento(3, false) ||
+        sensorBloqueiaIntertravamento(2, true)) {
+      print_log("teste_portoes_da_placa_e_rele_alarme: placa de 2 portoes nao limitou o intertravamento a 1 e 2.");
+      break;
+    }
+    manutencao_portao_2 = true;
+    if (sensorBloqueiaIntertravamento(2, false)) {
+      print_log("teste_portoes_da_placa_e_rele_alarme: portao em manutencao continuou bloqueando o intertravamento.");
+      break;
+    }
+
+    intertravamento_ativo = true;
+    EstadoPortao portao_em_manutencao;
+    iniciaEstadoPortao(portao_em_manutencao, 1, false, true, 0, true);
+    if (!processaPortao(portao_em_manutencao, true, true, 100, true, false, true) ||
+        !portao_em_manutencao.motor_acionado) {
+      print_log("teste_portoes_da_placa_e_rele_alarme: manutencao nao liberou a abertura do proprio portao.");
+      break;
+    }
+
+    quantidade_portoes_placa = 3;
+    EstadoPortao portao_alarme;
+    EstadoPortao portao_quieto;
+    iniciaEstadoPortao(portao_alarme, 1, false, true, 0, true);
+    iniciaEstadoPortao(portao_quieto, 2, false, true, 0, true);
+    processaPortao(portao_alarme, false, false, 100);
+    NiveisSaidas niveis = calculaSaidas(portao_alarme, portao_quieto, true, true, 100, false, nullptr, true, 3);
+    uint8_t byte_saidas = montaByteSaidasPca9534(niveis);
+    bool rele_8_aberto = (byte_saidas & (uint8_t)(1 << (canal_saida_central_alarme - 1))) == 0;
+    bool sirene_ligada = (byte_saidas & (uint8_t)(1 << (canal_saida_sirene - 1))) != 0;
+    if (niveis.sirene != HIGH || niveis.central_alarme != LOW || !sirene_ligada || !rele_8_aberto) {
+      print_log("teste_portoes_da_placa_e_rele_alarme: rele 8 nao abriu quando a sirene disparou.");
+      break;
+    }
+    niveis = calculaSaidas(portao_quieto, portao_quieto, true, true, 0, false, nullptr, true, 1);
+    if (niveis.motor_portao_2 != LOW || niveis.fotocelula_portao_2 != HIGH || niveis.fotocelula_portao_3 != HIGH) {
+      print_log("teste_portoes_da_placa_e_rele_alarme: placa de 1 portao mexeu na saida dos outros portoes.");
+      break;
+    }
+
+    resultado = true;
+  } while (false);
+
+  quantidade_portoes_placa = quantidade_original;
+  manutencao_portao_2 = manutencao_portao_2_original;
+  intertravamento_ativo = intertravamento_original;
   return resultado;
 }
 
@@ -4048,6 +4373,10 @@ bool teste_completo() {
     print_log("FALHA: teste_modo_manutencao - sirene, alarmes, eventos ou persistencia do modo manutencao incorretos.");
     return false;
   }
+  if (!teste_portoes_da_placa_e_rele_alarme()) {
+    print_log("FALHA: teste_portoes_da_placa_e_rele_alarme - quantidade de portoes, intertravamento ou rele 8 incorretos.");
+    return false;
+  }
   if (!teste_limite_gate_broken()) {
     print_log("FALHA: teste_limite_gate_broken - intervalo minimo de 1 minuto entre gate_broken incorreto.");
     return false;
@@ -4086,6 +4415,7 @@ bool teste_completo() {
 void setup() {
   Serial.begin(115200);
   delay(500);
+  quantidade_portoes_placa = quantidade_portoes_configurada;
   configuraPinos();
 
   unsigned long agora = millis();
@@ -4097,6 +4427,14 @@ void setup() {
   bool sensor_portao_3_fechado = true;
   leEntradasDeCampo(receptora_portao_1_acionada, sensor_portao_1_fechado, receptora_portao_2_acionada,
                     sensor_portao_2_fechado, receptora_portao_3_acionada, sensor_portao_3_fechado);
+  if (!portaoExisteNaPlaca(2)) {
+    receptora_portao_2_acionada = false;
+    sensor_portao_2_fechado = true;
+  }
+  if (!portaoExisteNaPlaca(3)) {
+    receptora_portao_3_acionada = false;
+    sensor_portao_3_fechado = true;
+  }
 
   iniciaEntradaEstabilizada(entrada_receptora_portao_1, receptora_portao_1_acionada, agora);
   iniciaEntradaEstabilizada(entrada_sensor_portao_1, sensor_portao_1_fechado, agora);
@@ -4109,8 +4447,8 @@ void setup() {
   iniciaEstadoPortao(estado_portao_3, 3, receptora_portao_3_acionada, sensor_portao_3_fechado, agora, false);
   carregaConfiguracaoPortoes();
   aplicaSaidas(calculaSaidas(estado_portao_1, estado_portao_2, fotocelula_portao_1_alimentada,
-                             fotocelula_portao_2_alimentada, agora, modo_manutencao_ativo, &estado_portao_3,
-                             fotocelula_portao_3_alimentada));
+                             fotocelula_portao_2_alimentada, agora, false, &estado_portao_3,
+                             fotocelula_portao_3_alimentada, quantidade_portoes_placa));
 
   fila_eventos_pendentes = xQueueCreate(tamanho_fila_eventos, sizeof(EventoPendente));
   fila_comandos_remotos_portao = xQueueCreate(1, sizeof(uint8_t));
@@ -4119,7 +4457,7 @@ void setup() {
   print_log("");
   print_log("======================================");
   print_log("PORTGUARD - MAV1022 / ESP32-S3");
-  print_log("CONTROLE E MONITORAMENTO - 3 PORTOES");
+  print_log("CONTROLE E MONITORAMENTO - " + String(quantidade_portoes_placa) + " PORTOES");
   print_log("======================================");
   print_log("ENTRADA 1 receptora portao 1 = PCA9534 0x21 canal 1");
   print_log("ENTRADA 2 sensor portao 1    = PCA9534 0x21 canal 2");
@@ -4167,8 +4505,8 @@ void setup() {
   }
 
   aplicaSaidas(calculaSaidas(estado_portao_1, estado_portao_2, fotocelula_portao_1_alimentada,
-                             fotocelula_portao_2_alimentada, millis(), modo_manutencao_ativo, &estado_portao_3,
-                             fotocelula_portao_3_alimentada));
+                             fotocelula_portao_2_alimentada, millis(), false, &estado_portao_3,
+                             fotocelula_portao_3_alimentada, quantidade_portoes_placa));
   iniciaReceptorRf433();
 
   // Prioridade acima do loop (1) para que HTTP bloqueante no loop não atrase os portões.

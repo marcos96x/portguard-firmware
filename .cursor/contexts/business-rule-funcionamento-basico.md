@@ -29,14 +29,16 @@ Entradas/saídas via PCA9534 (0x21 / 0x20) no I2C GPIO8/GPIO9. Ethernet W5500: M
 ## Regras (aplicadas por portão)
 - Entradas passam por estabilização de 50 ms antes de serem consideradas.
 - Borda de subida estável da receptora: pulso de 1 s no motor do portão.
-  - Portão fechado: abre janela de autorização de 3 s.
+  - Portão fechado: abre janela de autorização de 8 s. Repique do sensor enquanto o relé está atracado não gasta a autorização nem vira arrombamento.
   - Portão aberto: é comando de fechamento, não abre janela.
   - Intertravamento: abertura ignorada se o outro portão estiver aberto (ver `business-rule-intertravamento.md`).
 - Sensor passa a LOW (portão abriu): evento `gate_open`.
   - Dentro da janela de autorização: abertura autorizada (consome a autorização e zera o contador de falha).
   - Sem autorização: evento `gate_broken` e sirene contínua enquanto o portão estiver aberto. O `gate_broken` vai para a API no máximo 1 vez por minuto (ver `business-rule-limite-gate-broken.md`).
   - Ao fechar após abertura sem autorização, a sirene continua contínua por mais 120 s (`tempo_sirene_apos_fechamento_abertura_indevida_ms`), mesmo que o portão tenha sido fechado logo após abrir. Nova abertura indevida nesse intervalo volta ao alarme de portão aberto e reinicia os 120 s no próximo fechamento.
-- Autorização expirada sem abertura: contador de possível falha do sensor; no 6º seguido envia `need_maintenance`.
+- Autorização expirada sem abertura: contador de possível falha do sensor; no 6º seguido envia `plaque_problem` com `event_data` "Falha de leitura no sensor de fim de curso do portão N".
+- A quantidade de portões é `quantidade_portoes_configurada` (3 nesta placa). Entradas de portão que a placa não tem são ignoradas em sensor, comando, sirene e intertravamento. Ver `business-rule-quantidade-portoes.md`.
+- SAÍDA 8 acompanha o inverso da sirene no próprio byte do PCA9534: sirene disparada deixa o relé 8 desenergizado (contato aberto).
 - Portão aberto por 60 s: evento `gate_timeout_open` e sirene intermitente (1 s ligada / 2 s desligada) até fechar.
 - Portão fecha: evento `gate_close`, encerra alarmes daquele portão (exceto a sirene pós-fechamento de abertura indevida) e envia `gate_timeout_close` se havia alerta de tempo.
 - Sirene liga se qualquer portão tiver alarme; abertura indevida (aberta ou nos 120 s pós-fechamento) tem prioridade (contínua) sobre a intermitente.
