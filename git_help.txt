@@ -1,0 +1,9 @@
+# COMANDOS PARA ATUALIZAR REPOSITÓRIO APÓS MELHORIA / IMPLEMENTAÇÃO
+
+git add .
+git commit -m "texto com o que foi feito"
+git push origin master
+
+# COMANDO PRA QUANDO AZEDAR O FRANGO / QUEBRAR ALGO
+
+git stash

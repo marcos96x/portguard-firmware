@@ -6,17 +6,25 @@ alwaysApply: true
 
 Placa: **MAV1022** (ESP32-S3). Entradas e saídas de campo NÃO são GPIOs diretos: passam pelos PCA9534 (saídas 0x20, entradas 0x21) no I2C GPIO8/SDA e GPIO9/SCL. Ver `business-rule-hardware-mav1022.md`.
 
+Ethernet W5500 (manual revisão 1.1): MOSI GPIO11, MISO GPIO12, SCK GPIO13, CS GPIO14, INT GPIO10, RST GPIO7. GPIO15/16 ficam no cristal do RTC e GPIO19/20 na USB; não são entrada nem saída de campo.
+
 ENTRADA 1: Receptora 1 - recebe os comandos de abertura e fechamento via controle remoto do portão 1, normalmente LOW (inativo)
 ENTRADA 2: Sensor do portão 1 (portão 1 em si) , normalmente HIGH (ativo = fechado)
 ENTRADA 3: Receptora 2 - recebe os comandos de abertura e fechamento via controle remoto do portão 2, normalmente LOW (inativo)
 ENTRADA 4: Sensor do portão 2 (portão 2 em si) , normalmente HIGH (ativo = fechado)
+ENTRADA 5: Receptora 3 - recebe os comandos de abertura e fechamento via controle remoto do portão 3, normalmente LOW (inativo)
+ENTRADA 6: Sensor do portão 3 (portão 3 em si) , normalmente HIGH (ativo = fechado)
 
 SAÍDA 1: Motor do portão 1, normalmente LOW
 SAÍDA 2: Motor do portão 2, normalmente LOW
-SAÍDA 3: Sirene, normalmente LOW
+SAÍDA 3: Motor do portão 3, normalmente LOW
 SAÍDA 4: ligação de interruptor do Sensor de fotocélula do portão 1 para evitar colisão de veículos, normalmente HIGH para o sensor funcionar normalmente
 SAÍDA 5: ligação de interruptor do Sensor de fotocélula do portão 2 para evitar colisão de veículos, normalmente HIGH para o sensor funcionar normalmente
-SAÍDA 6: segue a lógica exata da SAÍDA 3 (sirene), mas normalmente HIGH
+SAÍDA 6: ligação de interruptor do Sensor de fotocélula do portão 3 para evitar colisão de veículos, normalmente HIGH para o sensor funcionar normalmente
+SAÍDA 7: Sirene, normalmente LOW
+SAÍDA 8: segue a lógica exata da sirene (SAÍDA 7), mas normalmente HIGH, para a central do alarme
+
+O portão 3 usa os canais que sobram no PCA9534 (8 entradas e 8 saídas). GPIO do ESP32-S3 permanece no I2C, Ethernet, USB, RTC e RF433.
 
 GPIO48: receptor RF433 (sinal invertido). Primeiro quadro completo e repetido é gravado; nas próximas pressões iguais do controle, aciona a SAÍDA 1 (portão 1). Ver `business-rule-receptor-rf433.md`.
 

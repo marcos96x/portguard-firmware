@@ -1,43 +1,57 @@
-ultima versão da placa mercado livre 
 /*
   ============================================================
-  PORTGUARD - MVP HF-006Enet
+  PORTGUARD - MAV1022 (ESP32-S3)
   Ethernet W5500 + Wi-Fi + Sensor + Sirene + API
   ============================================================
 
   PLACA:
-  Hoffer HF-006Enet
+  MAV1022, ESP32-S3. Entradas e saídas de campo passam pelos PCA9534
+  no I2C (GPIO8 SDA, GPIO9 SCL). Não há GPIO direto de borne.
 
   ------------------------------------------------------------
-  ENTRADAS (.cursor/contexts/architecture.md)
+  ENTRADAS (PCA9534 0x21, ativa em nível baixo)
   ------------------------------------------------------------
-  ENTRADA 1 / IN1 / GPIO36 - receptora portão 1 (repouso LOW)
-  ENTRADA 2 / IN2 / GPIO39 - sensor portão 1   (repouso HIGH = fechado)
-  ENTRADA 3 / IN3 / GPIO34 - receptora portão 2 (repouso LOW)
-  ENTRADA 4 / IN4 / GPIO35 - sensor portão 2   (repouso HIGH = fechado)
+  ENTRADA 1 / canal 1 / bit 0 - receptora portão 1 (repouso inativo)
+  ENTRADA 2 / canal 2 / bit 1 - sensor portão 1   (repouso ativo = fechado)
+  ENTRADA 3 / canal 3 / bit 2 - receptora portão 2 (repouso inativo)
+  ENTRADA 4 / canal 4 / bit 3 - sensor portão 2   (repouso ativo = fechado)
+  ENTRADA 5 / canal 5 / bit 4 - receptora portão 3 (repouso inativo)
+  ENTRADA 6 / canal 6 / bit 5 - sensor portão 3   (repouso ativo = fechado)
+
+  Os três sensores usam a mesma regra: opto ativo (bit em nível baixo) = portão fechado.
+  Abrir o sensor solta o opto, o bit sobe e o estado passa a aberto.
 
   ------------------------------------------------------------
-  SAÍDAS (.cursor/contexts/architecture.md)
+  SAÍDAS (PCA9534 0x20, bit 1 = relé energizado)
   ------------------------------------------------------------
-  SAÍDA 1 / RELÉ 1 / GPIO4  - motor portão 1        (repouso LOW)
-  SAÍDA 2 / RELÉ 2 / GPIO16 - motor portão 2        (repouso LOW)
-  SAÍDA 3 / RELÉ 3 / GPIO17 - sirene                (repouso LOW)
-  SAÍDA 4 / RELÉ 4 / GPIO18 - fotocélula portão 1  (repouso HIGH)
-  SAÍDA 5 / RELÉ 5 / GPIO19 - fotocélula portão 2  (repouso HIGH)
-  SAÍDA 6 / RELÉ 6 / GPIO5  - central de alarme, inverso da sirene (repouso HIGH)
+  SAÍDA 1 / canal 1 / bit 0 - motor portão 1        (repouso LOW)
+  SAÍDA 2 / canal 2 / bit 1 - motor portão 2        (repouso LOW)
+  SAÍDA 3 / canal 3 / bit 2 - motor portão 3        (repouso LOW)
+  SAÍDA 4 / canal 4 / bit 3 - fotocélula portão 1  (repouso HIGH)
+  SAÍDA 5 / canal 5 / bit 4 - fotocélula portão 2  (repouso HIGH)
+  SAÍDA 6 / canal 6 / bit 5 - fotocélula portão 3  (repouso HIGH)
+  SAÍDA 7 / canal 7 / bit 6 - sirene                (repouso LOW)
+  SAÍDA 8 / canal 8 / bit 7 - central de alarme, inverso da sirene (repouso HIGH)
+
+  Campo continua no PCA9534 (8 entradas e 8 saídas). GPIO do ESP32-S3 fica no
+  I2C, Ethernet, USB, RTC e RF433; não há borne direto sobrando para o portão 3.
 
   ------------------------------------------------------------
-  ETHERNET W5500
+  ETHERNET W5500 (manual MAV1022 revisão 1.1)
   ------------------------------------------------------------
-  GPIO13 = MOSI
+  GPIO11 = MOSI
   GPIO12 = MISO
-  GPIO14 = SCK
-  GPIO15 = CS
-  GPIO2  = INT
-  GPIO0  = RESET
+  GPIO13 = SCK
+  GPIO14 = CS
+  GPIO10 = INT
+  GPIO7  = RESET
+
+  GPIO48 = receptor RF433 (sinal invertido por Q2)
+  GPIO19/GPIO20 = USB nativa (não usar)
+  GPIO15/GPIO16 = cristal do RTC (não usar)
 
   ------------------------------------------------------------
-  FUNCIONAMENTO (portões 1 e 2 independentes)
+  FUNCIONAMENTO (portões 1, 2 e 3)
   ------------------------------------------------------------
   0. Entradas, regras e saídas rodam numa tarefa FreeRTOS própria
      (a cada 10 ms), independente das requisições HTTP do loop.
@@ -47,7 +61,7 @@ ultima versão da placa mercado livre
      - Motor do portão recebe pulso de 1 segundo.
      - Com o portão fechado, libera janela de 3 segundos para abertura.
      - Intertravamento (intertravamento_ativo): comando de abertura é
-       ignorado enquanto o outro portão estiver aberto. Fechamento nunca
+       ignorado enquanto qualquer outro portão estiver aberto. Fechamento nunca
        é bloqueado.
 
   2. Sensor abre sem autorização:
@@ -63,9 +77,9 @@ ultima versão da placa mercado livre
      - Alarmes daquele portão são encerrados, exceto após abertura sem
        autorização: a sirene continua contínua por mais 120 segundos.
 
-  SAÍDA 6 é sempre o inverso da sirene. SAÍDAS 4 e 5 mantêm as fotocélulas dos
-  portões 1 e 2 alimentadas (HIGH), exceto quando a ação fotocelula da API
-  desliga a do portão indicado (LOW).
+  SAÍDA 8 é sempre o inverso da sirene (SAÍDA 7). SAÍDAS 4, 5 e 6 mantêm as
+  fotocélulas dos portões 1, 2 e 3 alimentadas (HIGH), exceto quando a ação
+  fotocelula da API desliga a do portão indicado (LOW).
 
   5. Rede:
      - Com Wi-Fi conectado, as requisições usam Wi-Fi.
@@ -80,15 +94,15 @@ ultima versão da placa mercado livre
      - Heartbeat a cada 30 segundos quando houver link.
      - config_plaque: aplica o Wi-Fi recebido em action_data.
      - reset_plaque: apaga o Wi-Fi e usa cabo até um novo config_plaque.
-     - open_or_close_gate: action_data vazio ou 1 = portão 1, 2 = portão 2.
+     - open_or_close_gate: action_data vazio ou 1 = portão 1, 2 = portão 2, 3 = portão 3.
        Mesmo efeito da receptora (abre se fechado, fecha se aberto),
        respeitando o intertravamento.
-     - down_siren: desliga a sirene (encerra os alarmes ativos dos dois portões).
+     - down_siren: desliga a sirene (encerra os alarmes ativos dos três portões).
      - open_or_close_gate e down_siren criados há mais de 60 s (pelo relógio
        NTP) não são executados e respondem failed.
      - intertravamento: action_data 0 desativa, 1 ativa (persistido).
-     - fotocelula_1 / fotocelula_2: action_data 0 desliga (LOW) e 1 liga (HIGH)
-       a fotocélula do portão 1 (SAÍDA 4) / portão 2 (SAÍDA 5) (persistido).
+     - fotocelula_1 / fotocelula_2 / fotocelula_3: action_data 0 desliga (LOW) e 1 liga (HIGH)
+       a fotocélula do portão 1 (SAÍDA 4) / portão 2 (SAÍDA 5) / portão 3 (SAÍDA 6) (persistido).
        fotocelula (sem número) aceita {"port":N,"value":V} ou só 0/1 (portão 1).
      - Toda ação lida é respondida (completed/failed) para a fila andar; se a
        API continuar devolvendo uma ação já tratada, o status é reenviado.
@@ -107,6 +121,7 @@ ultima versão da placa mercado livre
 #include <HTTPClient.h>
 #include <ETH.h>
 #include <SPI.h>
+#include <Wire.h>
 
 // ============================================================
 // IDENTIFICAÇÃO E API
@@ -125,6 +140,7 @@ String wifi_ssid = "";
 String wifi_password = "";
 bool wifiCredenciaisPendentes = false;
 bool wifiConfigFalhou = false;
+bool wifi_persistido_ja_iniciado = false;
 long queueIdPendente = 0;
 long ultimoQueueIdNotificado = 0;
 unsigned long momentoInicioConfigWifi = 0;
@@ -136,18 +152,18 @@ Preferences preferences;
 NetworkClientSecure httpsClient;
 
 // ============================================================
-// ETHERNET W5500 - HF-006Enet
+// ETHERNET W5500 - MAV1022 / ESP32-S3
 // ============================================================
 
 #define ETH_PHY_TYPE ETH_PHY_W5500
 #define ETH_PHY_ADDR 1
-#define ETH_PHY_CS 15
-#define ETH_PHY_IRQ 2
-#define ETH_PHY_RST 0
+#define ETH_PHY_CS 14
+#define ETH_PHY_IRQ 10
+#define ETH_PHY_RST 7
 
-#define ETH_SPI_SCK 14
+#define ETH_SPI_SCK 13
 #define ETH_SPI_MISO 12
-#define ETH_SPI_MOSI 13
+#define ETH_SPI_MOSI 11
 
 bool ethIniciado = false;
 bool ethBeginOk = false;
@@ -161,7 +177,7 @@ bool ethFlagPendenteSalvar = false;
 
 const unsigned long INTERVALO_API_MS = 30000;
 const unsigned long INTERVALO_VALIDAR_WIFI_MS = 1000;
-const unsigned long INTERVALO_RECONECTAR_WIFI_MS = 10000;
+const unsigned long INTERVALO_RECONECTAR_WIFI_MS = 5000;
 const unsigned long INTERVALO_ERRO_REDE_MS = 10000;
 
 unsigned long ultimoCicloApi = 0;
@@ -200,25 +216,45 @@ unsigned long momento_inicio_sincronizacao_relogio = 0;
 const unsigned long tempo_maximo_espera_sincronizacao_relogio_ms = 15000;
 
 // ============================================================
-// PINOS (.cursor/contexts/architecture.md)
+// HARDWARE MAV1022 (.cursor/contexts/architecture.md)
 // ============================================================
 
-// Mapeamento observado na HF-006Enet: o borne SAÍDA 4 segue o GPIO18 e o borne SAÍDA 5 segue o GPIO19 (com o GPIO19
-// como inverso da sirene, era o relé da SAÍDA 5 que desligava no arrombamento). O GPIO5 é o relé restante da placa,
-// por isso SAÍDA 6 = GPIO5. IN3/IN4 ainda precisam ser confirmados no manual da Hoffer.
-const uint8_t pino_entrada_receptora_portao_1 = 36;  // ENTRADA 1
-const uint8_t pino_entrada_sensor_portao_1 = 39;     // ENTRADA 2
-const uint8_t pino_entrada_receptora_portao_2 = 34;  // ENTRADA 3
-const uint8_t pino_entrada_sensor_portao_2 = 35;     // ENTRADA 4
+const uint8_t pino_i2c_sda = 8;
+const uint8_t pino_i2c_scl = 9;
+const uint8_t endereco_pca9534_saidas = 0x20;
+const uint8_t endereco_pca9534_entradas = 0x21;
+const uint32_t frequencia_i2c_hz = 100000;
+const uint8_t registrador_entrada_pca9534 = 0x00;
+const uint8_t registrador_saida_pca9534 = 0x01;
+const uint8_t registrador_polaridade_pca9534 = 0x02;
+const uint8_t registrador_configuracao_pca9534 = 0x03;
 
-const uint8_t pino_saida_motor_portao_1 = 4;   // SAÍDA 1
-const uint8_t pino_saida_motor_portao_2 = 16;  // SAÍDA 2
-const uint8_t pino_saida_sirene = 17;          // SAÍDA 3
-const uint8_t pino_saida_fotocelula_portao_1 = 18;  // SAÍDA 4
-const uint8_t pino_saida_fotocelula_portao_2 = 19;  // SAÍDA 5
-const uint8_t pino_saida_central_alarme = 5;        // SAÍDA 6
+// Canal da placa N = bit (N - 1) do PCA9534.
+const uint8_t canal_entrada_receptora_portao_1 = 1;
+const uint8_t canal_entrada_sensor_portao_1 = 2;
+const uint8_t canal_entrada_receptora_portao_2 = 3;
+const uint8_t canal_entrada_sensor_portao_2 = 4;
+const uint8_t canal_entrada_receptora_portao_3 = 5;
+const uint8_t canal_entrada_sensor_portao_3 = 6;
+const uint8_t canal_saida_motor_portao_1 = 1;
+const uint8_t canal_saida_motor_portao_2 = 2;
+const uint8_t canal_saida_motor_portao_3 = 3;
+const uint8_t canal_saida_fotocelula_portao_1 = 4;
+const uint8_t canal_saida_fotocelula_portao_2 = 5;
+const uint8_t canal_saida_fotocelula_portao_3 = 6;
+const uint8_t canal_saida_sirene = 7;
+const uint8_t canal_saida_central_alarme = 8;
 
-const uint8_t nivel_entrada_ativa = HIGH;
+const uint8_t pino_receptor_rf433 = 48;
+const unsigned long silencio_fim_quadro_rf433_us = 5000;
+const unsigned long intervalo_minimo_comando_rf433_ms = 1000;
+const int quantidade_maxima_pulsos_rf433 = 80;
+const int quantidade_minima_pulsos_quadro_rf433 = 16;
+const int bits_minimos_quadro_rf433 = 8;
+const int bits_maximos_quadro_rf433 = 32;
+
+// Bits 0, 2 e 4 em alto: receptoras inativas. Bits 1, 3 e 5 em baixo: sensores ativos (portões fechados).
+const uint8_t byte_entradas_repouso_seguro_pca9534 = 0x15;
 
 // ============================================================
 // TEMPOS DA LÓGICA DOS PORTÕES
@@ -267,9 +303,11 @@ struct EstadoPortao {
 struct NiveisSaidas {
   uint8_t motor_portao_1;
   uint8_t motor_portao_2;
+  uint8_t motor_portao_3;
   uint8_t sirene;
   uint8_t fotocelula_portao_1;
   uint8_t fotocelula_portao_2;
+  uint8_t fotocelula_portao_3;
   uint8_t central_alarme;
 };
 
@@ -280,19 +318,46 @@ struct EventoPendente {
 
 EstadoPortao estado_portao_1;
 EstadoPortao estado_portao_2;
+EstadoPortao estado_portao_3;
 EntradaEstabilizada entrada_receptora_portao_1;
 EntradaEstabilizada entrada_sensor_portao_1;
 EntradaEstabilizada entrada_receptora_portao_2;
 EntradaEstabilizada entrada_sensor_portao_2;
+EntradaEstabilizada entrada_receptora_portao_3;
+EntradaEstabilizada entrada_sensor_portao_3;
 
 volatile bool fotocelula_portao_1_alimentada = true;
 volatile bool fotocelula_portao_2_alimentada = true;
+volatile bool fotocelula_portao_3_alimentada = true;
 // Quando true, comando de abertura de um portão é ignorado enquanto o outro estiver aberto
 // (comandos de fechamento nunca são bloqueados).
 volatile bool intertravamento_ativo = true;
 // Quando true (set_maintenance), a sirene nunca toca e nenhum evento/log é enviado para a API.
 // A fila de ações continua sendo consultada e executada normalmente.
 volatile bool modo_manutencao_ativo = false;
+
+uint8_t ultimo_byte_entradas_pca9534 = byte_entradas_repouso_seguro_pca9534;
+bool leitura_entradas_pca9534_valida = false;
+
+bool codigo_rf433_esta_gravado = false;
+uint32_t codigo_rf433_gravado = 0;
+uint8_t quantidade_bits_codigo_rf433_gravado = 0;
+bool gravacao_codigo_rf433_pendente = false;
+bool aguardando_repeticao_quadro_rf433 = false;
+uint32_t codigo_rf433_candidato = 0;
+uint8_t quantidade_bits_codigo_rf433_candidato = 0;
+unsigned long momento_ultimo_comando_rf433_reconhecido = 0;
+volatile bool comando_rf433_portao_1_pendente = false;
+bool quadro_rf433_injetado_pendente = false;
+bool quadro_rf433_injetado_valido = false;
+uint32_t codigo_rf433_injetado = 0;
+uint8_t quantidade_bits_codigo_rf433_injetado = 0;
+
+volatile uint16_t duracoes_pulsos_rf433[quantidade_maxima_pulsos_rf433];
+volatile int quantidade_pulsos_capturados_rf433 = 0;
+volatile uint32_t momento_ultima_borda_rf433_us = 0;
+volatile bool quadro_rf433_pronto_para_decodificar = false;
+volatile bool receptor_rf433_iniciado = false;
 
 // gate_broken é notificação crítica: depois de um envio com sucesso, novos gate_broken (de qualquer portão)
 // dentro de intervalo_minimo_entre_gate_broken_ms não são enviados para a API.
@@ -302,9 +367,9 @@ unsigned long momento_ultimo_gate_broken_enviado = 0;
 
 const int tamanho_fila_eventos = 20;
 QueueHandle_t fila_eventos_pendentes = nullptr;
-// Comandos da fila da API para a tarefa dos portões: 1 ou 2 = open_or_close_gate do portão,
+// Comandos da fila da API para a tarefa dos portões: 1, 2 ou 3 = open_or_close_gate do portão,
 // comando_remoto_desligar_sirene = down_siren. A tarefa devolve se o comando foi executado.
-const uint8_t comando_remoto_desligar_sirene = 3;
+const uint8_t comando_remoto_desligar_sirene = 4;
 QueueHandle_t fila_comandos_remotos_portao = nullptr;
 QueueHandle_t fila_resultados_comandos_remotos = nullptr;
 const unsigned long tempo_espera_resultado_comando_remoto_ms = 500;
@@ -313,6 +378,9 @@ TaskHandle_t tarefa_controle_portoes = nullptr;
 void conectarWifi();
 void iniciarEthernet();
 void preferirCaboSeWifiCaiu();
+bool deveManterReconexaoAutomaticaWifi();
+void configuraEstabilidadeWifiEsp32S3();
+void registraEventosWifiEsp32S3();
 bool enviarEventoLog(const char *eventType, uint8_t numero_portao = 0);
 bool atualizarStatusFila(long queueId, const char *actionStatus);
 bool wifiEstaConfigurado();
@@ -388,7 +456,7 @@ void reportarErroRede(const char *mensagem) {
 
 void aplicarRotaDeRede() {
   if (wifiConectado()) {
-    WiFi.setAutoReconnect(true);
+    configuraEstabilidadeWifiEsp32S3();
     Network.setDefaultInterface(WiFi.STA);
     return;
   }
@@ -547,14 +615,14 @@ void iniciarEthernet() {
   Serial.println("======================================");
   Serial.println("INICIANDO ETHERNET W5500");
   Serial.println("======================================");
-  Serial.println("HF-006Enet");
+  Serial.println("MAV1022 / ESP32-S3");
   Serial.println("SPI:");
-  Serial.println("SCK  = GPIO14");
+  Serial.println("SCK  = GPIO13");
   Serial.println("MISO = GPIO12");
-  Serial.println("MOSI = GPIO13");
-  Serial.println("CS   = GPIO15");
-  Serial.println("INT  = GPIO2");
-  Serial.println("RST  = GPIO0");
+  Serial.println("MOSI = GPIO11");
+  Serial.println("CS   = GPIO14");
+  Serial.println("INT  = GPIO10");
+  Serial.println("RST  = GPIO7");
 
   Network.onEvent(onEthEvent);
   SPI.begin(ETH_SPI_SCK, ETH_SPI_MISO, ETH_SPI_MOSI);
@@ -582,26 +650,182 @@ void iniciarEthernet() {
 // PORTÕES: ENTRADAS, REGRAS E SAÍDAS
 // ============================================================
 
-// Configura as 4 entradas e as 6 saídas, já colocando cada saída no seu nível de repouso.
-void configuraPinos() {
-  // GPIO34/35/36/39 são somente entrada e sem pull interno: a polarização vem dos optoacopladores da placa.
-  pinMode(pino_entrada_receptora_portao_1, INPUT);
-  pinMode(pino_entrada_sensor_portao_1, INPUT);
-  pinMode(pino_entrada_receptora_portao_2, INPUT);
-  pinMode(pino_entrada_sensor_portao_2, INPUT);
+// Lê um registrador do PCA9534 com STOP antes do requestFrom. No ESP32-S3 o repeated-start do Wire falha.
+bool leRegistradorPca9534ComSucesso(uint8_t endereco, uint8_t registrador, uint8_t &valor) {
+  for (int tentativa = 0; tentativa < 2; tentativa++) {
+    Wire.beginTransmission(endereco);
+    Wire.write(registrador);
+    if (Wire.endTransmission(true) != 0) {
+      continue;
+    }
+    if (Wire.requestFrom((uint8_t)endereco, (uint8_t)1) != 1) {
+      continue;
+    }
+    if (!Wire.available()) {
+      continue;
+    }
+    valor = (uint8_t)Wire.read();
+    return true;
+  }
+  return false;
+}
 
-  pinMode(pino_saida_motor_portao_1, OUTPUT);
-  digitalWrite(pino_saida_motor_portao_1, LOW);
-  pinMode(pino_saida_motor_portao_2, OUTPUT);
-  digitalWrite(pino_saida_motor_portao_2, LOW);
-  pinMode(pino_saida_sirene, OUTPUT);
-  digitalWrite(pino_saida_sirene, LOW);
-  pinMode(pino_saida_fotocelula_portao_1, OUTPUT);
-  digitalWrite(pino_saida_fotocelula_portao_1, HIGH);
-  pinMode(pino_saida_fotocelula_portao_2, OUTPUT);
-  digitalWrite(pino_saida_fotocelula_portao_2, HIGH);
-  pinMode(pino_saida_central_alarme, OUTPUT);
-  digitalWrite(pino_saida_central_alarme, HIGH);
+// Grava um registrador do PCA9534 e devolve true quando o expansor confirma o ACK.
+bool escreveRegistradorPca9534(uint8_t endereco, uint8_t registrador, uint8_t valor) {
+  Wire.beginTransmission(endereco);
+  Wire.write(registrador);
+  Wire.write(valor);
+  return Wire.endTransmission(true) == 0;
+}
+
+// Entrada optoacoplada ativa deixa o bit do PCA9534 em nível baixo.
+bool canalEntradaAtivo(uint8_t byte_entradas, uint8_t canal) {
+  uint8_t mascara = (uint8_t)(1 << (canal - 1));
+  return (byte_entradas & mascara) == 0;
+}
+
+// Lê o PCA9534 de entradas e registra mudança das ENTRADAS 1 a 4. Devolve false se o I2C falhar.
+bool leEntradasPca9534(uint8_t &byte_entradas) {
+  uint8_t lido = 0;
+  if (!leRegistradorPca9534ComSucesso(endereco_pca9534_entradas, registrador_entrada_pca9534, lido)) {
+    return false;
+  }
+
+  if (leitura_entradas_pca9534_valida && ((lido ^ ultimo_byte_entradas_pca9534) & 0x3F) != 0) {
+    const char *nomes_entradas[] = {"receptora portao 1", "sensor portao 1", "receptora portao 2", "sensor portao 2",
+                                    "receptora portao 3", "sensor portao 3"};
+    print_log("PCA9534 entradas = 0x" + String(lido, HEX));
+    for (uint8_t canal = 1; canal <= 6; canal++) {
+      bool estava_ativa = canalEntradaAtivo(ultimo_byte_entradas_pca9534, canal);
+      bool esta_ativa = canalEntradaAtivo(lido, canal);
+      if (estava_ativa != esta_ativa) {
+        String descricao = "ENTRADA " + String(canal) + " (" + nomes_entradas[canal - 1] + ") " +
+                           (esta_ativa ? "ativa" : "inativa");
+        if (canal == canal_entrada_sensor_portao_1 || canal == canal_entrada_sensor_portao_2 ||
+            canal == canal_entrada_sensor_portao_3) {
+          descricao += esta_ativa ? " (portao fechado)." : " (portao aberto).";
+        } else {
+          descricao += ".";
+        }
+        print_log(descricao);
+      }
+    }
+  }
+
+  ultimo_byte_entradas_pca9534 = lido;
+  leitura_entradas_pca9534_valida = true;
+  byte_entradas = lido;
+  return true;
+}
+
+// Converte a leitura do PCA9534 nos quatro níveis lógicos usados pela regra dos portões.
+void leEntradasDeCampo(bool &receptora_portao_1_acionada, bool &sensor_portao_1_fechado,
+                       bool &receptora_portao_2_acionada, bool &sensor_portao_2_fechado,
+                       bool &receptora_portao_3_acionada, bool &sensor_portao_3_fechado) {
+  uint8_t byte_entradas = leitura_entradas_pca9534_valida ? ultimo_byte_entradas_pca9534
+                                                          : byte_entradas_repouso_seguro_pca9534;
+  leEntradasPca9534(byte_entradas);
+  receptora_portao_1_acionada = canalEntradaAtivo(byte_entradas, canal_entrada_receptora_portao_1);
+  sensor_portao_1_fechado = canalEntradaAtivo(byte_entradas, canal_entrada_sensor_portao_1);
+  receptora_portao_2_acionada = canalEntradaAtivo(byte_entradas, canal_entrada_receptora_portao_2);
+  sensor_portao_2_fechado = canalEntradaAtivo(byte_entradas, canal_entrada_sensor_portao_2);
+  receptora_portao_3_acionada = canalEntradaAtivo(byte_entradas, canal_entrada_receptora_portao_3);
+  sensor_portao_3_fechado = canalEntradaAtivo(byte_entradas, canal_entrada_sensor_portao_3);
+}
+
+// Empacota os seis níveis lógicos no byte do PCA9534 de saídas. Bit 1 energiza o relé.
+uint8_t montaByteSaidasPca9534(const NiveisSaidas &niveis) {
+  uint8_t byte_saidas = 0;
+  if (niveis.motor_portao_1 == HIGH) {
+    byte_saidas |= (uint8_t)(1 << (canal_saida_motor_portao_1 - 1));
+  }
+  if (niveis.motor_portao_2 == HIGH) {
+    byte_saidas |= (uint8_t)(1 << (canal_saida_motor_portao_2 - 1));
+  }
+  if (niveis.motor_portao_3 == HIGH) {
+    byte_saidas |= (uint8_t)(1 << (canal_saida_motor_portao_3 - 1));
+  }
+  if (niveis.sirene == HIGH) {
+    byte_saidas |= (uint8_t)(1 << (canal_saida_sirene - 1));
+  }
+  if (niveis.fotocelula_portao_1 == HIGH) {
+    byte_saidas |= (uint8_t)(1 << (canal_saida_fotocelula_portao_1 - 1));
+  }
+  if (niveis.fotocelula_portao_2 == HIGH) {
+    byte_saidas |= (uint8_t)(1 << (canal_saida_fotocelula_portao_2 - 1));
+  }
+  if (niveis.fotocelula_portao_3 == HIGH) {
+    byte_saidas |= (uint8_t)(1 << (canal_saida_fotocelula_portao_3 - 1));
+  }
+  if (niveis.central_alarme == HIGH) {
+    byte_saidas |= (uint8_t)(1 << (canal_saida_central_alarme - 1));
+  }
+  return byte_saidas;
+}
+
+// Mantém o PCA9534 de entradas em alta impedância, com o latch em alto.
+// Se o pino de um sensor (ENTRADA 2, 4 ou 6) virar saída em nível baixo, o bit fica preso em
+// "fechado": o intertravamento não bloqueia os outros portões e o arrombamento não arma sirene nem API.
+// Retorna false quando o expansor não confirma a configuração.
+bool garanteConfiguracaoEntradasPca9534() {
+  bool latch_ok = escreveRegistradorPca9534(endereco_pca9534_entradas, registrador_saida_pca9534, 0xFF);
+  bool polaridade_ok = escreveRegistradorPca9534(endereco_pca9534_entradas, registrador_polaridade_pca9534, 0x00);
+  bool configuracao_ok = escreveRegistradorPca9534(endereco_pca9534_entradas, registrador_configuracao_pca9534, 0xFF);
+
+  uint8_t configuracao_lida = 0x00;
+  uint8_t polaridade_lida = 0xFF;
+  bool confirmou_configuracao = leRegistradorPca9534ComSucesso(endereco_pca9534_entradas, registrador_configuracao_pca9534,
+                                                               configuracao_lida) &&
+                                configuracao_lida == 0xFF;
+  bool confirmou_polaridade = leRegistradorPca9534ComSucesso(endereco_pca9534_entradas, registrador_polaridade_pca9534,
+                                                             polaridade_lida) &&
+                              polaridade_lida == 0x00;
+
+  bool configuracao_valida = latch_ok && polaridade_ok && configuracao_ok && confirmou_configuracao && confirmou_polaridade;
+  static bool configuracao_valida_anterior = true;
+  if (!configuracao_valida && configuracao_valida_anterior) {
+    print_log("ERRO: PCA9534 de entradas nao confirmou os pinos como entrada (config 0x" +
+              String(configuracao_lida, HEX) + ").");
+  } else if (configuracao_valida && !configuracao_valida_anterior) {
+    print_log("PCA9534 de entradas recuperado: pinos voltaram a ser entrada.");
+  }
+  configuracao_valida_anterior = configuracao_valida;
+  return configuracao_valida;
+}
+
+// Sobe o I2C, programa os dois PCA9534 e deixa o GPIO48 pronto para o receptor RF433.
+void configuraPinos() {
+  Wire.begin(pino_i2c_sda, pino_i2c_scl, frequencia_i2c_hz);
+
+  NiveisSaidas repouso;
+  repouso.motor_portao_1 = LOW;
+  repouso.motor_portao_2 = LOW;
+  repouso.motor_portao_3 = LOW;
+  repouso.sirene = LOW;
+  repouso.fotocelula_portao_1 = HIGH;
+  repouso.fotocelula_portao_2 = HIGH;
+  repouso.fotocelula_portao_3 = HIGH;
+  repouso.central_alarme = HIGH;
+  uint8_t byte_repouso = montaByteSaidasPca9534(repouso);
+
+  // O registrador de saída é gravado antes de virar saída, para os relés não ligarem todos no default 0xFF.
+  bool saidas_prontas = escreveRegistradorPca9534(endereco_pca9534_saidas, registrador_saida_pca9534, byte_repouso);
+  saidas_prontas = escreveRegistradorPca9534(endereco_pca9534_saidas, registrador_polaridade_pca9534, 0x00) && saidas_prontas;
+  saidas_prontas = escreveRegistradorPca9534(endereco_pca9534_saidas, registrador_configuracao_pca9534, 0x00) && saidas_prontas;
+  bool entradas_prontas = garanteConfiguracaoEntradasPca9534();
+
+  uint8_t configuracao_lida = 0xFF;
+  bool confirmou_saidas = leRegistradorPca9534ComSucesso(endereco_pca9534_saidas, registrador_configuracao_pca9534,
+                                                         configuracao_lida) &&
+                          configuracao_lida == 0x00;
+
+  if (!saidas_prontas || !entradas_prontas || !confirmou_saidas) {
+    print_log("ERRO: PCA9534 nao confirmou a configuracao no I2C (saidas 0x20 / entradas 0x21).");
+  } else {
+    print_log("PCA9534 pronto: saidas 0x20, entradas 0x21, I2C GPIO8/GPIO9.");
+  }
+
+  pinMode(pino_receptor_rf433, INPUT);
 }
 
 // Inicializa o filtro de estabilização de uma entrada com a leitura atual.
@@ -807,17 +1031,21 @@ bool processaPortao(EstadoPortao &portao, bool receptora_acionada, bool sensor_f
   return !comando_bloqueado;
 }
 
-// Calcula o nível de cada saída a partir do estado dos dois portões, sem escrever nos pinos.
+// Calcula o nível de cada saída a partir do estado dos três portões, sem escrever nos pinos.
 // Abertura indevida deixa a sirene contínua enquanto o portão estiver aberto e por
 // tempo_sirene_apos_fechamento_abertura_indevida_ms após fechar; tempo excessivo aberto faz a sirene intermitente.
-// Com modo_manutencao a sirene fica sempre desligada (e a SAÍDA 6, inversa, em HIGH).
+// Com modo_manutencao a sirene fica sempre desligada (e a SAÍDA 8, inversa, em HIGH).
+// portao_3 nulo mantém o motor do portão 3 desligado (testes que só exercitam dois portões).
 NiveisSaidas calculaSaidas(const EstadoPortao &portao_1, const EstadoPortao &portao_2, bool alimentar_fotocelula_portao_1,
-                           bool alimentar_fotocelula_portao_2, unsigned long agora, bool modo_manutencao = false) {
-  const EstadoPortao *portoes[] = {&portao_1, &portao_2};
+                           bool alimentar_fotocelula_portao_2, unsigned long agora, bool modo_manutencao = false,
+                           const EstadoPortao *portao_3 = nullptr, bool alimentar_fotocelula_portao_3 = true) {
+  const EstadoPortao *portoes[] = {&portao_1, &portao_2, portao_3};
+  const int quantidade_portoes = portao_3 != nullptr ? 3 : 2;
   const unsigned long ciclo_sirene_alerta_ms = tempo_sirene_ligada_alerta_ms + tempo_sirene_desligada_alerta_ms;
   bool sirene_ligada = false;
 
-  for (const EstadoPortao *portao : portoes) {
+  for (int indice = 0; indice < quantidade_portoes; indice++) {
+    const EstadoPortao *portao = portoes[indice];
     if (portao->alarme_abertura_indevida_ativo || portao->sirene_apos_fechamento_indevido_ativa) {
       sirene_ligada = true;
     } else if (portao->alerta_tempo_aberto_ativo &&
@@ -832,27 +1060,30 @@ NiveisSaidas calculaSaidas(const EstadoPortao &portao_1, const EstadoPortao &por
   NiveisSaidas niveis;
   niveis.motor_portao_1 = portao_1.motor_acionado ? HIGH : LOW;
   niveis.motor_portao_2 = portao_2.motor_acionado ? HIGH : LOW;
+  niveis.motor_portao_3 = portao_3 != nullptr && portao_3->motor_acionado ? HIGH : LOW;
   niveis.sirene = sirene_ligada ? HIGH : LOW;
   niveis.fotocelula_portao_1 = alimentar_fotocelula_portao_1 ? HIGH : LOW;
   niveis.fotocelula_portao_2 = alimentar_fotocelula_portao_2 ? HIGH : LOW;
+  niveis.fotocelula_portao_3 = alimentar_fotocelula_portao_3 ? HIGH : LOW;
   niveis.central_alarme = sirene_ligada ? LOW : HIGH;
   return niveis;
 }
 
-// Único ponto que escreve nas saídas físicas da placa.
+// Único ponto que escreve nas saídas físicas. Regrava o byte inteiro a cada ciclo para recuperar glitch no PCA9534.
 void aplicaSaidas(const NiveisSaidas &niveis) {
   static uint8_t ultimo_nivel_sirene = LOW;
+  static bool escrita_saidas_falhou = false;
 
-  digitalWrite(pino_saida_motor_portao_1, niveis.motor_portao_1);
-  digitalWrite(pino_saida_motor_portao_2, niveis.motor_portao_2);
-  digitalWrite(pino_saida_sirene, niveis.sirene);
-  digitalWrite(pino_saida_fotocelula_portao_1, niveis.fotocelula_portao_1);
-  digitalWrite(pino_saida_fotocelula_portao_2, niveis.fotocelula_portao_2);
-  digitalWrite(pino_saida_central_alarme, niveis.central_alarme);
+  uint8_t byte_saidas = montaByteSaidasPca9534(niveis);
+  bool gravou = escreveRegistradorPca9534(endereco_pca9534_saidas, registrador_saida_pca9534, byte_saidas);
+  if (!gravou && !escrita_saidas_falhou) {
+    print_log("ERRO: falha ao gravar as saidas no PCA9534 0x20.");
+  }
+  escrita_saidas_falhou = !gravou;
 
   if (niveis.sirene != ultimo_nivel_sirene) {
     ultimo_nivel_sirene = niveis.sirene;
-    print_log(niveis.sirene == HIGH ? "Sirene ligada (SAIDA 6 em LOW)." : "Sirene desligada (SAIDA 6 em HIGH).");
+    print_log(niveis.sirene == HIGH ? "Sirene ligada (SAIDA 8 em LOW)." : "Sirene desligada (SAIDA 8 em HIGH).");
   }
 }
 
@@ -874,16 +1105,22 @@ void desligaSirenePortao(EstadoPortao &portao, unsigned long agora) {
   }
 }
 
-// Liga ou desliga a alimentação da fotocélula de um portão (portão 1 = SAÍDA 4, portão 2 = SAÍDA 5).
+// Liga ou desliga a alimentação da fotocélula de um portão (portão 1 = SAÍDA 4, portão 2 = SAÍDA 5, portão 3 = SAÍDA 6).
 // Por padrão elas ficam alimentadas; desligar serve para permitir o fechamento quando a fotocélula estiver com defeito.
 void defineAlimentacaoFotocelula(uint8_t numero_portao, bool alimentar) {
-  if (numero_portao == 2) {
+  String descricao_fotocelula = "Fotocelula do portao 1";
+  String saida = "SAIDA 4";
+  if (numero_portao == 3) {
+    fotocelula_portao_3_alimentada = alimentar;
+    descricao_fotocelula = "Fotocelula do portao 3";
+    saida = "SAIDA 6";
+  } else if (numero_portao == 2) {
     fotocelula_portao_2_alimentada = alimentar;
+    descricao_fotocelula = "Fotocelula do portao 2";
+    saida = "SAIDA 5";
   } else {
     fotocelula_portao_1_alimentada = alimentar;
   }
-  String descricao_fotocelula = numero_portao == 2 ? "Fotocelula do portao 2" : "Fotocelula do portao 1";
-  String saida = numero_portao == 2 ? "SAIDA 5" : "SAIDA 4";
   if (alimentar) {
     print_log(descricao_fotocelula + " alimentada (" + saida + " em HIGH).");
   } else {
@@ -891,7 +1128,7 @@ void defineAlimentacaoFotocelula(uint8_t numero_portao, bool alimentar) {
   }
 }
 
-// Liga ou desliga o intertravamento (bloqueio de abertura de um portão enquanto o outro está aberto).
+// Liga ou desliga o intertravamento (bloqueio de abertura de um portão enquanto qualquer outro está aberto).
 void defineIntertravamento(bool ativo) {
   intertravamento_ativo = ativo;
   print_log(ativo ? "Intertravamento ativado." : "Intertravamento desativado.");
@@ -904,13 +1141,208 @@ void defineModoManutencao(bool ativo) {
                   : "Modo manutencao DESATIVADO: sirene e envio de eventos/logs voltam ao normal.");
 }
 
-// Carrega da Preferences as flags de intertravamento, fotocélulas dos portões 1 e 2 (padrão: ligadas)
+// Classifica um trem de pulsos curto/longo em um código binário. Ignora o silêncio de sincronismo e ruído sem par curto/longo.
+bool decodificaTremDePulsosRf433(const uint16_t *duracoes_us, int quantidade_pulsos, uint32_t &codigo, uint8_t &quantidade_bits) {
+  uint16_t duracoes_uteis[quantidade_maxima_pulsos_rf433];
+  int quantidade_uteis = 0;
+  for (int indice = 0; indice < quantidade_pulsos && quantidade_uteis < quantidade_maxima_pulsos_rf433; indice++) {
+    if (duracoes_us[indice] >= 150 && duracoes_us[indice] <= 2500) {
+      duracoes_uteis[quantidade_uteis++] = duracoes_us[indice];
+    }
+  }
+
+  if (quantidade_uteis < quantidade_minima_pulsos_quadro_rf433 || (quantidade_uteis % 2) != 0) {
+    return false;
+  }
+
+  uint32_t codigo_montado = 0;
+  int bits = 0;
+  for (int indice = 0; indice < quantidade_uteis; indice += 2) {
+    uint16_t primeiro = duracoes_uteis[indice];
+    uint16_t segundo = duracoes_uteis[indice + 1];
+    uint16_t menor = primeiro < segundo ? primeiro : segundo;
+    uint16_t maior = primeiro > segundo ? primeiro : segundo;
+    if (menor == 0 || maior < (uint16_t)(menor * 2)) {
+      return false;
+    }
+    codigo_montado = (codigo_montado << 1) | (primeiro > segundo ? 1u : 0u);
+    bits++;
+  }
+
+  if (bits < bits_minimos_quadro_rf433 || bits > bits_maximos_quadro_rf433) {
+    return false;
+  }
+
+  codigo = codigo_montado;
+  quantidade_bits = (uint8_t)bits;
+  return true;
+}
+
+// Copia o quadro fechado pela interrupção (ou pelo silêncio) e tenta decodificá-lo.
+bool consomeQuadroCapturadoRf433(uint32_t &codigo, uint8_t &quantidade_bits) {
+  uint16_t copia_duracoes[quantidade_maxima_pulsos_rf433];
+  int quantidade = 0;
+
+  noInterrupts();
+  uint32_t desde_ultima_borda_us = micros() - momento_ultima_borda_rf433_us;
+  if (!quadro_rf433_pronto_para_decodificar && receptor_rf433_iniciado &&
+      quantidade_pulsos_capturados_rf433 >= quantidade_minima_pulsos_quadro_rf433 &&
+      desde_ultima_borda_us >= silencio_fim_quadro_rf433_us) {
+    quadro_rf433_pronto_para_decodificar = true;
+  }
+  if (quadro_rf433_pronto_para_decodificar) {
+    quantidade = quantidade_pulsos_capturados_rf433;
+    for (int indice = 0; indice < quantidade; indice++) {
+      copia_duracoes[indice] = duracoes_pulsos_rf433[indice];
+    }
+    quantidade_pulsos_capturados_rf433 = 0;
+    quadro_rf433_pronto_para_decodificar = false;
+  }
+  interrupts();
+
+  if (quantidade <= 0) {
+    return false;
+  }
+  return decodificaTremDePulsosRf433(copia_duracoes, quantidade, codigo, quantidade_bits);
+}
+
+// Fecha a captura por silêncio, exige o mesmo quadro duas vezes, grava o primeiro código ou reconhece o já gravado.
+void processaReceptorFrequencia433(unsigned long agora) {
+  bool tem_quadro = false;
+  bool quadro_valido = false;
+  uint32_t codigo = 0;
+  uint8_t quantidade_bits = 0;
+
+  if (quadro_rf433_injetado_pendente) {
+    quadro_rf433_injetado_pendente = false;
+    tem_quadro = true;
+    quadro_valido = quadro_rf433_injetado_valido;
+    codigo = codigo_rf433_injetado;
+    quantidade_bits = quantidade_bits_codigo_rf433_injetado;
+  } else if (consomeQuadroCapturadoRf433(codigo, quantidade_bits)) {
+    tem_quadro = true;
+    quadro_valido = true;
+  }
+
+  if (!tem_quadro) {
+    return;
+  }
+  if (!quadro_valido) {
+    aguardando_repeticao_quadro_rf433 = false;
+    return;
+  }
+
+  if (!aguardando_repeticao_quadro_rf433 || codigo != codigo_rf433_candidato ||
+      quantidade_bits != quantidade_bits_codigo_rf433_candidato) {
+    codigo_rf433_candidato = codigo;
+    quantidade_bits_codigo_rf433_candidato = quantidade_bits;
+    aguardando_repeticao_quadro_rf433 = true;
+    return;
+  }
+  aguardando_repeticao_quadro_rf433 = false;
+
+  if (!codigo_rf433_esta_gravado) {
+    codigo_rf433_esta_gravado = true;
+    codigo_rf433_gravado = codigo;
+    quantidade_bits_codigo_rf433_gravado = quantidade_bits;
+    gravacao_codigo_rf433_pendente = true;
+    momento_ultimo_comando_rf433_reconhecido = agora;
+    print_log("Receptor RF433: primeiro codigo repetido gravado. Os proximos acionamentos iguais abrem o portao 1.");
+    return;
+  }
+
+  if (codigo != codigo_rf433_gravado || quantidade_bits != quantidade_bits_codigo_rf433_gravado) {
+    print_log("Receptor RF433: codigo diferente do gravado, ignorado.");
+    return;
+  }
+
+  if (agora - momento_ultimo_comando_rf433_reconhecido < intervalo_minimo_comando_rf433_ms) {
+    return;
+  }
+
+  momento_ultimo_comando_rf433_reconhecido = agora;
+  comando_rf433_portao_1_pendente = true;
+  print_log("Receptor RF433: codigo reconhecido. Comando no portao 1.");
+}
+
+// Entrega o comando RF433 já reconhecido uma única vez para a tarefa dos portões.
+bool consomeComandoReceptorRf433() {
+  if (!comando_rf433_portao_1_pendente) {
+    return false;
+  }
+  comando_rf433_portao_1_pendente = false;
+  return true;
+}
+
+// Captura as durações entre bordas do GPIO48. O silêncio fecha o quadro; a decodificação fica fora da interrupção.
+void IRAM_ATTR trataInterrupcaoReceptorRf433() {
+  uint32_t agora_us = micros();
+  uint32_t duracao_us = agora_us - momento_ultima_borda_rf433_us;
+  momento_ultima_borda_rf433_us = agora_us;
+
+  if (duracao_us >= silencio_fim_quadro_rf433_us) {
+    if (quantidade_pulsos_capturados_rf433 >= quantidade_minima_pulsos_quadro_rf433) {
+      quadro_rf433_pronto_para_decodificar = true;
+    } else {
+      quantidade_pulsos_capturados_rf433 = 0;
+    }
+    return;
+  }
+
+  if (quadro_rf433_pronto_para_decodificar) {
+    return;
+  }
+  if (quantidade_pulsos_capturados_rf433 < quantidade_maxima_pulsos_rf433 && duracao_us <= 65535) {
+    duracoes_pulsos_rf433[quantidade_pulsos_capturados_rf433++] = (uint16_t)duracao_us;
+  }
+}
+
+// Passa a escutar o receptor 433 MHz depois dos testes, para o GPIO48 não interferir no teste_completo.
+void iniciaReceptorRf433() {
+  quantidade_pulsos_capturados_rf433 = 0;
+  quadro_rf433_pronto_para_decodificar = false;
+  momento_ultima_borda_rf433_us = micros();
+  receptor_rf433_iniciado = true;
+  attachInterrupt(digitalPinToInterrupt(pino_receptor_rf433), trataInterrupcaoReceptorRf433, CHANGE);
+  print_log("Receptor RF433 escutando no GPIO48.");
+}
+
+// Carrega o código RF433 aprendido (rf433_ok, rf433_code, rf433_bits) da Preferences.
+void carregaCodigoRf433() {
+  preferences.begin("portguard", true);
+  codigo_rf433_esta_gravado = preferences.getBool("rf433_ok", false);
+  codigo_rf433_gravado = preferences.getUInt("rf433_code", 0);
+  quantidade_bits_codigo_rf433_gravado = preferences.getUChar("rf433_bits", 0);
+  preferences.end();
+
+  if (!codigo_rf433_esta_gravado || quantidade_bits_codigo_rf433_gravado < bits_minimos_quadro_rf433) {
+    codigo_rf433_esta_gravado = false;
+    quantidade_bits_codigo_rf433_gravado = 0;
+    print_log("Receptor RF433: nenhum codigo gravado. O proximo controle repetido sera aprendido.");
+    return;
+  }
+  print_log("Receptor RF433: codigo gravado carregado da Preferences.");
+}
+
+// Grava o código RF433 aprendido. A tarefa só marca a pendência; quem escreve a Preferences é o loop.
+void salvaCodigoRf433() {
+  preferences.begin("portguard", false);
+  preferences.putBool("rf433_ok", codigo_rf433_esta_gravado);
+  preferences.putUInt("rf433_code", codigo_rf433_gravado);
+  preferences.putUChar("rf433_bits", quantidade_bits_codigo_rf433_gravado);
+  preferences.end();
+  gravacao_codigo_rf433_pendente = false;
+  print_log("Receptor RF433: codigo persistido na Preferences.");
+}
+
+// Carrega da Preferences as flags de intertravamento, fotocélulas dos portões 1, 2 e 3 (padrão: ligadas)
 // e modo manutenção (padrão: desligado). A chave "fotocelula" é a do portão 1 (mesma de quando havia uma só).
 void carregaConfiguracaoPortoes() {
   preferences.begin("portguard", true);
   intertravamento_ativo = preferences.getBool("intertravamento", true);
   fotocelula_portao_1_alimentada = preferences.getBool("fotocelula", true);
   fotocelula_portao_2_alimentada = preferences.getBool("fotocelula_2", true);
+  fotocelula_portao_3_alimentada = preferences.getBool("fotocelula_3", true);
   modo_manutencao_ativo = preferences.getBool("manutencao", false);
   preferences.end();
 
@@ -919,7 +1351,10 @@ void carregaConfiguracaoPortoes() {
             (fotocelula_portao_1_alimentada ? "alimentada (SAIDA 4 em HIGH)" : "desligada (SAIDA 4 em LOW)"));
   print_log(String("Fotocelula portao 2 persistida: ") +
             (fotocelula_portao_2_alimentada ? "alimentada (SAIDA 5 em HIGH)" : "desligada (SAIDA 5 em LOW)"));
+  print_log(String("Fotocelula portao 3 persistida: ") +
+            (fotocelula_portao_3_alimentada ? "alimentada (SAIDA 6 em HIGH)" : "desligada (SAIDA 6 em LOW)"));
   print_log(String("Modo manutencao persistido: ") + (modo_manutencao_ativo ? "ativo" : "desativado"));
+  carregaCodigoRf433();
 }
 
 // Salva na Preferences as flags de intertravamento, fotocélulas e modo manutenção para valerem após reiniciar a placa.
@@ -928,28 +1363,50 @@ void salvaConfiguracaoPortoes() {
   preferences.putBool("intertravamento", intertravamento_ativo);
   preferences.putBool("fotocelula", fotocelula_portao_1_alimentada);
   preferences.putBool("fotocelula_2", fotocelula_portao_2_alimentada);
+  preferences.putBool("fotocelula_3", fotocelula_portao_3_alimentada);
   preferences.putBool("manutencao", modo_manutencao_ativo);
   preferences.end();
   print_log("Configuracao dos portoes (intertravamento, fotocelulas e manutencao) persistida na Preferences.");
 }
 
-// Tarefa FreeRTOS que, a cada intervalo_tarefa_portoes_ms, lê as 4 entradas, aplica as regras
-// dos dois portões e atualiza as 6 saídas. Roda separada do loop para que as requisições HTTP
+// Tarefa FreeRTOS que, a cada intervalo_tarefa_portoes_ms, lê as 6 entradas, aplica as regras
+// dos três portões e atualiza as 8 saídas. Roda separada do loop para que as requisições HTTP
 // (que podem levar vários segundos) não atrasem comandos, sensores nem a sirene.
 void tarefaControlePortoes(void *parametro) {
   (void)parametro;
 
   for (;;) {
     unsigned long agora = millis();
+    static unsigned long momento_ultima_garantia_entradas = 0;
+    if (agora - momento_ultima_garantia_entradas >= 1000) {
+      momento_ultima_garantia_entradas = agora;
+      garanteConfiguracaoEntradasPca9534();
+    }
+
+    bool receptora_bruta_portao_1 = false;
+    bool sensor_bruto_portao_1 = false;
+    bool receptora_bruta_portao_2 = false;
+    bool sensor_bruto_portao_2 = false;
+    bool receptora_bruta_portao_3 = false;
+    bool sensor_bruto_portao_3 = false;
+    leEntradasDeCampo(receptora_bruta_portao_1, sensor_bruto_portao_1, receptora_bruta_portao_2, sensor_bruto_portao_2,
+                      receptora_bruta_portao_3, sensor_bruto_portao_3);
 
     bool receptora_portao_1_acionada = atualizaEntradaEstabilizada(
-        entrada_receptora_portao_1, digitalRead(pino_entrada_receptora_portao_1) == nivel_entrada_ativa, agora);
+        entrada_receptora_portao_1, receptora_bruta_portao_1, agora);
     bool sensor_portao_1_fechado = atualizaEntradaEstabilizada(
-        entrada_sensor_portao_1, digitalRead(pino_entrada_sensor_portao_1) == nivel_entrada_ativa, agora);
+        entrada_sensor_portao_1, sensor_bruto_portao_1, agora);
     bool receptora_portao_2_acionada = atualizaEntradaEstabilizada(
-        entrada_receptora_portao_2, digitalRead(pino_entrada_receptora_portao_2) == nivel_entrada_ativa, agora);
+        entrada_receptora_portao_2, receptora_bruta_portao_2, agora);
     bool sensor_portao_2_fechado = atualizaEntradaEstabilizada(
-        entrada_sensor_portao_2, digitalRead(pino_entrada_sensor_portao_2) == nivel_entrada_ativa, agora);
+        entrada_sensor_portao_2, sensor_bruto_portao_2, agora);
+    bool receptora_portao_3_acionada = atualizaEntradaEstabilizada(
+        entrada_receptora_portao_3, receptora_bruta_portao_3, agora);
+    bool sensor_portao_3_fechado = atualizaEntradaEstabilizada(
+        entrada_sensor_portao_3, sensor_bruto_portao_3, agora);
+
+    processaReceptorFrequencia433(agora);
+    bool comando_rf433 = consomeComandoReceptorRf433();
 
     uint8_t comando_remoto_recebido = 0;
     if (fila_comandos_remotos_portao != nullptr) {
@@ -957,16 +1414,23 @@ void tarefaControlePortoes(void *parametro) {
     }
 
     bool modo_manutencao = modo_manutencao_ativo;
-    bool comando_portao_1_executado = processaPortao(estado_portao_1, receptora_portao_1_acionada, sensor_portao_1_fechado,
-                                                     agora, !sensor_portao_2_fechado, comando_remoto_recebido == 1,
-                                                     modo_manutencao);
+    bool portao_1_aberto = !sensor_portao_1_fechado;
+    bool portao_2_aberto = !sensor_portao_2_fechado;
+    bool portao_3_aberto = !sensor_portao_3_fechado;
+    bool comando_portao_1_executado = processaPortao(estado_portao_1, receptora_portao_1_acionada || comando_rf433,
+                                                     sensor_portao_1_fechado, agora, portao_2_aberto || portao_3_aberto,
+                                                     comando_remoto_recebido == 1, modo_manutencao);
     bool comando_portao_2_executado = processaPortao(estado_portao_2, receptora_portao_2_acionada, sensor_portao_2_fechado,
-                                                     agora, !sensor_portao_1_fechado, comando_remoto_recebido == 2,
+                                                     agora, portao_1_aberto || portao_3_aberto, comando_remoto_recebido == 2,
+                                                     modo_manutencao);
+    bool comando_portao_3_executado = processaPortao(estado_portao_3, receptora_portao_3_acionada, sensor_portao_3_fechado,
+                                                     agora, portao_1_aberto || portao_2_aberto, comando_remoto_recebido == 3,
                                                      modo_manutencao);
 
     if (comando_remoto_recebido == comando_remoto_desligar_sirene) {
       desligaSirenePortao(estado_portao_1, agora);
       desligaSirenePortao(estado_portao_2, agora);
+      desligaSirenePortao(estado_portao_3, agora);
     }
 
     if (comando_remoto_recebido != 0 && fila_resultados_comandos_remotos != nullptr) {
@@ -975,12 +1439,15 @@ void tarefaControlePortoes(void *parametro) {
         comando_remoto_executado = comando_portao_1_executado;
       } else if (comando_remoto_recebido == 2) {
         comando_remoto_executado = comando_portao_2_executado;
+      } else if (comando_remoto_recebido == 3) {
+        comando_remoto_executado = comando_portao_3_executado;
       }
       xQueueSend(fila_resultados_comandos_remotos, &comando_remoto_executado, 0);
     }
 
     aplicaSaidas(calculaSaidas(estado_portao_1, estado_portao_2, fotocelula_portao_1_alimentada,
-                               fotocelula_portao_2_alimentada, agora, modo_manutencao));
+                               fotocelula_portao_2_alimentada, agora, modo_manutencao, &estado_portao_3,
+                               fotocelula_portao_3_alimentada));
 
     vTaskDelay(pdMS_TO_TICKS(intervalo_tarefa_portoes_ms));
   }
@@ -1035,6 +1502,7 @@ void limparConfigWifi() {
   ultimaTentativaWifi = 0;
   wifiSsidRejeitado = "";
   wifiPasswordRejeitado = "";
+  wifi_persistido_ja_iniciado = false;
 
   salvarConfigWifi();
 
@@ -1490,7 +1958,7 @@ String extraiPrimeiroNumeroDoTexto(const String &texto) {
 }
 
 // Devolve o portão do open_or_close_gate a partir do action_data:
-// ausente, vazio, null ou 1 = portão 1; 2 = portão 2; qualquer outro valor = 0 (inválido).
+// ausente, vazio, null ou 1 = portão 1; 2 = portão 2; 3 = portão 3; qualquer outro valor = 0 (inválido).
 uint8_t extraiNumeroPortaoDoActionData(const String &payload) {
   String valor_action_data = extraiValorActionData(payload);
   if (valor_action_data.length() == 0) {
@@ -1503,6 +1971,9 @@ uint8_t extraiNumeroPortaoDoActionData(const String &payload) {
   }
   if (numero_portao == "2") {
     return 2;
+  }
+  if (numero_portao == "3") {
+    return 3;
   }
   return 0;
 }
@@ -1542,15 +2013,18 @@ int extraiFlagDoActionData(const String &payload) {
   return -1;
 }
 
-// Devolve o portão de uma ação de fotocélula: fotocelula_1 = portão 1 e fotocelula_2 = portão 2 (formato atual da
+// Devolve o portão de uma ação de fotocélula: fotocelula_1/2/3 = portão 1/2/3 (formato atual da
 // API). Na ação fotocelula (sem número) lê a chave "port" do action_data ({"port":2,"value":0}): sem "port" = portão 1;
-// 1 ou 2 = esse portão; qualquer outro valor = 0 (inválido).
+// 1, 2 ou 3 = esse portão; qualquer outro valor = 0 (inválido).
 uint8_t extraiPortaoFotocelula(const String &tipo_acao, const String &payload) {
   if (tipo_acao == "fotocelula_1") {
     return 1;
   }
   if (tipo_acao == "fotocelula_2") {
     return 2;
+  }
+  if (tipo_acao == "fotocelula_3") {
+    return 3;
   }
 
   String valor_action_data = extraiValorActionData(payload);
@@ -1565,6 +2039,9 @@ uint8_t extraiPortaoFotocelula(const String &tipo_acao, const String &payload) {
   }
   if (numero_portao == "2") {
     return 2;
+  }
+  if (numero_portao == "3") {
+    return 3;
   }
   return 0;
 }
@@ -1598,8 +2075,9 @@ bool acaoDaFilaExpirada(const String &payload, long long agora_epoch) {
 
 // Trata as ações de flag da fila e persiste na Preferences para valer após reiniciar, respondendo completed ou failed:
 // - intertravamento: aplica a flag do action_data (0 = false, 1 = true);
-// - fotocelula_1 / fotocelula_2: action_data 0 coloca a fotocélula do portão 1 (SAÍDA 4) / portão 2 (SAÍDA 5) em LOW
-//   e 1 em HIGH. fotocelula (sem número) aceita {"port":N,"value":V} ou só 0/1 (portão 1).
+// - fotocelula_1 / fotocelula_2 / fotocelula_3: action_data 0 coloca a fotocélula do portão 1 (SAÍDA 4) /
+//   portão 2 (SAÍDA 5) / portão 3 (SAÍDA 6) em LOW e 1 em HIGH.
+//   fotocelula (sem número) aceita {"port":N,"value":V} ou só 0/1 (portão 1).
 // - set_maintenance / unset_maintenance: ativam / desativam o modo manutenção (action_data ignorado).
 bool processarAlteracaoFlagPortoes(long queue_id, const String &tipo_acao, const String &payload) {
   bool acao_manutencao = tipo_acao == "set_maintenance" || tipo_acao == "unset_maintenance";
@@ -1621,7 +2099,7 @@ bool processarAlteracaoFlagPortoes(long queue_id, const String &tipo_acao, const
   ultimoQueueIdNotificado = queue_id;
 
   if (valor_flag < 0 || (acao_fotocelula && numero_portao_fotocelula == 0)) {
-    print_log(tipo_acao + " com action_data invalido (use 0 ou 1; fotocelula aceita port 1 ou 2).");
+    print_log(tipo_acao + " com action_data invalido (use 0 ou 1; fotocelula aceita port 1, 2 ou 3).");
     atualizarStatusFila(queue_id, "failed");
     return false;
   }
@@ -1639,7 +2117,7 @@ bool processarAlteracaoFlagPortoes(long queue_id, const String &tipo_acao, const
   return true;
 }
 
-// Entrega um comando da fila da API (1/2 = open_or_close_gate do portão, comando_remoto_desligar_sirene = down_siren)
+// Entrega um comando da fila da API (1/2/3 = open_or_close_gate do portão, comando_remoto_desligar_sirene = down_siren)
 // para a tarefa dos portões e espera o resultado. Retorna false se a tarefa não estiver rodando ou não responder;
 // comando_executado recebe o resultado (false quando o intertravamento bloqueou a abertura).
 bool enviaComandoRemotoParaTarefaPortoes(uint8_t comando_remoto, bool &comando_executado) {
@@ -1679,7 +2157,7 @@ bool processarAbrirOuFecharPortao(long queue_id, const String &payload) {
   ultimoQueueIdNotificado = queue_id;
 
   if (numero_portao == 0) {
-    print_log("open_or_close_gate com action_data invalido (use vazio, 1 ou 2).");
+    print_log("open_or_close_gate com action_data invalido (use vazio, 1, 2 ou 3).");
     atualizarStatusFila(queue_id, "failed");
     return false;
   }
@@ -1688,7 +2166,7 @@ bool processarAbrirOuFecharPortao(long queue_id, const String &payload) {
   if (!enviaComandoRemotoParaTarefaPortoes(numero_portao, comando_executado)) {
     print_log("ERRO: tarefa dos portoes nao respondeu ao open_or_close_gate.");
   } else if (!comando_executado) {
-    print_log("open_or_close_gate bloqueado pelo intertravamento (o outro portao esta aberto).");
+    print_log("open_or_close_gate bloqueado pelo intertravamento (outro portao esta aberto).");
   } else {
     print_log("open_or_close_gate executado no portao " + String(numero_portao) + ".");
   }
@@ -1698,7 +2176,7 @@ bool processarAbrirOuFecharPortao(long queue_id, const String &payload) {
 }
 
 // Trata a ação down_siren da fila: pede à tarefa dos portões para desligar a sirene (encerra os alarmes ativos dos
-// dois portões) e responde completed ou failed. O queue_id é marcado como processado antes de executar.
+// três portões) e responde completed ou failed. O queue_id é marcado como processado antes de executar.
 bool processarDesligarSirene(long queue_id) {
   print_log("");
   print_log("Evento down_siren recebido: desligando a sirene.");
@@ -1905,6 +2383,7 @@ void falharConfigWifiRecebida() {
 
   WiFi.disconnect(true, false);
   delay(100);
+  wifi_persistido_ja_iniciado = false;
 
   carregarConfigWifi();
 
@@ -1927,13 +2406,54 @@ void falharConfigWifiRecebida() {
   }
 }
 
+// Credencial persistida e válida: o modem fica acordado e a pilha reconecta sozinha.
+bool deveManterReconexaoAutomaticaWifi() {
+  return setup_finished && wifi_ssid.length() > 0 && !wifiCredenciaisPendentes && !wifiConfigFalhou;
+}
+
+// Desliga o sleep do modem no ESP32-S3 e aplica auto-reconnect só quando as credenciais persistidas são válidas.
+void configuraEstabilidadeWifiEsp32S3() {
+  if (WiFi.getMode() == WIFI_MODE_NULL || WiFi.getMode() == WIFI_OFF) {
+    return;
+  }
+  WiFi.setSleep(false);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(deveManterReconexaoAutomaticaWifi());
+}
+
+// Reaplica sleep desligado e auto-reconnect quando o rádio ganha ou perde o IP.
+void onWifiEvent(arduino_event_id_t evento, arduino_event_info_t info) {
+  (void)info;
+  if (evento != ARDUINO_EVENT_WIFI_STA_GOT_IP && evento != ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    return;
+  }
+
+  configuraEstabilidadeWifiEsp32S3();
+  if (evento == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    Network.setDefaultInterface(WiFi.STA);
+    print_log("Wi-Fi conectado. Modem sem sleep e rota padrao na interface Wi-Fi.");
+  }
+}
+
+// Registra o callback de Wi-Fi uma única vez, junto dos eventos da Ethernet.
+void registraEventosWifiEsp32S3() {
+  static bool eventos_wifi_registrados = false;
+  if (eventos_wifi_registrados) {
+    return;
+  }
+  eventos_wifi_registrados = true;
+  Network.onEvent(onWifiEvent);
+}
+
+// Conecta o Wi-Fi persistido sem reiniciar o rádio a cada ciclo, ou faz uma tentativa única quando a fila pede config_plaque.
 void conectarWifi() {
   if (wifiConfigFalhou || wifi_ssid.length() == 0) {
     return;
   }
 
   if (wifiConectado()) {
-    WiFi.setAutoReconnect(true);
+    wifi_persistido_ja_iniciado = true;
+    configuraEstabilidadeWifiEsp32S3();
     Network.setDefaultInterface(WiFi.STA);
     cicloApiAssimQueRedeSubir = true;
     return;
@@ -1969,10 +2489,28 @@ void conectarWifi() {
     Serial.print("Tentativa UNICA de WiFi (queue): ");
     Serial.println(wifi_ssid);
 
+    wifi_persistido_ja_iniciado = false;
     WiFi.mode(WIFI_STA);
+    WiFi.persistent(false);
+    WiFi.setSleep(false);
     WiFi.setAutoReconnect(false);
     WiFi.disconnect(true, false);
     delay(100);
+    WiFi.begin(wifi_ssid.c_str(), wifi_password.c_str());
+    preferirCaboSeWifiCaiu();
+    return;
+  }
+
+  if (!wifi_persistido_ja_iniciado) {
+    wifi_persistido_ja_iniciado = true;
+    ultimaTentativaWifi = millis();
+
+    Serial.println();
+    Serial.print("Conectando ao WiFi persistido: ");
+    Serial.println(wifi_ssid);
+
+    WiFi.mode(WIFI_STA);
+    configuraEstabilidadeWifiEsp32S3();
     WiFi.begin(wifi_ssid.c_str(), wifi_password.c_str());
     preferirCaboSeWifiCaiu();
     return;
@@ -1984,17 +2522,8 @@ void conectarWifi() {
   }
 
   ultimaTentativaWifi = millis();
-
-  Serial.println();
-  Serial.print("Conectando ao WiFi persistido: ");
-  Serial.println(wifi_ssid);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(false);
-  WiFi.disconnect(false, false);
-  delay(100);
-  WiFi.begin(wifi_ssid.c_str(), wifi_password.c_str());
-  preferirCaboSeWifiCaiu();
+  configuraEstabilidadeWifiEsp32S3();
+  WiFi.reconnect();
 }
 
 // ============================================================
@@ -2024,6 +2553,8 @@ void verificarRede() {
       setup_finished = true;
       wifiCredenciaisPendentes = false;
       wifiConfigFalhou = false;
+      wifi_persistido_ja_iniciado = true;
+      configuraEstabilidadeWifiEsp32S3();
       salvarConfigWifi();
       Serial.println("WiFi conectado. Credenciais persistidas.");
       atualizarStatusFila(queueIdPendente, "completed");
@@ -2096,48 +2627,72 @@ void enviaEventosPendentes() {
 // TESTES
 // ============================================================
 
-// Verifica se os pinos seguem o esquema da architecture.md: sem pinos repetidos, sem conflito com a
-// Ethernet W5500 e a flash, saídas fora dos GPIOs somente entrada e níveis de repouso corretos.
+// Verifica o mapa da MAV1022: I2C, W5500 e RF433 sem conflito com USB/RTC, canais do PCA9534 e repouso das saídas.
 bool teste_configuracao_pinos() {
-  const uint8_t pinos_entrada[] = {
-      pino_entrada_receptora_portao_1, pino_entrada_sensor_portao_1,
-      pino_entrada_receptora_portao_2, pino_entrada_sensor_portao_2};
-  const uint8_t pinos_saida[] = {
-      pino_saida_motor_portao_1, pino_saida_motor_portao_2, pino_saida_sirene,
-      pino_saida_fotocelula_portao_1, pino_saida_fotocelula_portao_2, pino_saida_central_alarme};
-  const uint8_t pinos_ethernet[] = {ETH_SPI_SCK, ETH_SPI_MISO, ETH_SPI_MOSI, ETH_PHY_CS, ETH_PHY_IRQ, ETH_PHY_RST};
+  const uint8_t pinos_usados[] = {
+      pino_i2c_sda, pino_i2c_scl, pino_receptor_rf433,
+      ETH_SPI_MOSI, ETH_SPI_MISO, ETH_SPI_SCK, ETH_PHY_CS, ETH_PHY_IRQ, ETH_PHY_RST};
+  const uint8_t pinos_esperados[] = {8, 9, 48, 11, 12, 13, 14, 10, 7};
+  const uint8_t pinos_reservados[] = {15, 16, 19, 20};
+  const uint8_t canais_entrada[] = {
+      canal_entrada_receptora_portao_1, canal_entrada_sensor_portao_1,
+      canal_entrada_receptora_portao_2, canal_entrada_sensor_portao_2,
+      canal_entrada_receptora_portao_3, canal_entrada_sensor_portao_3};
+  const uint8_t canais_saida[] = {
+      canal_saida_motor_portao_1, canal_saida_motor_portao_2, canal_saida_motor_portao_3,
+      canal_saida_fotocelula_portao_1, canal_saida_fotocelula_portao_2, canal_saida_fotocelula_portao_3,
+      canal_saida_sirene, canal_saida_central_alarme};
 
-  uint8_t pinos_usados[sizeof(pinos_entrada) + sizeof(pinos_saida)];
-  int quantidade_pinos_usados = 0;
-  for (uint8_t pino : pinos_entrada) {
-    pinos_usados[quantidade_pinos_usados++] = pino;
-  }
-  for (uint8_t pino : pinos_saida) {
-    if (pino >= 34) {
-      print_log("teste_configuracao_pinos: saida no GPIO" + String(pino) + ", que e somente entrada.");
-      return false;
-    }
-    pinos_usados[quantidade_pinos_usados++] = pino;
+  if (endereco_pca9534_saidas != 0x20 || endereco_pca9534_entradas != 0x21) {
+    print_log("teste_configuracao_pinos: endereco I2C do PCA9534 diferente de 0x20/0x21.");
+    return false;
   }
 
-  for (int indice = 0; indice < quantidade_pinos_usados; indice++) {
-    uint8_t pino = pinos_usados[indice];
-    if (pino >= 6 && pino <= 11) {
-      print_log("teste_configuracao_pinos: GPIO" + String(pino) + " pertence a flash do ESP32.");
+  for (int indice = 0; indice < (int)(sizeof(pinos_usados) / sizeof(pinos_usados[0])); indice++) {
+    if (pinos_usados[indice] != pinos_esperados[indice]) {
+      print_log("teste_configuracao_pinos: GPIO" + String(pinos_usados[indice]) + " fora do mapa da MAV1022.");
       return false;
     }
-    for (uint8_t pino_ethernet : pinos_ethernet) {
-      if (pino == pino_ethernet) {
-        print_log("teste_configuracao_pinos: GPIO" + String(pino) + " ja usado pela Ethernet W5500.");
+    for (uint8_t pino_reservado : pinos_reservados) {
+      if (pinos_usados[indice] == pino_reservado) {
+        print_log("teste_configuracao_pinos: GPIO" + String(pinos_usados[indice]) + " e USB ou cristal do RTC.");
         return false;
       }
     }
-    for (int indice_comparado = indice + 1; indice_comparado < quantidade_pinos_usados; indice_comparado++) {
-      if (pino == pinos_usados[indice_comparado]) {
-        print_log("teste_configuracao_pinos: GPIO" + String(pino) + " usado mais de uma vez.");
+    for (int indice_comparado = indice + 1; indice_comparado < (int)(sizeof(pinos_usados) / sizeof(pinos_usados[0]));
+         indice_comparado++) {
+      if (pinos_usados[indice] == pinos_usados[indice_comparado]) {
+        print_log("teste_configuracao_pinos: GPIO" + String(pinos_usados[indice]) + " usado mais de uma vez.");
         return false;
       }
     }
+  }
+
+  for (int indice = 0; indice < 6; indice++) {
+    if (canais_entrada[indice] != (uint8_t)(indice + 1)) {
+      print_log("teste_configuracao_pinos: canal de entrada fora da ordem da architecture.md.");
+      return false;
+    }
+  }
+  for (int indice = 0; indice < 8; indice++) {
+    if (canais_saida[indice] != (uint8_t)(indice + 1)) {
+      print_log("teste_configuracao_pinos: canal de saida fora da ordem da architecture.md.");
+      return false;
+    }
+  }
+
+  if (canalEntradaAtivo(0x00, canal_entrada_sensor_portao_1) != true ||
+      canalEntradaAtivo(0xFF, canal_entrada_receptora_portao_1) != false ||
+      canalEntradaAtivo(byte_entradas_repouso_seguro_pca9534, canal_entrada_receptora_portao_1) != false ||
+      canalEntradaAtivo(byte_entradas_repouso_seguro_pca9534, canal_entrada_sensor_portao_1) != true ||
+      canalEntradaAtivo(byte_entradas_repouso_seguro_pca9534, canal_entrada_receptora_portao_2) != false ||
+      canalEntradaAtivo(byte_entradas_repouso_seguro_pca9534, canal_entrada_sensor_portao_2) != true ||
+      canalEntradaAtivo(byte_entradas_repouso_seguro_pca9534, canal_entrada_receptora_portao_3) != false ||
+      canalEntradaAtivo(byte_entradas_repouso_seguro_pca9534, canal_entrada_sensor_portao_3) != true ||
+      canalEntradaAtivo(0x08, canal_entrada_sensor_portao_2) != false ||
+      canalEntradaAtivo(0x20, canal_entrada_sensor_portao_3) != false) {
+    print_log("teste_configuracao_pinos: polaridade ativa-baixa das entradas incorreta.");
+    return false;
   }
 
   EstadoPortao portao_1_repouso;
@@ -2145,9 +2700,11 @@ bool teste_configuracao_pinos() {
   iniciaEstadoPortao(portao_1_repouso, 1, false, true, 0, true);
   iniciaEstadoPortao(portao_2_repouso, 2, false, true, 0, true);
   NiveisSaidas niveis = calculaSaidas(portao_1_repouso, portao_2_repouso, true, true, 0);
+  uint8_t byte_repouso = montaByteSaidasPca9534(niveis);
 
-  return niveis.motor_portao_1 == LOW && niveis.motor_portao_2 == LOW && niveis.sirene == LOW &&
-         niveis.fotocelula_portao_1 == HIGH && niveis.fotocelula_portao_2 == HIGH && niveis.central_alarme == HIGH;
+  return niveis.motor_portao_1 == LOW && niveis.motor_portao_2 == LOW && niveis.motor_portao_3 == LOW &&
+         niveis.sirene == LOW && niveis.fotocelula_portao_1 == HIGH && niveis.fotocelula_portao_2 == HIGH &&
+         niveis.fotocelula_portao_3 == HIGH && niveis.central_alarme == HIGH && byte_repouso == 0xB8;
 }
 
 // Verifica o filtro de estabilização: repiques menores que tempo_estabilizacao_entrada_ms são ignorados.
@@ -2217,7 +2774,7 @@ bool teste_comando_com_portao_aberto() {
          portao.eventos_registrados_teste == "gate_close;";
 }
 
-// Verifica abertura sem comando: alarme, gate_broken, sirene contínua (SAÍDA 6 invertida) durante todo o
+// Verifica abertura sem comando: alarme, gate_broken, sirene contínua (SAÍDA 8 invertida) durante todo o
 // tempo em que o portão fica aberto, sirene mantida por tempo_sirene_apos_fechamento_abertura_indevida_ms
 // após fechar (inclusive quando o portão é fechado logo em seguida) e nova abertura indevida nesse intervalo.
 bool teste_abertura_indevida() {
@@ -2398,8 +2955,8 @@ bool teste_independencia_portoes() {
   return niveis.sirene == HIGH && niveis.central_alarme == LOW;
 }
 
-// Verifica o controle das fotocélulas (SAÍDA 4 = portão 1, SAÍDA 5 = portão 2): cada uma é desligável
-// independentemente da outra e sem afetar a sirene. Restaura as flags originais ao final.
+// Verifica o controle das fotocélulas (SAÍDA 4 = portão 1, SAÍDA 5 = portão 2, SAÍDA 6 = portão 3): cada uma é
+// desligável independentemente das outras e sem afetar a sirene. Restaura as flags originais ao final.
 bool teste_alimentacao_fotocelula() {
   EstadoPortao portao_1;
   EstadoPortao portao_2;
@@ -2417,30 +2974,42 @@ bool teste_alimentacao_fotocelula() {
 
   bool fotocelula_portao_1_original = fotocelula_portao_1_alimentada;
   bool fotocelula_portao_2_original = fotocelula_portao_2_alimentada;
+  bool fotocelula_portao_3_original = fotocelula_portao_3_alimentada;
   fotocelula_portao_1_alimentada = true;
   fotocelula_portao_2_alimentada = true;
+  fotocelula_portao_3_alimentada = true;
 
   defineAlimentacaoFotocelula(2, false);
-  bool desligou_somente_portao_2 = fotocelula_portao_1_alimentada && !fotocelula_portao_2_alimentada;
+  bool desligou_somente_portao_2 = fotocelula_portao_1_alimentada && !fotocelula_portao_2_alimentada &&
+                                   fotocelula_portao_3_alimentada;
   defineAlimentacaoFotocelula(2, true);
   defineAlimentacaoFotocelula(1, false);
-  bool desligou_somente_portao_1 = !fotocelula_portao_1_alimentada && fotocelula_portao_2_alimentada;
+  bool desligou_somente_portao_1 = !fotocelula_portao_1_alimentada && fotocelula_portao_2_alimentada &&
+                                   fotocelula_portao_3_alimentada;
   defineAlimentacaoFotocelula(1, true);
-  niveis = calculaSaidas(portao_1, portao_2, fotocelula_portao_1_alimentada, fotocelula_portao_2_alimentada, 0);
-  bool religou = niveis.fotocelula_portao_1 == HIGH && niveis.fotocelula_portao_2 == HIGH;
+  defineAlimentacaoFotocelula(3, false);
+  bool desligou_somente_portao_3 = fotocelula_portao_1_alimentada && fotocelula_portao_2_alimentada &&
+                                   !fotocelula_portao_3_alimentada;
+  defineAlimentacaoFotocelula(3, true);
+  niveis = calculaSaidas(portao_1, portao_2, fotocelula_portao_1_alimentada, fotocelula_portao_2_alimentada, 0, false,
+                         nullptr, fotocelula_portao_3_alimentada);
+  bool religou = niveis.fotocelula_portao_1 == HIGH && niveis.fotocelula_portao_2 == HIGH &&
+                 niveis.fotocelula_portao_3 == HIGH && niveis.sirene == LOW;
 
   fotocelula_portao_1_alimentada = fotocelula_portao_1_original;
   fotocelula_portao_2_alimentada = fotocelula_portao_2_original;
-  return desligou_somente_portao_2 && desligou_somente_portao_1 && religou;
+  fotocelula_portao_3_alimentada = fotocelula_portao_3_original;
+  return desligou_somente_portao_2 && desligou_somente_portao_1 && desligou_somente_portao_3 && religou;
 }
 
-// Verifica que as SAÍDAS 4 e 5 (fotocélulas) ficam sempre em HIGH, independente de sirene e sensores, e que a
-// SAÍDA 6 (central de alarme) é sempre o inverso da SAÍDA 3 (sirene), em repouso, abertura indevida,
-// os dois portões em alarme, sirene pós-fechamento, sirene intermitente (ligada e em pausa). Também garante o
-// mapeamento das SAÍDAS 4, 5 e 6 observado na placa (GPIO18, GPIO19 e GPIO5).
+// Verifica que as SAÍDAS 4, 5 e 6 (fotocélulas) ficam sempre em HIGH, independente de sirene e sensores, e que a
+// SAÍDA 8 (central de alarme) é sempre o inverso da SAÍDA 7 (sirene), em repouso, abertura indevida,
+// os portões em alarme, sirene pós-fechamento, sirene intermitente (ligada e em pausa). Também garante o
+// mapeamento dos canais 4, 5, 6, 7 e 8 no byte do PCA9534.
 bool teste_saida_fotocelula_e_central_alarme() {
-  if (pino_saida_fotocelula_portao_1 != 18 || pino_saida_fotocelula_portao_2 != 19 || pino_saida_central_alarme != 5) {
-    print_log("teste_saida_fotocelula_e_central_alarme: SAIDA 4 deve ser GPIO18, SAIDA 5 GPIO19 e SAIDA 6 GPIO5.");
+  if (canal_saida_motor_portao_3 != 3 || canal_saida_fotocelula_portao_1 != 4 || canal_saida_fotocelula_portao_2 != 5 ||
+      canal_saida_fotocelula_portao_3 != 6 || canal_saida_sirene != 7 || canal_saida_central_alarme != 8) {
+    print_log("teste_saida_fotocelula_e_central_alarme: canais das SAIDAS 3 a 8 divergem da architecture.md.");
     return false;
   }
 
@@ -2494,12 +3063,25 @@ bool teste_saida_fotocelula_e_central_alarme() {
 
   for (int indice = 0; indice < quantidade_cenarios; indice++) {
     const NiveisSaidas &niveis = niveis_cenarios[indice];
-    if (niveis.fotocelula_portao_1 != HIGH || niveis.fotocelula_portao_2 != HIGH) {
-      print_log("teste_saida_fotocelula_e_central_alarme: SAIDA 4 ou 5 em LOW no cenario " + String(indice) + ".");
+    if (niveis.fotocelula_portao_1 != HIGH || niveis.fotocelula_portao_2 != HIGH || niveis.fotocelula_portao_3 != HIGH) {
+      print_log("teste_saida_fotocelula_e_central_alarme: SAIDA 4, 5 ou 6 em LOW no cenario " + String(indice) + ".");
       return false;
     }
     if (niveis.central_alarme == niveis.sirene) {
-      print_log("teste_saida_fotocelula_e_central_alarme: SAIDA 6 nao e o inverso da SAIDA 3 no cenario " +
+      print_log("teste_saida_fotocelula_e_central_alarme: SAIDA 8 nao e o inverso da SAIDA 7 no cenario " +
+                String(indice) + ".");
+      return false;
+    }
+    uint8_t byte_saidas = montaByteSaidasPca9534(niveis);
+    bool bit_sirene = (byte_saidas & (uint8_t)(1 << (canal_saida_sirene - 1))) != 0;
+    bool bit_central = (byte_saidas & (uint8_t)(1 << (canal_saida_central_alarme - 1))) != 0;
+    bool bit_fotocelula_1 = (byte_saidas & (uint8_t)(1 << (canal_saida_fotocelula_portao_1 - 1))) != 0;
+    bool bit_fotocelula_2 = (byte_saidas & (uint8_t)(1 << (canal_saida_fotocelula_portao_2 - 1))) != 0;
+    bool bit_fotocelula_3 = (byte_saidas & (uint8_t)(1 << (canal_saida_fotocelula_portao_3 - 1))) != 0;
+    if (bit_sirene != (niveis.sirene == HIGH) || bit_central != (niveis.central_alarme == HIGH) ||
+        bit_fotocelula_1 != (niveis.fotocelula_portao_1 == HIGH) || bit_fotocelula_2 != (niveis.fotocelula_portao_2 == HIGH) ||
+        bit_fotocelula_3 != (niveis.fotocelula_portao_3 == HIGH)) {
+      print_log("teste_saida_fotocelula_e_central_alarme: byte do PCA9534 nao segue os niveis no cenario " +
                 String(indice) + ".");
       return false;
     }
@@ -2521,6 +3103,31 @@ bool teste_intertravamento() {
   iniciaEstadoPortao(portao_2, 2, false, true, 0, true);
 
   do {
+    processaPortao(portao_1, true, true, 100, false);
+    processaPortao(portao_1, false, false, 200, false);
+    if (!portao_1.portao_aberto || portao_1.alarme_abertura_indevida_ativo) {
+      print_log("teste_intertravamento: portao 1 nao abriu com o portao 2 fechado.");
+      break;
+    }
+    processaPortao(portao_2, true, true, 300, portao_1.portao_aberto);
+    if (portao_2.motor_acionado || portao_2.abertura_autorizada ||
+        calculaSaidas(portao_1, portao_2, true, true, 300).motor_portao_2 != LOW) {
+      print_log("teste_intertravamento: comando de abertura do portao 2 nao foi ignorado com o portao 1 aberto.");
+      break;
+    }
+
+    iniciaEstadoPortao(portao_1, 1, false, true, 0, true);
+    iniciaEstadoPortao(portao_2, 2, false, true, 0, true);
+    processaPortao(portao_2, false, false, 100, false);
+    if (!portao_2.alarme_abertura_indevida_ativo || portao_2.eventos_registrados_teste.indexOf("gate_broken") < 0 ||
+        calculaSaidas(portao_1, portao_2, true, true, 100).sirene != HIGH ||
+        calculaSaidas(portao_1, portao_2, true, true, 100).central_alarme != LOW) {
+      print_log("teste_intertravamento: arrombamento do portao 2 nao gerou gate_broken nem sirene.");
+      break;
+    }
+
+    iniciaEstadoPortao(portao_1, 1, false, true, 0, true);
+    iniciaEstadoPortao(portao_2, 2, false, true, 0, true);
     processaPortao(portao_2, true, true, 100, portao_1.portao_aberto);
     processaPortao(portao_2, false, false, 600, portao_1.portao_aberto);
     if (!portao_2.portao_aberto || portao_2.alarme_abertura_indevida_ativo) {
@@ -2573,8 +3180,82 @@ bool teste_intertravamento() {
   return resultado;
 }
 
+// Verifica o intertravamento com três portões: um portão aberto bloqueia a abertura dos outros dois;
+// fechamento continua liberado; abertura forçada depois do bloqueio gera gate_broken e liga a sirene
+// (SAÍDA 7) com a central (SAÍDA 8) em LOW. Restaura intertravamento_ativo ao final.
+bool teste_intertravamento_tres_portoes() {
+  bool intertravamento_original = intertravamento_ativo;
+  intertravamento_ativo = true;
+  bool resultado = false;
+
+  EstadoPortao portao_1;
+  EstadoPortao portao_2;
+  EstadoPortao portao_3;
+  iniciaEstadoPortao(portao_1, 1, false, true, 0, true);
+  iniciaEstadoPortao(portao_2, 2, false, true, 0, true);
+  iniciaEstadoPortao(portao_3, 3, false, true, 0, true);
+
+  do {
+    processaPortao(portao_3, true, true, 100, false);
+    processaPortao(portao_3, false, false, 200, false);
+    if (!portao_3.portao_aberto || portao_3.alarme_abertura_indevida_ativo) {
+      print_log("teste_intertravamento_tres_portoes: portao 3 nao abriu com os outros fechados.");
+      break;
+    }
+
+    processaPortao(portao_1, true, true, 300, true);
+    processaPortao(portao_2, true, true, 400, true);
+    if (portao_1.motor_acionado || portao_1.abertura_autorizada || portao_2.motor_acionado ||
+        portao_2.abertura_autorizada) {
+      print_log("teste_intertravamento_tres_portoes: abertura do portao 1 ou 2 nao foi bloqueada com o portao 3 aberto.");
+      break;
+    }
+
+    intertravamento_ativo = false;
+    iniciaEstadoPortao(portao_1, 1, false, true, 0, true);
+    processaPortao(portao_1, true, true, 500, true);
+    processaPortao(portao_1, false, false, 600, true);
+    intertravamento_ativo = true;
+    processaPortao(portao_1, true, false, 700, true);
+    if (!portao_1.motor_acionado) {
+      print_log("teste_intertravamento_tres_portoes: fechamento do portao 1 foi bloqueado com o portao 3 aberto.");
+      break;
+    }
+
+    iniciaEstadoPortao(portao_3, 3, false, true, 0, true);
+    processaPortao(portao_3, true, true, 800, true);
+    if (portao_3.motor_acionado || portao_3.abertura_autorizada) {
+      print_log("teste_intertravamento_tres_portoes: abertura do portao 3 nao foi bloqueada com o portao 1 aberto.");
+      break;
+    }
+    processaPortao(portao_3, false, false, 900, true);
+    NiveisSaidas niveis = calculaSaidas(portao_1, portao_2, true, true, 900, false, &portao_3, true);
+    if (!portao_3.alarme_abertura_indevida_ativo || portao_3.eventos_registrados_teste.indexOf("gate_broken") < 0 ||
+        niveis.sirene != HIGH || niveis.central_alarme != LOW) {
+      print_log("teste_intertravamento_tres_portoes: arrombamento do portao 3 nao gerou gate_broken nem sirene.");
+      break;
+    }
+
+    iniciaEstadoPortao(portao_1, 1, false, true, 0, true);
+    iniciaEstadoPortao(portao_2, 2, false, true, 0, true);
+    iniciaEstadoPortao(portao_3, 3, false, true, 0, true);
+    processaPortao(portao_2, true, true, 1000, false);
+    processaPortao(portao_2, false, false, 1100, false);
+    processaPortao(portao_3, true, true, 1200, true);
+    if (!portao_2.portao_aberto || portao_3.motor_acionado || portao_3.abertura_autorizada) {
+      print_log("teste_intertravamento_tres_portoes: portao 2 aberto nao bloqueou a abertura do portao 3.");
+      break;
+    }
+
+    resultado = true;
+  } while (false);
+
+  intertravamento_ativo = intertravamento_original;
+  return resultado;
+}
+
 // Verifica o open_or_close_gate: leitura do action_data em todos os formatos aceitos (vazio/null/1 = portão 1,
-// 2 = portão 2, outros = inválido) e o comando remoto no processaPortao (abre com autorização sem gerar
+// 2 = portão 2, 3 = portão 3, outros = inválido) e o comando remoto no processaPortao (abre com autorização sem gerar
 // gate_broken, fecha portão aberto e é bloqueado pelo intertravamento com o outro portão aberto).
 bool teste_comando_remoto_portao() {
   struct CasoActionData {
@@ -2590,7 +3271,8 @@ bool teste_comando_remoto_portao() {
       {"{\"list\":[{\"id\":12,\"action_type\":\"open_or_close_gate\",\"action_data\": 2}]}", 2},
       {"{\"list\":[{\"id\":12,\"action_type\":\"open_or_close_gate\",\"action_data\":\"{\\\"port\\\":2}\"}]}", 2},
       {"{\"list\":[{\"id\":12,\"action_type\":\"open_or_close_gate\",\"action_data\":{\"port\":1}}]}", 1},
-      {"{\"list\":[{\"id\":12,\"action_type\":\"open_or_close_gate\",\"action_data\":\"3\"}]}", 0},
+      {"{\"list\":[{\"id\":12,\"action_type\":\"open_or_close_gate\",\"action_data\":\"3\"}]}", 3},
+      {"{\"list\":[{\"id\":12,\"action_type\":\"open_or_close_gate\",\"action_data\":\"4\"}]}", 0},
       {"{\"list\":[{\"id\":12,\"action_type\":\"open_or_close_gate\",\"action_data\":\"abc\"}]}", 0},
   };
   for (const CasoActionData &caso : casos_action_data) {
@@ -2691,13 +3373,15 @@ bool teste_comando_flags_placa() {
       {"fotocelula_1", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula_1\",\"action_data\":\"0\"}]}", 1},
       {"fotocelula_2", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula_2\",\"action_data\":\"0\"}]}", 2},
       {"fotocelula_2", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula_2\",\"action_data\":\"1\"}]}", 2},
+      {"fotocelula_3", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula_3\",\"action_data\":\"0\"}]}", 3},
       {"fotocelula", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula\",\"action_data\":\"0\"}]}", 1},
       {"fotocelula", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula\"}]}", 1},
       {"fotocelula", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula\",\"action_data\":{\"port\":1,\"value\":0}}]}", 1},
       {"fotocelula", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula\",\"action_data\":{\"port\":2,\"value\":0}}]}", 2},
       {"fotocelula", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula\",\"action_data\":\"{\\\"port\\\":\\\"2\\\",\\\"value\\\":1}\"}]}", 2},
       {"fotocelula", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula\",\"action_data\":{\"value\":1,\"port\":2}}]}", 2},
-      {"fotocelula", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula\",\"action_data\":{\"port\":3,\"value\":0}}]}", 0},
+      {"fotocelula", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula\",\"action_data\":{\"port\":3,\"value\":0}}]}", 3},
+      {"fotocelula", "{\"list\":[{\"id\":7,\"action_type\":\"fotocelula\",\"action_data\":{\"port\":4,\"value\":0}}]}", 0},
   };
   for (const CasoPortaoFotocelula &caso : casos_portao_fotocelula) {
     uint8_t numero_portao = extraiPortaoFotocelula(caso.tipo_acao, caso.payload);
@@ -2711,6 +3395,7 @@ bool teste_comando_flags_placa() {
   bool intertravamento_original = intertravamento_ativo;
   bool fotocelula_portao_1_original = fotocelula_portao_1_alimentada;
   bool fotocelula_portao_2_original = fotocelula_portao_2_alimentada;
+  bool fotocelula_portao_3_original = fotocelula_portao_3_alimentada;
   bool resultado = false;
 
   EstadoPortao portao_1;
@@ -2750,23 +3435,29 @@ bool teste_comando_flags_placa() {
       break;
     }
     defineAlimentacaoFotocelula(1, true);
-    niveis = calculaSaidas(portao_1, portao_2, fotocelula_portao_1_alimentada, fotocelula_portao_2_alimentada, 0);
-    if (niveis.fotocelula_portao_1 != HIGH || niveis.fotocelula_portao_2 != HIGH) {
-      print_log("teste_comando_flags_placa: fotocelula = 1 nao voltou as SAIDAS 4 e 5 para HIGH.");
+    defineAlimentacaoFotocelula(3, false);
+    niveis = calculaSaidas(portao_1, portao_2, fotocelula_portao_1_alimentada, fotocelula_portao_2_alimentada, 0, false,
+                           nullptr, fotocelula_portao_3_alimentada);
+    if (niveis.fotocelula_portao_1 != HIGH || niveis.fotocelula_portao_2 != HIGH || niveis.fotocelula_portao_3 != LOW) {
+      print_log("teste_comando_flags_placa: fotocelula do portao 3 = 0 nao colocou somente a SAIDA 6 em LOW.");
       break;
     }
+    defineAlimentacaoFotocelula(3, true);
 
     intertravamento_ativo = intertravamento_original;
     fotocelula_portao_1_alimentada = fotocelula_portao_1_original;
     fotocelula_portao_2_alimentada = fotocelula_portao_2_original;
+    fotocelula_portao_3_alimentada = fotocelula_portao_3_original;
     salvaConfiguracaoPortoes();
     intertravamento_ativo = !intertravamento_original;
     fotocelula_portao_1_alimentada = !fotocelula_portao_1_original;
     fotocelula_portao_2_alimentada = !fotocelula_portao_2_original;
+    fotocelula_portao_3_alimentada = !fotocelula_portao_3_original;
     carregaConfiguracaoPortoes();
     if (intertravamento_ativo != intertravamento_original ||
         fotocelula_portao_1_alimentada != fotocelula_portao_1_original ||
-        fotocelula_portao_2_alimentada != fotocelula_portao_2_original) {
+        fotocelula_portao_2_alimentada != fotocelula_portao_2_original ||
+        fotocelula_portao_3_alimentada != fotocelula_portao_3_original) {
       print_log("teste_comando_flags_placa: flags nao foram persistidas/recarregadas da Preferences.");
       break;
     }
@@ -2777,10 +3468,11 @@ bool teste_comando_flags_placa() {
   intertravamento_ativo = intertravamento_original;
   fotocelula_portao_1_alimentada = fotocelula_portao_1_original;
   fotocelula_portao_2_alimentada = fotocelula_portao_2_original;
+  fotocelula_portao_3_alimentada = fotocelula_portao_3_original;
   return resultado;
 }
 
-// Verifica o modo manutenção: sirene sempre desligada (SAÍDA 6 em HIGH) mesmo com alarme ativo, abertura sem
+// Verifica o modo manutenção: sirene sempre desligada (SAÍDA 8 em HIGH) mesmo com alarme ativo, abertura sem
 // autorização não arma alarme nem gera gate_broken, alarmes ativos são encerrados e não voltam ao sair da manutenção,
 // tempo aberto recomeça a contar ao sair, comandos continuam funcionando, eventos não entram na fila da API,
 // enviarEventoLog não envia nada e a flag é persistida na Preferences. Restaura o estado original ao final.
@@ -2924,7 +3616,7 @@ bool teste_limite_gate_broken() {
 }
 
 // Verifica o down_siren: com abertura indevida em um portão e alerta de tempo aberto no outro, desligar a sirene
-// encerra todos os alarmes (SAÍDA 3 em LOW e SAÍDA 6 em HIGH), o alerta não volta logo em seguida com o portão ainda
+// encerra todos os alarmes (SAÍDA 7 em LOW e SAÍDA 8 em HIGH), o alerta não volta logo em seguida com o portão ainda
 // aberto (só depois de um novo tempo_maximo_portao_aberto_ms), não sobra sirene pós-fechamento e uma nova abertura
 // sem autorização volta a disparar o alarme.
 bool teste_desligar_sirene_remoto() {
@@ -3037,6 +3729,260 @@ bool teste_fila_api_formato_atual() {
   return true;
 }
 
+// Confere escrita e leitura do bit da sirene no PCA9534 e a polaridade ativa-baixa do sensor.
+bool teste_comunicacao_pca9534() {
+  uint8_t byte_original = 0;
+  if (!leRegistradorPca9534ComSucesso(endereco_pca9534_saidas, registrador_saida_pca9534, byte_original)) {
+    print_log("teste_comunicacao_pca9534: nao leu o registrador de saida do PCA9534 0x20.");
+    return false;
+  }
+
+  uint8_t byte_sirene = (uint8_t)(byte_original ^ (uint8_t)(1 << (canal_saida_sirene - 1)));
+  if (!escreveRegistradorPca9534(endereco_pca9534_saidas, registrador_saida_pca9534, byte_sirene)) {
+    escreveRegistradorPca9534(endereco_pca9534_saidas, registrador_saida_pca9534, byte_original);
+    print_log("teste_comunicacao_pca9534: nao gravou o bit da sirene.");
+    return false;
+  }
+
+  uint8_t byte_lido = 0;
+  bool leitura_ok = leRegistradorPca9534ComSucesso(endereco_pca9534_saidas, registrador_saida_pca9534, byte_lido);
+  escreveRegistradorPca9534(endereco_pca9534_saidas, registrador_saida_pca9534, byte_original);
+  if (!leitura_ok || byte_lido != byte_sirene) {
+    print_log("teste_comunicacao_pca9534: readback da sirene diferente do byte gravado.");
+    return false;
+  }
+
+  uint8_t polaridade = 0xFF;
+  if (!leRegistradorPca9534ComSucesso(endereco_pca9534_entradas, registrador_polaridade_pca9534, polaridade) ||
+      polaridade != 0x00) {
+    print_log("teste_comunicacao_pca9534: polaridade do PCA9534 de entradas nao esta em 0x00.");
+    return false;
+  }
+
+  if (!canalEntradaAtivo(0x00, canal_entrada_sensor_portao_1) || canalEntradaAtivo(0xFF, canal_entrada_sensor_portao_1) ||
+      !canalEntradaAtivo(0x00, canal_entrada_sensor_portao_2) || canalEntradaAtivo(0xFF, canal_entrada_sensor_portao_2)) {
+    print_log("teste_comunicacao_pca9534: sensor nao esta em polaridade ativa-baixa.");
+    return false;
+  }
+
+  uint8_t configuracao_entradas = 0x00;
+  if (!leRegistradorPca9534ComSucesso(endereco_pca9534_entradas, registrador_configuracao_pca9534, configuracao_entradas) ||
+      configuracao_entradas != 0xFF) {
+    print_log("teste_comunicacao_pca9534: ENTRADA 4 pode estar presa; configuracao lida 0x" +
+              String(configuracao_entradas, HEX) + ".");
+    return false;
+  }
+  return true;
+}
+
+// Confere o intervalo de 5 s e a política de auto-reconnect (persistido, pendente, rejeitado e sem SSID).
+bool teste_estabilidade_wifi_esp32_s3() {
+  if (INTERVALO_RECONECTAR_WIFI_MS != 5000) {
+    print_log("teste_estabilidade_wifi_esp32_s3: intervalo de reconexao diferente de 5 s.");
+    return false;
+  }
+
+  bool setup_original = setup_finished;
+  String ssid_original = wifi_ssid;
+  bool pendente_original = wifiCredenciaisPendentes;
+  bool falhou_original = wifiConfigFalhou;
+  bool sucesso = true;
+
+  setup_finished = true;
+  wifi_ssid = "rede_persistida";
+  wifiCredenciaisPendentes = false;
+  wifiConfigFalhou = false;
+  if (!deveManterReconexaoAutomaticaWifi()) {
+    print_log("teste_estabilidade_wifi_esp32_s3: credencial persistida nao manteve a reconexao automatica.");
+    sucesso = false;
+  }
+
+  wifiCredenciaisPendentes = true;
+  if (sucesso && deveManterReconexaoAutomaticaWifi()) {
+    print_log("teste_estabilidade_wifi_esp32_s3: config_plaque pendente manteve a reconexao automatica.");
+    sucesso = false;
+  }
+
+  wifiCredenciaisPendentes = false;
+  wifiConfigFalhou = true;
+  if (sucesso && deveManterReconexaoAutomaticaWifi()) {
+    print_log("teste_estabilidade_wifi_esp32_s3: credencial rejeitada manteve a reconexao automatica.");
+    sucesso = false;
+  }
+
+  wifiConfigFalhou = false;
+  wifi_ssid = "";
+  if (sucesso && deveManterReconexaoAutomaticaWifi()) {
+    print_log("teste_estabilidade_wifi_esp32_s3: SSID vazio manteve a reconexao automatica.");
+    sucesso = false;
+  }
+
+  setup_finished = false;
+  wifi_ssid = "rede_persistida";
+  if (sucesso && deveManterReconexaoAutomaticaWifi()) {
+    print_log("teste_estabilidade_wifi_esp32_s3: setup nao concluido manteve a reconexao automatica.");
+    sucesso = false;
+  }
+
+  setup_finished = setup_original;
+  wifi_ssid = ssid_original;
+  wifiCredenciaisPendentes = pendente_original;
+  wifiConfigFalhou = falhou_original;
+
+  if (sucesso) {
+    wifi_mode_t modo_original = WiFi.getMode();
+    bool ligou_radio_so_para_teste = modo_original == WIFI_OFF || modo_original == WIFI_MODE_NULL;
+    if (ligou_radio_so_para_teste) {
+      WiFi.mode(WIFI_STA);
+    }
+    configuraEstabilidadeWifiEsp32S3();
+    if (WiFi.getSleep() != WIFI_PS_NONE) {
+      print_log("teste_estabilidade_wifi_esp32_s3: sleep do modem continua ligado.");
+      sucesso = false;
+    }
+    if (sucesso && WiFi.getAutoReconnect() != deveManterReconexaoAutomaticaWifi()) {
+      print_log("teste_estabilidade_wifi_esp32_s3: auto-reconnect nao seguiu a politica das credenciais.");
+      sucesso = false;
+    }
+    if (ligou_radio_so_para_teste && !wifiEstaConfigurado() && !wifiCredenciaisPendentes) {
+      WiFi.mode(WIFI_OFF);
+    }
+  }
+
+  return sucesso;
+}
+
+// Confere decodificação, rejeição de ruído, aprendizado só com quadro repetido, código diferente e cooldown de 1 s.
+bool teste_receptor_frequencia_433() {
+  bool gravado_original = codigo_rf433_esta_gravado;
+  uint32_t codigo_original = codigo_rf433_gravado;
+  uint8_t bits_originais = quantidade_bits_codigo_rf433_gravado;
+  bool gravacao_original = gravacao_codigo_rf433_pendente;
+  bool aguardando_original = aguardando_repeticao_quadro_rf433;
+  bool comando_original = comando_rf433_portao_1_pendente;
+  unsigned long momento_original = momento_ultimo_comando_rf433_reconhecido;
+
+  codigo_rf433_esta_gravado = false;
+  codigo_rf433_gravado = 0;
+  quantidade_bits_codigo_rf433_gravado = 0;
+  gravacao_codigo_rf433_pendente = false;
+  aguardando_repeticao_quadro_rf433 = false;
+  comando_rf433_portao_1_pendente = false;
+  momento_ultimo_comando_rf433_reconhecido = 0;
+  quadro_rf433_injetado_pendente = false;
+
+  bool sucesso = true;
+  uint16_t quadro_valido[] = {900, 300, 300, 900, 900, 300, 300, 900, 300, 900, 900, 300, 300, 900, 900, 300};
+  uint32_t codigo = 0;
+  uint8_t quantidade_bits = 0;
+  if (!decodificaTremDePulsosRf433(quadro_valido, 16, codigo, quantidade_bits) || codigo != 0xA5 || quantidade_bits != 8) {
+    print_log("teste_receptor_frequencia_433: decodificacao do quadro sintetico falhou.");
+    sucesso = false;
+  }
+
+  uint16_t quadro_com_sincronismo[17];
+  for (int indice = 0; indice < 16; indice++) {
+    quadro_com_sincronismo[indice] = quadro_valido[indice];
+  }
+  quadro_com_sincronismo[16] = 9000;
+  uint32_t codigo_sincronismo = 0;
+  uint8_t bits_sincronismo = 0;
+  if (sucesso && (!decodificaTremDePulsosRf433(quadro_com_sincronismo, 17, codigo_sincronismo, bits_sincronismo) ||
+                  codigo_sincronismo != 0xA5)) {
+    print_log("teste_receptor_frequencia_433: sincronismo longo alterou o codigo.");
+    sucesso = false;
+  }
+
+  uint16_t ruido[16];
+  for (int indice = 0; indice < 16; indice++) {
+    ruido[indice] = 400;
+  }
+  uint32_t codigo_ruido = 0;
+  uint8_t bits_ruido = 0;
+  if (sucesso && decodificaTremDePulsosRf433(ruido, 16, codigo_ruido, bits_ruido)) {
+    print_log("teste_receptor_frequencia_433: ruido foi aceito como quadro.");
+    sucesso = false;
+  }
+
+  uint16_t quadro_incompleto[] = {900, 300, 300, 900, 900, 300, 300, 900};
+  if (sucesso && decodificaTremDePulsosRf433(quadro_incompleto, 8, codigo_ruido, bits_ruido)) {
+    print_log("teste_receptor_frequencia_433: quadro incompleto foi aceito.");
+    sucesso = false;
+  }
+
+  auto injeta_quadro = [](bool valido, uint32_t codigo_injetado, uint8_t bits_injetados, unsigned long agora) {
+    quadro_rf433_injetado_pendente = true;
+    quadro_rf433_injetado_valido = valido;
+    codigo_rf433_injetado = codigo_injetado;
+    quantidade_bits_codigo_rf433_injetado = bits_injetados;
+    processaReceptorFrequencia433(agora);
+  };
+
+  if (sucesso) {
+    injeta_quadro(false, 0, 0, 1000);
+    injeta_quadro(true, 0xA5, 8, 1100);
+    if (codigo_rf433_esta_gravado) {
+      print_log("teste_receptor_frequencia_433: gravou sem quadro repetido.");
+      sucesso = false;
+    }
+  }
+  if (sucesso) {
+    injeta_quadro(true, 0xA5, 8, 1200);
+    if (!codigo_rf433_esta_gravado || codigo_rf433_gravado != 0xA5 || !gravacao_codigo_rf433_pendente ||
+        comando_rf433_portao_1_pendente) {
+      print_log("teste_receptor_frequencia_433: quadro repetido nao gravou ou ja acionou o portao.");
+      sucesso = false;
+    }
+  }
+  if (sucesso) {
+    injeta_quadro(true, 0x5A, 8, 1300);
+    injeta_quadro(true, 0x5A, 8, 1400);
+    if (codigo_rf433_gravado != 0xA5 || comando_rf433_portao_1_pendente) {
+      print_log("teste_receptor_frequencia_433: codigo diferente sobrescreveu o gravado ou acionou o portao.");
+      sucesso = false;
+    }
+  }
+  if (sucesso) {
+    injeta_quadro(true, 0xA5, 8, 1500);
+    injeta_quadro(true, 0xA5, 8, 1600);
+    if (comando_rf433_portao_1_pendente) {
+      print_log("teste_receptor_frequencia_433: comando dentro do cooldown de 1 s.");
+      sucesso = false;
+    }
+  }
+  if (sucesso) {
+    unsigned long momento_liberado = 1200 + intervalo_minimo_comando_rf433_ms;
+    injeta_quadro(true, 0xA5, 8, momento_liberado);
+    injeta_quadro(true, 0xA5, 8, momento_liberado);
+    if (!consomeComandoReceptorRf433()) {
+      print_log("teste_receptor_frequencia_433: codigo reconhecido nao acionou o portao 1.");
+      sucesso = false;
+    } else {
+      EstadoPortao portao;
+      iniciaEstadoPortao(portao, 1, false, true, 0, true);
+      processaPortao(portao, true, true, momento_liberado);
+      if (!portao.motor_acionado || !portao.abertura_autorizada) {
+        print_log("teste_receptor_frequencia_433: comando RF433 nao gerou pulso no portao 1.");
+        sucesso = false;
+      }
+    }
+  }
+  if (sucesso && consomeComandoReceptorRf433()) {
+    print_log("teste_receptor_frequencia_433: comando RF433 foi entregue duas vezes.");
+    sucesso = false;
+  }
+
+  codigo_rf433_esta_gravado = gravado_original;
+  codigo_rf433_gravado = codigo_original;
+  quantidade_bits_codigo_rf433_gravado = bits_originais;
+  gravacao_codigo_rf433_pendente = gravacao_original;
+  aguardando_repeticao_quadro_rf433 = aguardando_original;
+  comando_rf433_portao_1_pendente = comando_original;
+  momento_ultimo_comando_rf433_reconhecido = momento_original;
+  quadro_rf433_injetado_pendente = false;
+  return sucesso;
+}
+
 // Executa todos os testes da placa. Retorna false (e mostra o motivo) no primeiro teste que falhar.
 bool teste_completo() {
   print_log("");
@@ -3075,15 +4021,19 @@ bool teste_completo() {
     return false;
   }
   if (!teste_alimentacao_fotocelula()) {
-    print_log("FALHA: teste_alimentacao_fotocelula - controle das SAIDAS 4 e 5 (fotocelulas) incorreto.");
+    print_log("FALHA: teste_alimentacao_fotocelula - controle das SAIDAS 4, 5 e 6 (fotocelulas) incorreto.");
     return false;
   }
   if (!teste_saida_fotocelula_e_central_alarme()) {
-    print_log("FALHA: teste_saida_fotocelula_e_central_alarme - SAIDA 4/5 saiu de HIGH ou SAIDA 6 nao inverte a SAIDA 3.");
+    print_log("FALHA: teste_saida_fotocelula_e_central_alarme - SAIDA 4/5/6 saiu de HIGH ou SAIDA 8 nao inverte a SAIDA 7.");
     return false;
   }
   if (!teste_intertravamento()) {
     print_log("FALHA: teste_intertravamento - abertura com o outro portao aberto nao foi bloqueada ou fechamento foi bloqueado.");
+    return false;
+  }
+  if (!teste_intertravamento_tres_portoes()) {
+    print_log("FALHA: teste_intertravamento_tres_portoes - abertura com outro portao aberto nao foi bloqueada entre os 3 portoes.");
     return false;
   }
   if (!teste_comando_remoto_portao()) {
@@ -3110,6 +4060,18 @@ bool teste_completo() {
     print_log("FALHA: teste_fila_api_formato_atual - leitura das acoes da fila ou validade das acoes incorreta.");
     return false;
   }
+  if (!teste_estabilidade_wifi_esp32_s3()) {
+    print_log("FALHA: teste_estabilidade_wifi_esp32_s3 - sleep do modem ou reconexao automatica incorretos.");
+    return false;
+  }
+  if (!teste_receptor_frequencia_433()) {
+    print_log("FALHA: teste_receptor_frequencia_433 - aprendizado ou reconhecimento do controle 433 incorreto.");
+    return false;
+  }
+  if (!teste_comunicacao_pca9534()) {
+    print_log("FALHA: teste_comunicacao_pca9534 - PCA9534 nao confirmou escrita da sirene ou polaridade das entradas.");
+    return false;
+  }
 
   print_log("TESTE COMPLETO: todos os testes passaram.");
   print_log("================================");
@@ -3120,27 +4082,35 @@ bool teste_completo() {
 // SETUP
 // ============================================================
 
-// Inicializa saídas em repouso, estado dos dois portões, rede, testes e por fim a tarefa dos portões.
+// Inicializa saídas em repouso, estado dos três portões, rede, testes e por fim a tarefa dos portões.
 void setup() {
-  configuraPinos();
   Serial.begin(115200);
   delay(500);
+  configuraPinos();
 
   unsigned long agora = millis();
-  bool receptora_portao_1_acionada = digitalRead(pino_entrada_receptora_portao_1) == nivel_entrada_ativa;
-  bool sensor_portao_1_fechado = digitalRead(pino_entrada_sensor_portao_1) == nivel_entrada_ativa;
-  bool receptora_portao_2_acionada = digitalRead(pino_entrada_receptora_portao_2) == nivel_entrada_ativa;
-  bool sensor_portao_2_fechado = digitalRead(pino_entrada_sensor_portao_2) == nivel_entrada_ativa;
+  bool receptora_portao_1_acionada = false;
+  bool sensor_portao_1_fechado = true;
+  bool receptora_portao_2_acionada = false;
+  bool sensor_portao_2_fechado = true;
+  bool receptora_portao_3_acionada = false;
+  bool sensor_portao_3_fechado = true;
+  leEntradasDeCampo(receptora_portao_1_acionada, sensor_portao_1_fechado, receptora_portao_2_acionada,
+                    sensor_portao_2_fechado, receptora_portao_3_acionada, sensor_portao_3_fechado);
 
   iniciaEntradaEstabilizada(entrada_receptora_portao_1, receptora_portao_1_acionada, agora);
   iniciaEntradaEstabilizada(entrada_sensor_portao_1, sensor_portao_1_fechado, agora);
   iniciaEntradaEstabilizada(entrada_receptora_portao_2, receptora_portao_2_acionada, agora);
   iniciaEntradaEstabilizada(entrada_sensor_portao_2, sensor_portao_2_fechado, agora);
+  iniciaEntradaEstabilizada(entrada_receptora_portao_3, receptora_portao_3_acionada, agora);
+  iniciaEntradaEstabilizada(entrada_sensor_portao_3, sensor_portao_3_fechado, agora);
   iniciaEstadoPortao(estado_portao_1, 1, receptora_portao_1_acionada, sensor_portao_1_fechado, agora, false);
   iniciaEstadoPortao(estado_portao_2, 2, receptora_portao_2_acionada, sensor_portao_2_fechado, agora, false);
+  iniciaEstadoPortao(estado_portao_3, 3, receptora_portao_3_acionada, sensor_portao_3_fechado, agora, false);
   carregaConfiguracaoPortoes();
   aplicaSaidas(calculaSaidas(estado_portao_1, estado_portao_2, fotocelula_portao_1_alimentada,
-                             fotocelula_portao_2_alimentada, agora, modo_manutencao_ativo));
+                             fotocelula_portao_2_alimentada, agora, modo_manutencao_ativo, &estado_portao_3,
+                             fotocelula_portao_3_alimentada));
 
   fila_eventos_pendentes = xQueueCreate(tamanho_fila_eventos, sizeof(EventoPendente));
   fila_comandos_remotos_portao = xQueueCreate(1, sizeof(uint8_t));
@@ -3148,21 +4118,27 @@ void setup() {
 
   print_log("");
   print_log("======================================");
-  print_log("PORTGUARD - HF-006Enet");
-  print_log("CONTROLE E MONITORAMENTO - 2 PORTOES");
+  print_log("PORTGUARD - MAV1022 / ESP32-S3");
+  print_log("CONTROLE E MONITORAMENTO - 3 PORTOES");
   print_log("======================================");
-  print_log("ENTRADA 1 receptora portao 1 = GPIO" + String(pino_entrada_receptora_portao_1));
-  print_log("ENTRADA 2 sensor portao 1    = GPIO" + String(pino_entrada_sensor_portao_1));
-  print_log("ENTRADA 3 receptora portao 2 = GPIO" + String(pino_entrada_receptora_portao_2));
-  print_log("ENTRADA 4 sensor portao 2    = GPIO" + String(pino_entrada_sensor_portao_2));
-  print_log("SAIDA 1 motor portao 1       = GPIO" + String(pino_saida_motor_portao_1) + " (LOW)");
-  print_log("SAIDA 2 motor portao 2       = GPIO" + String(pino_saida_motor_portao_2) + " (LOW)");
-  print_log("SAIDA 3 sirene               = GPIO" + String(pino_saida_sirene) + " (LOW)");
-  print_log("SAIDA 4 fotocelula portao 1  = GPIO" + String(pino_saida_fotocelula_portao_1) + " (HIGH)");
-  print_log("SAIDA 5 fotocelula portao 2  = GPIO" + String(pino_saida_fotocelula_portao_2) + " (HIGH)");
-  print_log("SAIDA 6 central de alarme    = GPIO" + String(pino_saida_central_alarme) + " (HIGH, inverso da sirene)");
+  print_log("ENTRADA 1 receptora portao 1 = PCA9534 0x21 canal 1");
+  print_log("ENTRADA 2 sensor portao 1    = PCA9534 0x21 canal 2");
+  print_log("ENTRADA 3 receptora portao 2 = PCA9534 0x21 canal 3");
+  print_log("ENTRADA 4 sensor portao 2    = PCA9534 0x21 canal 4");
+  print_log("ENTRADA 5 receptora portao 3 = PCA9534 0x21 canal 5");
+  print_log("ENTRADA 6 sensor portao 3    = PCA9534 0x21 canal 6");
+  print_log("SAIDA 1 motor portao 1       = PCA9534 0x20 canal 1 (LOW)");
+  print_log("SAIDA 2 motor portao 2       = PCA9534 0x20 canal 2 (LOW)");
+  print_log("SAIDA 3 motor portao 3       = PCA9534 0x20 canal 3 (LOW)");
+  print_log("SAIDA 4 fotocelula portao 1  = PCA9534 0x20 canal 4 (HIGH)");
+  print_log("SAIDA 5 fotocelula portao 2  = PCA9534 0x20 canal 5 (HIGH)");
+  print_log("SAIDA 6 fotocelula portao 3  = PCA9534 0x20 canal 6 (HIGH)");
+  print_log("SAIDA 7 sirene               = PCA9534 0x20 canal 7 (LOW)");
+  print_log("SAIDA 8 central de alarme    = PCA9534 0x20 canal 8 (HIGH, inverso da sirene)");
+  print_log("RF433                        = GPIO48");
 
   carregarConfigWifi();
+  registraEventosWifiEsp32S3();
   iniciarEthernet();
 
   if (wifiEstaConfigurado()) {
@@ -3180,6 +4156,7 @@ void setup() {
   print_log("");
   print_log(String("Estado inicial portao 1: ") + (estado_portao_1.portao_aberto ? "aberto (contagem de tempo aberto iniciada)." : "fechado."));
   print_log(String("Estado inicial portao 2: ") + (estado_portao_2.portao_aberto ? "aberto (contagem de tempo aberto iniciada)." : "fechado."));
+  print_log(String("Estado inicial portao 3: ") + (estado_portao_3.portao_aberto ? "aberto (contagem de tempo aberto iniciada)." : "fechado."));
 
   if (fila_eventos_pendentes == nullptr) {
     print_log("ERRO: nao foi possivel criar a fila de eventos. Eventos nao serao enviados a API.");
@@ -3189,8 +4166,14 @@ void setup() {
     print_log("ATENCAO: teste_completo falhou. Verifique o motivo acima antes de instalar a placa.");
   }
 
+  aplicaSaidas(calculaSaidas(estado_portao_1, estado_portao_2, fotocelula_portao_1_alimentada,
+                             fotocelula_portao_2_alimentada, millis(), modo_manutencao_ativo, &estado_portao_3,
+                             fotocelula_portao_3_alimentada));
+  iniciaReceptorRf433();
+
   // Prioridade acima do loop (1) para que HTTP bloqueante no loop não atrase os portões.
-  if (xTaskCreatePinnedToCore(tarefaControlePortoes, "controle_portoes", 6144, nullptr, 2,
+  // Pilha de 12288 bytes: a tarefa lê I2C e o receptor RF433 junto da lógica dos portões.
+  if (xTaskCreatePinnedToCore(tarefaControlePortoes, "controle_portoes", 12288, nullptr, 2,
                               &tarefa_controle_portoes, xPortGetCoreID()) != pdPASS) {
     print_log("ERRO: nao foi possivel iniciar a tarefa de controle dos portoes.");
   }
@@ -3205,5 +4188,8 @@ void setup() {
 void loop() {
   verificarRede();
   enviaEventosPendentes();
+  if (gravacao_codigo_rf433_pendente) {
+    salvaCodigoRf433();
+  }
   delay(10);
 }

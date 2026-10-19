@@ -4,12 +4,12 @@ alwaysApply: false
 
 # Regra de negócio: intertravamento dos portões
 
-Impede que um portão seja aberto enquanto o outro já está aberto. Implementada em `script.cpp`, dentro de `processaPortao()`.
+Impede que um portão seja aberto enquanto qualquer outro já está aberto. Vale para os três portões. Implementada em `script.cpp`, dentro de `processaPortao()`.
 
 ## Regras
 - Controlada pela variável global `intertravamento_ativo` (padrão `true`). Com `false` os portões voltam a ser totalmente independentes. Alterada remotamente pela ação `intertravamento` da fila (0/1) e persistida na Preferences (ver `business-rule-configuracao-remota-placa.md`).
-- "Portão aberto" vem do sensor estabilizado (ENTRADA 2 / ENTRADA 4 em LOW, conforme `architecture.md`).
-- Comando de **abertura** (borda de subida da receptora com o próprio portão fechado) é ignorado se o outro portão estiver aberto:
+- "Portão aberto" vem do sensor estabilizado (ENTRADA 2 / ENTRADA 4 / ENTRADA 6 em LOW, conforme `architecture.md`). Os três sensores usam a mesma polaridade: opto ativo = portão fechado.
+- Comando de **abertura** (borda de subida da receptora com o próprio portão fechado) é ignorado se qualquer outro portão estiver aberto:
   - não gera pulso no motor e não abre janela de autorização;
   - registra log "Comando de abertura ignorado pelo intertravamento";
   - o comando é descartado: depois que o outro portão fechar é preciso acionar o controle novamente.
@@ -18,9 +18,10 @@ Impede que um portão seja aberto enquanto o outro já está aberto. Implementad
 - O intertravamento olha somente os sensores: um portão com comando autorizado que ainda não abriu fisicamente (dentro da janela de 3 s) não bloqueia o outro.
 
 ## Estrutura
-- `processaPortao(portao, receptora_acionada, sensor_fechado, agora, outro_portao_aberto, comando_remoto)`: `outro_portao_aberto` (padrão `false`) informa se o outro portão está aberto. Retorna `false` quando um comando foi bloqueado pelo intertravamento.
+- `processaPortao(portao, receptora_acionada, sensor_fechado, agora, outro_portao_aberto, comando_remoto)`: `outro_portao_aberto` (padrão `false`) informa se algum outro portão está aberto. Retorna `false` quando um comando foi bloqueado pelo intertravamento.
 - O intertravamento vale também para o comando remoto `open_or_close_gate` (ver `business-rule-comando-remoto-portao.md`).
-- `tarefaControlePortoes()` passa `!sensor_portao_2_fechado` para o portão 1 e `!sensor_portao_1_fechado` para o portão 2, usando as leituras estabilizadas do mesmo ciclo.
+- `tarefaControlePortoes()` passa para cada portão o OU dos outros dois sensores abertos, usando as leituras estabilizadas do mesmo ciclo: portão 1 recebe portão 2 ou 3 aberto, portão 2 recebe portão 1 ou 3, portão 3 recebe portão 1 ou 2.
 
 ## Testes
-`teste_intertravamento` (chamado em `teste_completo()`): abertura bloqueada com o outro portão aberto, abertura forçada após comando ignorado gera `gate_broken`, fechamento liberado nos dois portões, abertura liberada com o outro fechado e com `intertravamento_ativo = false`. Restaura o valor original de `intertravamento_ativo` ao final.
+`teste_intertravamento` (chamado em `teste_completo()`): abertura do portão 1 bloqueia o portão 2 e abertura do portão 2 bloqueia o portão 1; arrombamento do portão 2 gera `gate_broken` e sirene; abertura forçada após comando ignorado gera `gate_broken`; fechamento liberado; abertura liberada com o outro fechado e com `intertravamento_ativo = false`. Restaura o valor original de `intertravamento_ativo` ao final.
+`teste_intertravamento_tres_portoes` (chamado em `teste_completo()`): portão 3 aberto bloqueia a abertura dos portões 1 e 2; portão 1 ou 2 aberto bloqueia a abertura do portão 3; fechamento do portão 1 continua liberado com o portão 3 aberto; abertura forçada do portão 3 gera `gate_broken` e sirene (SAÍDA 7) com a central (SAÍDA 8) em LOW.

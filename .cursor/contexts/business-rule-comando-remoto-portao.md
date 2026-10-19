@@ -10,6 +10,7 @@ A consulta periódica da fila (`buscarConfigWifiNaApi()` via `/plaque-queues-act
 - Portão alvo vem de `action_data` (`extraiNumeroPortaoDoActionData()`):
   - ausente, vazio, `null` ou `1` = portão 1;
   - `2` = portão 2;
+  - `3` = portão 3;
   - outro valor = inválido, responde `failed` sem acionar nada.
   - Aceita número (`2`), texto (`"2"`) ou JSON normal/escapado (`{"port":2}`).
 - O comando tem o mesmo efeito de um acionamento da receptora do portão:
@@ -23,7 +24,7 @@ A consulta periódica da fila (`buscarConfigWifiNaApi()` via `/plaque-queues-act
 - Comando criado há mais de 60 s (`created_at` x relógio NTP) não é executado e responde `failed` (ver "Ações imediatas antigas" em `business-rule-configuracao-remota-placa.md`).
 
 ## Estrutura
-- `processarAbrirOuFecharPortao(queue_id, payload)` roda no `loop()` (rede). `enviaComandoRemotoParaTarefaPortoes()` envia o número do portão para `fila_comandos_remotos_portao` e espera até `tempo_espera_resultado_comando_remoto_ms` (500 ms) o resultado em `fila_resultados_comandos_remotos` (a mesma função entrega o `down_siren`, código `comando_remoto_desligar_sirene` = 3).
+- `processarAbrirOuFecharPortao(queue_id, payload)` roda no `loop()` (rede). `enviaComandoRemotoParaTarefaPortoes()` envia o número do portão para `fila_comandos_remotos_portao` e espera até `tempo_espera_resultado_comando_remoto_ms` (500 ms) o resultado em `fila_resultados_comandos_remotos` (a mesma função entrega o `down_siren`, código `comando_remoto_desligar_sirene` = 4, para não colidir com o portão 3).
 - `tarefaControlePortoes()` consome o comando a cada ciclo e passa `comando_remoto = true` para `processaPortao()` do portão alvo; devolve o retorno de `processaPortao()` (false = bloqueado pelo intertravamento).
 - O portão nunca é acionado diretamente pelo `loop()`, para não haver concorrência com a tarefa dos portões.
 

@@ -9,7 +9,7 @@ Implementada em `script.cpp`. Ativado pela ação `set_maintenance` e desativado
 ## Regras
 - Flag `modo_manutencao_ativo` (padrão `false`), persistida na Preferences (chave `manutencao`, namespace `portguard`) junto com intertravamento e fotocélula (`salvaConfiguracaoPortoes()` / `carregaConfiguracaoPortoes()`), para que uma queda de energia durante a manutenção não faça a sirene tocar ao religar.
 - Em manutenção:
-  - a sirene nunca toca (`calculaSaidas(..., modo_manutencao)` força SAÍDA 3 em LOW e, por ser inversa, SAÍDA 6 em HIGH);
+  - a sirene nunca toca (`calculaSaidas(..., modo_manutencao)` força SAÍDA 7 em LOW e, por ser inversa, SAÍDA 8 em HIGH);
   - abertura sem autorização não arma alarme nem gera `gate_broken`;
   - alarmes que já estavam ativos (abertura indevida, sirene pós-fechamento, alerta de tempo aberto) são encerrados e não voltam quando a manutenção termina;
   - a contagem de tempo aberto fica parada; se o portão continuar aberto ao sair da manutenção, o alerta de 60 s conta a partir da saída;

@@ -36,12 +36,16 @@ Canal da placa N = bit (N−1) do expansor (P0..P7). Confirmar na serigrafia se 
 | ENTRADA 2 sensor portão 1 | 2 | 1 |
 | ENTRADA 3 receptora portão 2 | 3 | 2 |
 | ENTRADA 4 sensor portão 2 | 4 | 3 |
+| ENTRADA 5 receptora portão 3 | 5 | 4 |
+| ENTRADA 6 sensor portão 3 | 6 | 5 |
 | SAÍDA 1 motor portão 1 | 1 | 0 |
 | SAÍDA 2 motor portão 2 | 2 | 1 |
-| SAÍDA 3 sirene | 3 | 2 |
+| SAÍDA 3 motor portão 3 | 3 | 2 |
 | SAÍDA 4 fotocélula portão 1 | 4 | 3 |
 | SAÍDA 5 fotocélula portão 2 | 5 | 4 |
-| SAÍDA 6 central de alarme | 6 | 5 |
+| SAÍDA 6 fotocélula portão 3 | 6 | 5 |
+| SAÍDA 7 sirene | 7 | 6 |
+| SAÍDA 8 central de alarme (inverso da sirene) | 8 | 7 |
 
 Repouso lógico (igual à regra de negócio geral): motores/sirene desenergizados; fotocélulas e central de alarme energizadas (HIGH lógico = bit 1).
 
@@ -52,8 +56,9 @@ Repouso lógico (igual à regra de negócio geral): motores/sirene desenergizado
 ## Funções
 - `configuraPinos()`: I2C 100 kHz em GPIO8/9, polaridade 0x02=0x00, PCA9534 0x20 saída / 0x21 entrada, confirma escrita lendo de volta; `pinMode(GPIO48, INPUT)`.
 - `leRegistradorPca9534ComSucesso()`: **STOP + requestFrom** (sem `endTransmission(false)`). No ESP32-S3 o repeated-start do Wire falha e deixava sensores/sirene mortos.
-- `leEntradasPca9534()` / `canalEntradaAtivo()`: leitura e polaridade ativa-baixa; loga mudança das ENTRADAS 1–4.
-- `montaByteSaidasPca9534()` / `aplicaSaidas()`: empacota os 6 níveis e **regrava sempre** o byte no 0x20 (sirene/motores não ficam presos após glitch).
+- `leEntradasPca9534()` / `canalEntradaAtivo()`: leitura e polaridade ativa-baixa; loga mudança das ENTRADAS 1–6 com o nome da função (sensor do portão = ENTRADA 2, 4 ou 6 aberta/fechada) e o byte lido. Os três sensores usam a mesma regra: bit em nível baixo = portão fechado.
+- `garanteConfiguracaoEntradasPca9534()`: latch de saída em 0xFF, polaridade 0x00 e configuração 0xFF (todos os pinos em entrada). Chamada no `configuraPinos()` e de novo a cada 1 s pela tarefa dos portões. Se um bit de sensor (ENTRADA 2, 4 ou 6) ficar como saída em nível baixo, aquele portão parece sempre fechado: o intertravamento não bloqueia os outros e o arrombamento não arma sirene nem `gate_broken`.
+- `montaByteSaidasPca9534()` / `aplicaSaidas()`: empacota os 8 níveis e **regrava sempre** o byte no 0x20 (sirene/motores não ficam presos após glitch). Repouso das saídas = 0xB8 (fotocélulas e central em HIGH; motores e sirene em LOW).
 - `iniciaReceptorRf433()`: `attachInterrupt` no GPIO48 após os testes do `setup()`.
 - Tarefa dos portões: pilha 12288 bytes (evita crash que matava I/O).
 

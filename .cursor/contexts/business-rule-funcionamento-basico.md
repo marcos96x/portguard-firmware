@@ -2,9 +2,9 @@
 alwaysApply: false
 ---
 
-# Regra de negócio: funcionamento básico da placa (2 portões)
+# Regra de negócio: funcionamento básico da placa (3 portões)
 
-Lógica local que mantém a placa operando de forma autônoma, com os portões 1 e 2 independentes. Implementada em `script.cpp` (placa **MAV1022** / ESP32-S3). Detalhe do hardware em `business-rule-hardware-mav1022.md`.
+Lógica local que mantém a placa operando de forma autônoma, com os portões 1, 2 e 3. Implementada em `script.cpp` (placa **MAV1022** / ESP32-S3). Detalhe do hardware em `business-rule-hardware-mav1022.md`.
 
 ## Pinagem (canais do PCA9534, não GPIOs diretos)
 | Função | Canal (bit) | Repouso lógico |
@@ -13,12 +13,16 @@ Lógica local que mantém a placa operando de forma autônoma, com os portões 1
 | ENTRADA 2 - Sensor portão 1 | 2 (bit 1) | ativo = fechado |
 | ENTRADA 3 - Receptora portão 2 | 3 (bit 2) | inativo |
 | ENTRADA 4 - Sensor portão 2 | 4 (bit 3) | ativo = fechado |
+| ENTRADA 5 - Receptora portão 3 | 5 (bit 4) | inativo |
+| ENTRADA 6 - Sensor portão 3 | 6 (bit 5) | ativo = fechado |
 | SAÍDA 1 - Motor portão 1 | 1 (bit 0) | desenergizado |
 | SAÍDA 2 - Motor portão 2 | 2 (bit 1) | desenergizado |
-| SAÍDA 3 - Sirene | 3 (bit 2) | desenergizado |
+| SAÍDA 3 - Motor portão 3 | 3 (bit 2) | desenergizado |
 | SAÍDA 4 - Fotocélula portão 1 | 4 (bit 3) | energizado |
 | SAÍDA 5 - Fotocélula portão 2 | 5 (bit 4) | energizado |
-| SAÍDA 6 - Central de alarme (inverso da SAÍDA 3) | 6 (bit 5) | energizado |
+| SAÍDA 6 - Fotocélula portão 3 | 6 (bit 5) | energizado |
+| SAÍDA 7 - Sirene | 7 (bit 6) | desenergizado |
+| SAÍDA 8 - Central de alarme (inverso da SAÍDA 7) | 8 (bit 7) | energizado |
 
 Entradas/saídas via PCA9534 (0x21 / 0x20) no I2C GPIO8/GPIO9. Ethernet W5500: MOSI11, MISO12, SCK13, CS14, INT10, RST7.
 
@@ -37,8 +41,8 @@ Entradas/saídas via PCA9534 (0x21 / 0x20) no I2C GPIO8/GPIO9. Ethernet W5500: M
 - Portão fecha: evento `gate_close`, encerra alarmes daquele portão (exceto a sirene pós-fechamento de abertura indevida) e envia `gate_timeout_close` se havia alerta de tempo.
 - Sirene liga se qualquer portão tiver alarme; abertura indevida (aberta ou nos 120 s pós-fechamento) tem prioridade (contínua) sobre a intermitente.
 - A ação `down_siren` da fila desliga a sirene (ver `business-rule-desligar-sirene.md`).
-- SAÍDA 6 é sempre o inverso da SAÍDA 3.
-- SAÍDAS 4 e 5 (fotocélulas dos portões 1 e 2) ficam em HIGH, independente da sirene e de qualquer sensor; só mudam pelas ações `fotocelula_1` / `fotocelula_2` da fila, cada uma com sua flag persistida (ver `business-rule-configuracao-remota-placa.md`).
+- SAÍDA 8 é sempre o inverso da SAÍDA 7 (sirene).
+- SAÍDAS 4, 5 e 6 (fotocélulas dos portões 1, 2 e 3) ficam em HIGH, independente da sirene e de qualquer sensor; só mudam pelas ações `fotocelula_1` / `fotocelula_2` / `fotocelula_3` da fila, cada uma com sua flag persistida (ver `business-rule-configuracao-remota-placa.md`).
 - O estado das entradas na inicialização é tomado como referência e não gera eventos.
 
 ## Estrutura
