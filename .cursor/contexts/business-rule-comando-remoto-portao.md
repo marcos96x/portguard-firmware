@@ -14,7 +14,7 @@ A consulta periódica da fila (`buscarConfigWifiNaApi()` via `/plaque-queues-act
   - outro valor = inválido, responde `failed` sem acionar nada.
   - Aceita número (`2`), texto (`"2"`) ou JSON normal/escapado (`{"port":2}`).
 - O comando tem o mesmo efeito de um acionamento da receptora do portão:
-  - portão fechado: pulso no motor e janela de autorização de 8 s (a abertura não gera `gate_broken`; repique do sensor durante o pulso do relé não gasta a autorização);
+  - portão fechado: pulso no motor e janela de autorização de 13 s (a abertura não gera `gate_broken`; repique do sensor durante o pulso do relé não gasta a autorização; sensor que abre depois dos 13 s dispara a sirene);
   - portão aberto: pulso no motor para fechamento;
   - respeita o intertravamento (`business-rule-intertravamento.md`): abertura com o outro portão aberto é bloqueada.
 - Resposta à fila (`/plaque-queues-actions/save`): `completed` se o motor foi acionado; `failed` se bloqueado pelo intertravamento, `action_data` inválido ou tarefa dos portões sem resposta.

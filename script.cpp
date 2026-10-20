@@ -47,9 +47,17 @@
   GPIO10 = INT
   GPIO7  = RESET
 
-  GPIO48 = receptor RF433 (sinal invertido por Q2)
+  GPIO48 = receptor RF433 (sinal invertido por Q2). Com o botao de gravar
+           controle, a janela de 20 s imprime o quadro RF de cada tecla.
+           Esse aviso nao aciona rele.
+  GPIO5  = botao cadastrar controle (ativo em nivel baixo). Depois do botao,
+           o comando repetido do controle e gravado e aparece no monitor serial.
+           Acionar esse controle abre o portao 1.
   GPIO19/GPIO20 = USB nativa (não usar)
   GPIO15/GPIO16 = cristal do RTC (não usar)
+  GPIO3  = LED azul D6 (Wi-Fi): aceso com IP, apagado sem conexao
+  GPIO21 = LED vermelho D7 (Ethernet): aceso com cabo e IP, apagado sem link
+  GPIO47 = LED laranja D8 (status): 1 s aceso e 1 s apagado, ritmo de conexao com o servidor
 
   ------------------------------------------------------------
   FUNCIONAMENTO (portões 1, 2 e 3)
@@ -60,7 +68,7 @@
 
   1. Comando na receptora do portão:
      - Motor do portão recebe pulso de 1 segundo.
-     - Com o portão fechado, libera janela de 8 segundos para abertura.
+     - Com o portão fechado, libera janela de 13 segundos para abertura.
        Repique do sensor enquanto o relé do motor está atracado não gasta essa autorização.
      - Intertravamento (intertravamento_ativo): comando de abertura é
        ignorado enquanto qualquer outro portão da placa estiver aberto.
@@ -256,12 +264,34 @@ const uint8_t canal_saida_sirene = 7;
 const uint8_t canal_saida_central_alarme = 8;
 
 const uint8_t pino_receptor_rf433 = 48;
+const uint8_t pino_botao_cadastrar_controle = 5;
+// LEDs da MAV1022 (manual revisão 1.1). Nível alto acende o LED.
+const uint8_t pino_led_wifi = 3;
+const uint8_t pino_led_ethernet = 21;
+const uint8_t pino_led_status_servidor = 47;
+const unsigned long tempo_piscada_led_status_servidor_ms = 1000;
+const unsigned long tempo_espera_cadastro_controle_rf433_ms = 20000;
+const uint8_t quantidade_maxima_controles_rf433 = 8;
 const unsigned long silencio_fim_quadro_rf433_us = 5000;
 const unsigned long intervalo_minimo_comando_rf433_ms = 1000;
-const int quantidade_maxima_pulsos_rf433 = 80;
+const int quantidade_maxima_pulsos_rf433 = 96;
 const int quantidade_minima_pulsos_quadro_rf433 = 16;
 const int bits_minimos_quadro_rf433 = 8;
 const int bits_maximos_quadro_rf433 = 32;
+const unsigned long intervalo_minimo_pulso_util_rf433_us = 250;
+const unsigned long intervalo_maximo_pulso_util_rf433_us = 1500;
+const int quantidade_minima_intervalos_assinatura_rf433 = 50;
+const int quantidade_maxima_intervalos_assinatura_rf433 = 70;
+const unsigned long intervalo_minimo_mensagem_assinatura_rf433_ms = 300;
+const uint16_t duracao_pulso_curto_minima_rf433_us = 350;
+const uint16_t duracao_pulso_curto_maxima_rf433_us = 650;
+const uint16_t duracao_pulso_longo_minima_rf433_us = 800;
+const uint16_t duracao_pulso_longo_maxima_rf433_us = 1150;
+const uint32_t base_assinatura_fnv_rf433 = 2166136261UL;
+const uint32_t primo_assinatura_fnv_rf433 = 16777619UL;
+const uint32_t assinatura_botao_1_controle_rf433 = 0xFE280B33UL;
+const uint32_t assinatura_botao_2_controle_rf433 = 0xE5B7B297UL;
+const uint32_t assinatura_botao_3_controle_rf433 = 0x6958C26BUL;
 
 // Bits 0, 2 e 4 em alto: receptoras inativas. Bits 1, 3 e 5 em baixo: sensores ativos (portões fechados).
 const uint8_t byte_entradas_repouso_seguro_pca9534 = 0x15;
@@ -271,7 +301,9 @@ const uint8_t byte_entradas_repouso_seguro_pca9534 = 0x15;
 // ============================================================
 
 const unsigned long tempo_pulso_motor_ms = 1000;
-const unsigned long janela_comando_autorizado_ms = 8000;
+// 8 s originais mais 5 s: o sensor do portão comandado pode demorar a abrir sem virar arrombamento.
+const unsigned long acrescimo_janela_abertura_comando_ms = 5000;
+const unsigned long janela_comando_autorizado_ms = 8000 + acrescimo_janela_abertura_comando_ms;
 const unsigned long tempo_sirene_apos_fechamento_abertura_indevida_ms = 120000;
 const unsigned long tempo_maximo_portao_aberto_ms = 60000;
 const unsigned long tempo_sirene_ligada_alerta_ms = 1000;
@@ -360,6 +392,12 @@ uint32_t codigo_rf433_candidato = 0;
 uint8_t quantidade_bits_codigo_rf433_candidato = 0;
 unsigned long momento_ultimo_comando_rf433_reconhecido = 0;
 volatile bool comando_rf433_portao_1_pendente = false;
+bool cadastro_controle_rf433_ativo = false;
+unsigned long momento_inicio_cadastro_controle_rf433 = 0;
+bool escuta_botao_cadastrar_controle = false;
+uint8_t quantidade_controles_rf433_gravados = 0;
+uint32_t codigos_controles_rf433[quantidade_maxima_controles_rf433];
+uint8_t bits_controles_rf433[quantidade_maxima_controles_rf433];
 bool quadro_rf433_injetado_pendente = false;
 bool quadro_rf433_injetado_valido = false;
 uint32_t codigo_rf433_injetado = 0;
@@ -369,7 +407,12 @@ volatile uint16_t duracoes_pulsos_rf433[quantidade_maxima_pulsos_rf433];
 volatile int quantidade_pulsos_capturados_rf433 = 0;
 volatile uint32_t momento_ultima_borda_rf433_us = 0;
 volatile bool quadro_rf433_pronto_para_decodificar = false;
+volatile bool quadro_rf433_excedeu_pulsos = false;
 volatile bool receptor_rf433_iniciado = false;
+unsigned long momento_ultima_mensagem_assinatura_rf433 = 0;
+uint32_t quantidade_quadros_assinatura_rf433 = 0;
+uint32_t quantidade_quadros_assinatura_rf433_regulares = 0;
+uint32_t quantidade_quadros_assinatura_rf433_rejeitados = 0;
 
 // gate_broken é notificação crítica: depois de um envio com sucesso, novos gate_broken (de qualquer portão)
 // dentro de intervalo_minimo_entre_gate_broken_ms não são enviados para a API.
@@ -769,9 +812,9 @@ uint8_t montaByteSaidasPca9534(const NiveisSaidas &niveis) {
   if (niveis.fotocelula_portao_3 == HIGH) {
     byte_saidas |= (uint8_t)(1 << (canal_saida_fotocelula_portao_3 - 1));
   }
-  // Relé 8 é o inverso da sirene. Sirene disparada (bit 6 em 1) deixa o relé 8 desenergizado
-  // (bit 7 em 0): o contato da central abre. Em repouso o relé 8 fica energizado (contato fechado).
-  if (niveis.sirene != HIGH) {
+  // Relé 8 é o inverso da sirene. Com a sirene disparada o bit 7 fica em 0: o relé desliga
+  // e o contato da central abre. Em repouso o relé 8 fica energizado (contato fechado).
+  if (niveis.sirene != HIGH && niveis.central_alarme == HIGH) {
     byte_saidas |= (uint8_t)(1 << (canal_saida_central_alarme - 1));
   }
   return byte_saidas;
@@ -883,6 +926,60 @@ void configuraPinos() {
   }
 
   pinMode(pino_receptor_rf433, INPUT);
+  pinMode(pino_botao_cadastrar_controle, INPUT_PULLUP);
+  pinMode(pino_led_wifi, OUTPUT);
+  pinMode(pino_led_ethernet, OUTPUT);
+  pinMode(pino_led_status_servidor, OUTPUT);
+  digitalWrite(pino_led_wifi, LOW);
+  digitalWrite(pino_led_ethernet, LOW);
+  digitalWrite(pino_led_status_servidor, LOW);
+}
+
+// Nível do LED de link: alto enquanto a interface tem conexão, baixo quando perde.
+uint8_t nivelLedConexao(bool conectado) {
+  return conectado ? HIGH : LOW;
+}
+
+// Nível do LED de status: 1 s aceso e 1 s apagado, o ritmo que mostra a placa em contato com o servidor.
+uint8_t nivelLedStatusServidor(unsigned long agora) {
+  bool aceso = (agora / tempo_piscada_led_status_servidor_ms) % 2 == 0;
+  return aceso ? HIGH : LOW;
+}
+
+// Atualiza os três LEDs da placa. Wi-Fi e cabo seguem a conexão; o status pisca sem usar delay.
+void atualizaLedsIndicadoresRede(unsigned long agora) {
+  static uint8_t nivel_anterior_led_wifi = 0xFF;
+  static uint8_t nivel_anterior_led_ethernet = 0xFF;
+  static uint8_t nivel_anterior_led_status = 0xFF;
+
+  uint8_t nivel_wifi = nivelLedConexao(wifiConectado());
+  uint8_t nivel_ethernet = nivelLedConexao(caboConectado());
+  uint8_t nivel_status = nivelLedStatusServidor(agora);
+
+  if (nivel_wifi != nivel_anterior_led_wifi) {
+    bool mudou = nivel_anterior_led_wifi != 0xFF;
+    nivel_anterior_led_wifi = nivel_wifi;
+    digitalWrite(pino_led_wifi, nivel_wifi);
+    if (mudou) {
+      print_log(nivel_wifi == HIGH ? "LED Wi-Fi aceso: placa com conexao Wi-Fi."
+                                   : "LED Wi-Fi apagado: conexao Wi-Fi perdida.");
+    }
+  }
+
+  if (nivel_ethernet != nivel_anterior_led_ethernet) {
+    bool mudou = nivel_anterior_led_ethernet != 0xFF;
+    nivel_anterior_led_ethernet = nivel_ethernet;
+    digitalWrite(pino_led_ethernet, nivel_ethernet);
+    if (mudou) {
+      print_log(nivel_ethernet == HIGH ? "LED Ethernet aceso: cabo com conexao."
+                                       : "LED Ethernet apagado: cabo sem conexao.");
+    }
+  }
+
+  if (nivel_status != nivel_anterior_led_status) {
+    nivel_anterior_led_status = nivel_status;
+    digitalWrite(pino_led_status_servidor, nivel_status);
+  }
 }
 
 // Inicializa o filtro de estabilização de uma entrada com a leitura atual.
@@ -1120,13 +1217,19 @@ NiveisSaidas calculaSaidas(const EstadoPortao &portao_1, const EstadoPortao &por
   bool considerar_portao_3 = quantidade_portoes >= 3 && portao_3 != nullptr;
   bool fotocelula_portao_2_da_placa = quantidade_portoes >= 2;
   bool fotocelula_portao_3_da_placa = quantidade_portoes >= 3;
-  const EstadoPortao *portoes[] = {&portao_1, considerar_portao_2 ? &portao_2 : nullptr,
-                                   considerar_portao_3 ? portao_3 : nullptr};
-  const int quantidade_considerada = considerar_portao_3 ? 3 : (considerar_portao_2 ? 2 : 1);
   bool sirene_ligada = false;
 
-  for (int indice = 0; indice < quantidade_considerada; indice++) {
-    const EstadoPortao *portao = portoes[indice];
+  // Cada portão entra na sirene pelo próprio estado. O portão 3 não pode ficar de fora:
+  // arrombamento nele liga a SAÍDA 7 e derruba a SAÍDA 8 junto com os outros portões.
+  const EstadoPortao *portao_considerado_1 = &portao_1;
+  const EstadoPortao *portao_considerado_2 = considerar_portao_2 ? &portao_2 : nullptr;
+  const EstadoPortao *portao_considerado_3 = considerar_portao_3 ? portao_3 : nullptr;
+  const EstadoPortao *portoes_considerados[] = {portao_considerado_1, portao_considerado_2, portao_considerado_3};
+  for (int indice = 0; indice < 3; indice++) {
+    const EstadoPortao *portao = portoes_considerados[indice];
+    if (portao == nullptr) {
+      continue;
+    }
     if (portao->alarme_abertura_indevida_ativo || portao->sirene_apos_fechamento_indevido_ativa) {
       sirene_ligada = true;
     } else if (portao->alerta_tempo_aberto_ativo &&
@@ -1155,24 +1258,28 @@ void aplicaSaidas(const NiveisSaidas &niveis) {
   static uint8_t ultimo_nivel_sirene = LOW;
   static bool escrita_saidas_falhou = false;
 
-  uint8_t byte_saidas = montaByteSaidasPca9534(niveis);
+  NiveisSaidas niveis_aplicados = niveis;
+  if (niveis_aplicados.sirene == HIGH) {
+    niveis_aplicados.central_alarme = LOW;
+  }
+  uint8_t byte_saidas = montaByteSaidasPca9534(niveis_aplicados);
   bool gravou = escreveRegistradorPca9534(endereco_pca9534_saidas, registrador_saida_pca9534, byte_saidas);
   if (!gravou && !escrita_saidas_falhou) {
     print_log("ERRO: falha ao gravar as saidas no PCA9534 0x20.");
   }
   escrita_saidas_falhou = !gravou;
 
-  if (niveis.sirene != ultimo_nivel_sirene) {
-    ultimo_nivel_sirene = niveis.sirene;
-    print_log(niveis.sirene == HIGH ? "Sirene ligada (SAIDA 7 em HIGH). Rele 8 aberto (SAIDA 8 em LOW)."
-                                   : "Sirene desligada (SAIDA 7 em LOW). Rele 8 fechado (SAIDA 8 em HIGH).");
+  if (niveis_aplicados.sirene != ultimo_nivel_sirene) {
+    ultimo_nivel_sirene = niveis_aplicados.sirene;
+    print_log(niveis_aplicados.sirene == HIGH ? "Sirene ligada (SAIDA 7 em HIGH). Rele 8 aberto (SAIDA 8 em LOW)."
+                                             : "Sirene desligada (SAIDA 7 em LOW). Rele 8 fechado (SAIDA 8 em HIGH).");
   }
 
   static uint8_t ultimo_nivel_fotocelula_portao_3 = HIGH;
-  if (niveis.fotocelula_portao_3 != ultimo_nivel_fotocelula_portao_3) {
-    ultimo_nivel_fotocelula_portao_3 = niveis.fotocelula_portao_3;
-    print_log(niveis.fotocelula_portao_3 == HIGH ? "Fotocelula do portao 3 alimentada (SAIDA 6 em HIGH)."
-                                                : "Fotocelula do portao 3 desligada (SAIDA 6 em LOW).");
+  if (niveis_aplicados.fotocelula_portao_3 != ultimo_nivel_fotocelula_portao_3) {
+    ultimo_nivel_fotocelula_portao_3 = niveis_aplicados.fotocelula_portao_3;
+    print_log(niveis_aplicados.fotocelula_portao_3 == HIGH ? "Fotocelula do portao 3 alimentada (SAIDA 6 em HIGH)."
+                                                         : "Fotocelula do portao 3 desligada (SAIDA 6 em LOW).");
   }
 }
 
@@ -1239,6 +1346,85 @@ void defineManutencaoPortao(uint8_t numero_portao, bool ativo) {
   print_log(String("Manutencao do portao ") + String(numero_portao) + (ativo ? " ATIVADA." : " DESATIVADA."));
 }
 
+// Classifica um intervalo do controle: S curto, L longo, ou ? fora da faixa usada na assinatura.
+char classificaIntervaloPulsoRf433(uint16_t duracao_us) {
+  if (duracao_us >= duracao_pulso_curto_minima_rf433_us && duracao_us <= duracao_pulso_curto_maxima_rf433_us) {
+    return 'S';
+  }
+  if (duracao_us >= duracao_pulso_longo_minima_rf433_us && duracao_us <= duracao_pulso_longo_maxima_rf433_us) {
+    return 'L';
+  }
+  return '?';
+}
+
+// Monta a assinatura FNV-1a da sequencia de simbolos. O mesmo quadro do controle gera sempre o mesmo codigo.
+uint32_t calculaAssinaturaSimbolosRf433(const char *simbolos, uint8_t tamanho) {
+  uint32_t assinatura = base_assinatura_fnv_rf433;
+  assinatura ^= tamanho;
+  assinatura *= primo_assinatura_fnv_rf433;
+  for (uint8_t indice = 0; indice < tamanho; indice++) {
+    assinatura ^= (uint8_t)simbolos[indice];
+    assinatura *= primo_assinatura_fnv_rf433;
+  }
+  return assinatura;
+}
+
+// Traduz a assinatura para o botao conhecido do controle. Assinatura nova permanece apenas no monitor serial.
+String identificaAssinaturaControleRf433(uint32_t assinatura) {
+  if (assinatura == assinatura_botao_1_controle_rf433) {
+    return ">>> BOTAO 1 IDENTIFICADO";
+  }
+  if (assinatura == assinatura_botao_2_controle_rf433) {
+    return ">>> BOTAO 2 IDENTIFICADO";
+  }
+  if (assinatura == assinatura_botao_3_controle_rf433) {
+    return ">>> BOTAO 3 IDENTIFICADO";
+  }
+  return ">>> ASSINATURA DESCONHECIDA";
+}
+
+// Aceita o quadro do controle, calcula a assinatura e mostra no formato QUADRO RF. Nao aciona rele.
+bool analisaQuadroAssinaturaRf433(const uint16_t *duracoes_us, int quantidade_intervalos, uint32_t &assinatura) {
+  quantidade_quadros_assinatura_rf433++;
+  if (quantidade_intervalos < quantidade_minima_intervalos_assinatura_rf433 ||
+      quantidade_intervalos > quantidade_maxima_intervalos_assinatura_rf433) {
+    quantidade_quadros_assinatura_rf433_rejeitados++;
+    return false;
+  }
+
+  char simbolos[quantidade_maxima_pulsos_rf433 + 1];
+  int intervalos_regulares = 0;
+  for (int indice = 0; indice < quantidade_intervalos; indice++) {
+    simbolos[indice] = classificaIntervaloPulsoRf433(duracoes_us[indice]);
+    if (simbolos[indice] != '?') {
+      intervalos_regulares++;
+    }
+  }
+  simbolos[quantidade_intervalos] = '\0';
+
+  if ((uint32_t)intervalos_regulares * 100 < (uint32_t)quantidade_intervalos * 90) {
+    quantidade_quadros_assinatura_rf433_rejeitados++;
+    return false;
+  }
+
+  quantidade_quadros_assinatura_rf433_regulares++;
+  assinatura = calculaAssinaturaSimbolosRf433(simbolos, (uint8_t)quantidade_intervalos);
+  if (millis() - momento_ultima_mensagem_assinatura_rf433 < intervalo_minimo_mensagem_assinatura_rf433_ms) {
+    return true;
+  }
+
+  momento_ultima_mensagem_assinatura_rf433 = millis();
+  print_log("");
+  print_log("==============================");
+  print_log("QUADRO RF CAPTURADO!");
+  print_log("Intervalos: " + String(quantidade_intervalos));
+  print_log("Assinatura: 0x" + String(assinatura, HEX));
+  print_log("Simbolos: " + String(simbolos));
+  print_log(identificaAssinaturaControleRf433(assinatura));
+  print_log("==============================");
+  return true;
+}
+
 // Classifica um trem de pulsos curto/longo em um código binário. Ignora o silêncio de sincronismo e ruído sem par curto/longo.
 bool decodificaTremDePulsosRf433(const uint16_t *duracoes_us, int quantidade_pulsos, uint32_t &codigo, uint8_t &quantidade_bits) {
   uint16_t duracoes_uteis[quantidade_maxima_pulsos_rf433];
@@ -1285,6 +1471,7 @@ bool consomeQuadroCapturadoRf433(uint32_t &codigo, uint8_t &quantidade_bits) {
   uint32_t desde_ultima_borda_us = micros() - momento_ultima_borda_rf433_us;
   if (!quadro_rf433_pronto_para_decodificar && receptor_rf433_iniciado &&
       quantidade_pulsos_capturados_rf433 >= quantidade_minima_pulsos_quadro_rf433 &&
+      !quadro_rf433_excedeu_pulsos && momento_ultima_borda_rf433_us != 0 &&
       desde_ultima_borda_us >= silencio_fim_quadro_rf433_us) {
     quadro_rf433_pronto_para_decodificar = true;
   }
@@ -1295,17 +1482,75 @@ bool consomeQuadroCapturadoRf433(uint32_t &codigo, uint8_t &quantidade_bits) {
     }
     quantidade_pulsos_capturados_rf433 = 0;
     quadro_rf433_pronto_para_decodificar = false;
+    quadro_rf433_excedeu_pulsos = false;
   }
   interrupts();
 
   if (quantidade <= 0) {
     return false;
   }
+  if (cadastro_controle_rf433_ativo) {
+    uint32_t assinatura_quadro = 0;
+    analisaQuadroAssinaturaRf433(copia_duracoes, quantidade, assinatura_quadro);
+  }
   return decodificaTremDePulsosRf433(copia_duracoes, quantidade, codigo, quantidade_bits);
 }
 
-// Fecha a captura por silêncio, exige o mesmo quadro duas vezes, grava o primeiro código ou reconhece o já gravado.
+// Escreve no monitor serial o comando binário recebido do controle (o que a IDE mostra no prompt).
+void imprimeComandoControleRf433(const String &prefixo, uint32_t codigo, uint8_t quantidade_bits) {
+  String bits_texto = "";
+  for (int indice = (int)quantidade_bits - 1; indice >= 0; indice--) {
+    bits_texto += ((codigo >> indice) & 1u) ? "1" : "0";
+  }
+  print_log(prefixo + " codigo 0x" + String(codigo, HEX) + " (" + String(quantidade_bits) + " bits) " + bits_texto);
+}
+
+// Abre a janela em que o próximo controle repetido é cadastrado. O botão GPIO5 e o teste chamam esta função.
+void abreCadastroControleRf433(unsigned long agora) {
+  cadastro_controle_rf433_ativo = true;
+  momento_inicio_cadastro_controle_rf433 = agora;
+  aguardando_repeticao_quadro_rf433 = false;
+  print_log("Botao cadastrar controle pressionado (GPIO5). Aperte o botao do controle.");
+  print_log("O comando enviado pelo controle aparece neste monitor serial.");
+  print_log("Janela de 20 segundos aberta. O quadro RF de cada tecla aparece aqui.");
+}
+
+// Diz se este código já está na lista de controles cadastrados.
+bool controleRf433JaCadastrado(uint32_t codigo, uint8_t quantidade_bits) {
+  for (uint8_t indice = 0; indice < quantidade_controles_rf433_gravados; indice++) {
+    if (codigos_controles_rf433[indice] == codigo && bits_controles_rf433[indice] == quantidade_bits) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Fecha a captura por silêncio, exige o mesmo quadro duas vezes e, com o botão de cadastrar controle,
+// grava o comando. Controle já cadastrado abre o portão 1.
 void processaReceptorFrequencia433(unsigned long agora) {
+  if (escuta_botao_cadastrar_controle) {
+    static bool leitura_anterior_botao = false;
+    static bool botao_pressionado_estavel = false;
+    static unsigned long momento_mudanca_botao = 0;
+    bool botao_pressionado = digitalRead(pino_botao_cadastrar_controle) == LOW;
+    if (botao_pressionado != leitura_anterior_botao) {
+      leitura_anterior_botao = botao_pressionado;
+      momento_mudanca_botao = agora;
+    } else if (botao_pressionado != botao_pressionado_estavel &&
+               agora - momento_mudanca_botao >= tempo_estabilizacao_entrada_ms) {
+      botao_pressionado_estavel = botao_pressionado;
+      if (botao_pressionado_estavel) {
+        abreCadastroControleRf433(agora);
+      }
+    }
+  }
+
+  if (cadastro_controle_rf433_ativo &&
+      agora - momento_inicio_cadastro_controle_rf433 > tempo_espera_cadastro_controle_rf433_ms) {
+    cadastro_controle_rf433_ativo = false;
+    print_log("Cadastro de controle encerrado: nenhum comando repetido chegou a tempo.");
+  }
+
   bool tem_quadro = false;
   bool quadro_valido = false;
   uint32_t codigo = 0;
@@ -1335,22 +1580,46 @@ void processaReceptorFrequencia433(unsigned long agora) {
     codigo_rf433_candidato = codigo;
     quantidade_bits_codigo_rf433_candidato = quantidade_bits;
     aguardando_repeticao_quadro_rf433 = true;
+    if (cadastro_controle_rf433_ativo) {
+      imprimeComandoControleRf433("Comando enviado pelo controle:", codigo, quantidade_bits);
+    }
     return;
   }
   aguardando_repeticao_quadro_rf433 = false;
 
-  if (!codigo_rf433_esta_gravado) {
+  if (cadastro_controle_rf433_ativo) {
+    cadastro_controle_rf433_ativo = false;
+    imprimeComandoControleRf433("Comando confirmado do controle:", codigo, quantidade_bits);
+    if (controleRf433JaCadastrado(codigo, quantidade_bits)) {
+      print_log("Este controle ja estava cadastrado. Aciona-lo abre o portao 1.");
+      return;
+    }
+    if (quantidade_controles_rf433_gravados >= quantidade_maxima_controles_rf433) {
+      for (uint8_t indice = 0; indice + 1 < quantidade_maxima_controles_rf433; indice++) {
+        codigos_controles_rf433[indice] = codigos_controles_rf433[indice + 1];
+        bits_controles_rf433[indice] = bits_controles_rf433[indice + 1];
+      }
+      quantidade_controles_rf433_gravados = quantidade_maxima_controles_rf433 - 1;
+      print_log("Lista de controles cheia. O cadastro mais antigo foi substituido.");
+    }
+    codigos_controles_rf433[quantidade_controles_rf433_gravados] = codigo;
+    bits_controles_rf433[quantidade_controles_rf433_gravados] = quantidade_bits;
+    quantidade_controles_rf433_gravados++;
     codigo_rf433_esta_gravado = true;
     codigo_rf433_gravado = codigo;
     quantidade_bits_codigo_rf433_gravado = quantidade_bits;
     gravacao_codigo_rf433_pendente = true;
     momento_ultimo_comando_rf433_reconhecido = agora;
-    print_log("Receptor RF433: primeiro codigo repetido gravado. Os proximos acionamentos iguais abrem o portao 1.");
+    print_log("Controle cadastrado. Os proximos acionamentos deste comando abrem o portao 1.");
     return;
   }
 
-  if (codigo != codigo_rf433_gravado || quantidade_bits != quantidade_bits_codigo_rf433_gravado) {
-    print_log("Receptor RF433: codigo diferente do gravado, ignorado.");
+  if (!controleRf433JaCadastrado(codigo, quantidade_bits)) {
+    if (quantidade_controles_rf433_gravados == 0) {
+      print_log("Receptor RF433: controle ignorado. Aperte o botao cadastrar controle e aperte o controle de novo.");
+    } else {
+      print_log("Receptor RF433: codigo diferente dos controles cadastrados, ignorado.");
+    }
     return;
   }
 
@@ -1360,7 +1629,7 @@ void processaReceptorFrequencia433(unsigned long agora) {
 
   momento_ultimo_comando_rf433_reconhecido = agora;
   comando_rf433_portao_1_pendente = true;
-  print_log("Receptor RF433: codigo reconhecido. Comando no portao 1.");
+  imprimeComandoControleRf433("Receptor RF433: comando reconhecido. Abrindo o portao 1.", codigo, quantidade_bits);
 }
 
 // Entrega o comando RF433 já reconhecido uma única vez para a tarefa dos portões.
@@ -1372,26 +1641,40 @@ bool consomeComandoReceptorRf433() {
   return true;
 }
 
-// Captura as durações entre bordas do GPIO48. O silêncio fecha o quadro; a decodificação fica fora da interrupção.
+// Captura as durações entre bordas do GPIO48. Pulso fora da faixa zera o quadro; o silêncio fecha a captura.
 void IRAM_ATTR trataInterrupcaoReceptorRf433() {
   uint32_t agora_us = micros();
+  if (momento_ultima_borda_rf433_us == 0) {
+    momento_ultima_borda_rf433_us = agora_us;
+    return;
+  }
+
   uint32_t duracao_us = agora_us - momento_ultima_borda_rf433_us;
   momento_ultima_borda_rf433_us = agora_us;
+  if (quadro_rf433_pronto_para_decodificar) {
+    return;
+  }
 
   if (duracao_us >= silencio_fim_quadro_rf433_us) {
-    if (quantidade_pulsos_capturados_rf433 >= quantidade_minima_pulsos_quadro_rf433) {
+    if (quantidade_pulsos_capturados_rf433 >= quantidade_minima_pulsos_quadro_rf433 && !quadro_rf433_excedeu_pulsos) {
       quadro_rf433_pronto_para_decodificar = true;
     } else {
       quantidade_pulsos_capturados_rf433 = 0;
+      quadro_rf433_excedeu_pulsos = false;
     }
     return;
   }
 
-  if (quadro_rf433_pronto_para_decodificar) {
+  if (duracao_us < intervalo_minimo_pulso_util_rf433_us || duracao_us > intervalo_maximo_pulso_util_rf433_us) {
+    quantidade_pulsos_capturados_rf433 = 0;
+    quadro_rf433_excedeu_pulsos = false;
     return;
   }
-  if (quantidade_pulsos_capturados_rf433 < quantidade_maxima_pulsos_rf433 && duracao_us <= 65535) {
+
+  if (quantidade_pulsos_capturados_rf433 < quantidade_maxima_pulsos_rf433) {
     duracoes_pulsos_rf433[quantidade_pulsos_capturados_rf433++] = (uint16_t)duracao_us;
+  } else {
+    quadro_rf433_excedeu_pulsos = true;
   }
 }
 
@@ -1399,38 +1682,72 @@ void IRAM_ATTR trataInterrupcaoReceptorRf433() {
 void iniciaReceptorRf433() {
   quantidade_pulsos_capturados_rf433 = 0;
   quadro_rf433_pronto_para_decodificar = false;
+  quadro_rf433_excedeu_pulsos = false;
   momento_ultima_borda_rf433_us = micros();
   receptor_rf433_iniciado = true;
+  escuta_botao_cadastrar_controle = true;
   attachInterrupt(digitalPinToInterrupt(pino_receptor_rf433), trataInterrupcaoReceptorRf433, CHANGE);
-  print_log("Receptor RF433 escutando no GPIO48.");
+  print_log("Receptor RF433 escutando no GPIO48. Botao cadastrar controle no GPIO5.");
 }
 
-// Carrega o código RF433 aprendido (rf433_ok, rf433_code, rf433_bits) da Preferences.
+// Carrega os controles RF433 cadastrados. O primeiro continua nas chaves antigas rf433_ok/code/bits.
 void carregaCodigoRf433() {
   preferences.begin("portguard", true);
-  codigo_rf433_esta_gravado = preferences.getBool("rf433_ok", false);
-  codigo_rf433_gravado = preferences.getUInt("rf433_code", 0);
-  quantidade_bits_codigo_rf433_gravado = preferences.getUChar("rf433_bits", 0);
+  uint8_t quantidade_lida = preferences.getUChar("rf433_qtd", 0);
+  if (quantidade_lida > quantidade_maxima_controles_rf433) {
+    quantidade_lida = quantidade_maxima_controles_rf433;
+  }
+  quantidade_controles_rf433_gravados = 0;
+  for (uint8_t indice = 0; indice < quantidade_lida; indice++) {
+    String chave_codigo = "rf433_c" + String(indice);
+    String chave_bits = "rf433_b" + String(indice);
+    uint32_t codigo = preferences.getUInt(chave_codigo.c_str(), 0);
+    uint8_t quantidade_bits = preferences.getUChar(chave_bits.c_str(), 0);
+    if (quantidade_bits < bits_minimos_quadro_rf433 || quantidade_bits > bits_maximos_quadro_rf433) {
+      continue;
+    }
+    codigos_controles_rf433[quantidade_controles_rf433_gravados] = codigo;
+    bits_controles_rf433[quantidade_controles_rf433_gravados] = quantidade_bits;
+    quantidade_controles_rf433_gravados++;
+  }
+  if (quantidade_controles_rf433_gravados == 0 && preferences.getBool("rf433_ok", false)) {
+    uint8_t quantidade_bits = preferences.getUChar("rf433_bits", 0);
+    if (quantidade_bits >= bits_minimos_quadro_rf433 && quantidade_bits <= bits_maximos_quadro_rf433) {
+      codigos_controles_rf433[0] = preferences.getUInt("rf433_code", 0);
+      bits_controles_rf433[0] = quantidade_bits;
+      quantidade_controles_rf433_gravados = 1;
+    }
+  }
   preferences.end();
 
-  if (!codigo_rf433_esta_gravado || quantidade_bits_codigo_rf433_gravado < bits_minimos_quadro_rf433) {
-    codigo_rf433_esta_gravado = false;
+  codigo_rf433_esta_gravado = quantidade_controles_rf433_gravados > 0;
+  if (!codigo_rf433_esta_gravado) {
+    codigo_rf433_gravado = 0;
     quantidade_bits_codigo_rf433_gravado = 0;
-    print_log("Receptor RF433: nenhum codigo gravado. O proximo controle repetido sera aprendido.");
+    print_log("Receptor RF433: nenhum controle cadastrado. Aperte o botao cadastrar controle (GPIO5).");
     return;
   }
-  print_log("Receptor RF433: codigo gravado carregado da Preferences.");
+  codigo_rf433_gravado = codigos_controles_rf433[quantidade_controles_rf433_gravados - 1];
+  quantidade_bits_codigo_rf433_gravado = bits_controles_rf433[quantidade_controles_rf433_gravados - 1];
+  print_log("Receptor RF433: " + String(quantidade_controles_rf433_gravados) + " controle(s) carregado(s) da Preferences.");
 }
 
-// Grava o código RF433 aprendido. A tarefa só marca a pendência; quem escreve a Preferences é o loop.
+// Grava a lista de controles RF433. A tarefa só marca a pendência; quem escreve a Preferences é o loop.
 void salvaCodigoRf433() {
   preferences.begin("portguard", false);
-  preferences.putBool("rf433_ok", codigo_rf433_esta_gravado);
-  preferences.putUInt("rf433_code", codigo_rf433_gravado);
-  preferences.putUChar("rf433_bits", quantidade_bits_codigo_rf433_gravado);
+  preferences.putUChar("rf433_qtd", quantidade_controles_rf433_gravados);
+  for (uint8_t indice = 0; indice < quantidade_controles_rf433_gravados; indice++) {
+    String chave_codigo = "rf433_c" + String(indice);
+    String chave_bits = "rf433_b" + String(indice);
+    preferences.putUInt(chave_codigo.c_str(), codigos_controles_rf433[indice]);
+    preferences.putUChar(chave_bits.c_str(), bits_controles_rf433[indice]);
+  }
+  preferences.putBool("rf433_ok", quantidade_controles_rf433_gravados > 0);
+  preferences.putUInt("rf433_code", quantidade_controles_rf433_gravados > 0 ? codigos_controles_rf433[0] : 0);
+  preferences.putUChar("rf433_bits", quantidade_controles_rf433_gravados > 0 ? bits_controles_rf433[0] : 0);
   preferences.end();
   gravacao_codigo_rf433_pendente = false;
-  print_log("Receptor RF433: codigo persistido na Preferences.");
+  print_log("Receptor RF433: " + String(quantidade_controles_rf433_gravados) + " controle(s) persistido(s) na Preferences.");
 }
 
 // Carrega da Preferences as flags de intertravamento, fotocélulas dos portões 1, 2 e 3 (padrão: ligadas)
@@ -1481,6 +1798,7 @@ void tarefaControlePortoes(void *parametro) {
 
   for (;;) {
     unsigned long agora = millis();
+    atualizaLedsIndicadoresRede(agora);
     static unsigned long momento_ultima_garantia_entradas = 0;
     if (agora - momento_ultima_garantia_entradas >= 1000) {
       momento_ultima_garantia_entradas = agora;
@@ -1574,9 +1892,17 @@ void tarefaControlePortoes(void *parametro) {
       xQueueSend(fila_resultados_comandos_remotos, &comando_remoto_executado, 0);
     }
 
-    aplicaSaidas(calculaSaidas(estado_portao_1, estado_portao_2, fotocelula_portao_1_alimentada,
-                               fotocelula_portao_2_alimentada, agora, false, &estado_portao_3,
-                               fotocelula_portao_3_alimentada, quantidade_portoes_placa));
+    NiveisSaidas niveis_saidas = calculaSaidas(estado_portao_1, estado_portao_2, fotocelula_portao_1_alimentada,
+                                              fotocelula_portao_2_alimentada, agora, false, &estado_portao_3,
+                                              fotocelula_portao_3_alimentada, quantidade_portoes_placa);
+    bool arrombamento_continuo_portao_3 = portaoExisteNaPlaca(3) && !portaoEmManutencao(3) &&
+                                          (estado_portao_3.alarme_abertura_indevida_ativo ||
+                                           estado_portao_3.sirene_apos_fechamento_indevido_ativa);
+    if (arrombamento_continuo_portao_3) {
+      niveis_saidas.sirene = HIGH;
+      niveis_saidas.central_alarme = LOW;
+    }
+    aplicaSaidas(niveis_saidas);
 
     vTaskDelay(pdMS_TO_TICKS(intervalo_tarefa_portoes_ms));
   }
@@ -2832,9 +3158,10 @@ void enviaEventosPendentes() {
 // Verifica o mapa da MAV1022: I2C, W5500 e RF433 sem conflito com USB/RTC, canais do PCA9534 e repouso das saídas.
 bool teste_configuracao_pinos() {
   const uint8_t pinos_usados[] = {
-      pino_i2c_sda, pino_i2c_scl, pino_receptor_rf433,
-      ETH_SPI_MOSI, ETH_SPI_MISO, ETH_SPI_SCK, ETH_PHY_CS, ETH_PHY_IRQ, ETH_PHY_RST};
-  const uint8_t pinos_esperados[] = {8, 9, 48, 11, 12, 13, 14, 10, 7};
+      pino_i2c_sda, pino_i2c_scl, pino_receptor_rf433, pino_botao_cadastrar_controle,
+      ETH_SPI_MOSI, ETH_SPI_MISO, ETH_SPI_SCK, ETH_PHY_CS, ETH_PHY_IRQ, ETH_PHY_RST,
+      pino_led_wifi, pino_led_ethernet, pino_led_status_servidor};
+  const uint8_t pinos_esperados[] = {8, 9, 48, 5, 11, 12, 13, 14, 10, 7, 3, 21, 47};
   const uint8_t pinos_reservados[] = {15, 16, 19, 20};
   const uint8_t canais_entrada[] = {
       canal_entrada_receptora_portao_1, canal_entrada_sensor_portao_1,
@@ -3129,6 +3456,61 @@ bool teste_validade_comando_autorizado() {
          portao.eventos_registrados_teste == "plaque_problem;" &&
          textoFalhaSensorFimDeCurso(1) == "Falha de leitura no sensor de fim de curso do portão 1" &&
          textoFalhaSensorFimDeCurso(portao.numero_portao).indexOf("portão 1") >= 0;
+}
+
+// Verifica os 5 s a mais da janela: abertura lenta ainda é autorizada, e só o portão comandado
+// dispara a sirene se o sensor abrir depois dos 13 s.
+bool teste_janela_abertura_comando_estendida() {
+  if (acrescimo_janela_abertura_comando_ms != 5000 || janela_comando_autorizado_ms != 13000) {
+    print_log("teste_janela_abertura_comando_estendida: janela diferente de 13 segundos.");
+    return false;
+  }
+
+  EstadoPortao portao;
+  EstadoPortao outro_portao;
+  iniciaEstadoPortao(portao, 1, false, true, 0, true);
+  iniciaEstadoPortao(outro_portao, 2, false, true, 0, true);
+
+  processaPortao(portao, true, true, 100);
+  processaPortao(portao, false, true, 100 + 8000);
+  if (!portao.abertura_autorizada || portao.alarme_abertura_indevida_ativo) {
+    print_log("teste_janela_abertura_comando_estendida: os 8 s antigos ainda geraram arrombamento.");
+    return false;
+  }
+
+  unsigned long momento_abertura_lenta = 100 + 8000 + 1;
+  processaPortao(portao, false, false, momento_abertura_lenta);
+  if (portao.alarme_abertura_indevida_ativo ||
+      portao.eventos_registrados_teste.indexOf("gate_broken") >= 0 ||
+      calculaSaidas(portao, outro_portao, true, true, momento_abertura_lenta).sirene != LOW) {
+    print_log("teste_janela_abertura_comando_estendida: abertura dentro dos 13 s disparou a sirene.");
+    return false;
+  }
+
+  iniciaEstadoPortao(portao, 1, false, true, 0, true);
+  iniciaEstadoPortao(outro_portao, 2, false, true, 0, true);
+  processaPortao(portao, false, true, 100, false, true);
+  unsigned long momento_fora_da_janela = 100 + janela_comando_autorizado_ms + 1;
+  processaPortao(portao, false, false, momento_fora_da_janela);
+  if (!portao.alarme_abertura_indevida_ativo ||
+      portao.eventos_registrados_teste.indexOf("gate_broken") < 0 ||
+      calculaSaidas(portao, outro_portao, true, true, momento_fora_da_janela).sirene != HIGH) {
+    print_log("teste_janela_abertura_comando_estendida: sensor apos 13 s nao disparou a sirene.");
+    return false;
+  }
+  if (outro_portao.alarme_abertura_indevida_ativo || outro_portao.abertura_autorizada) {
+    print_log("teste_janela_abertura_comando_estendida: o portao sem comando entrou na janela.");
+    return false;
+  }
+
+  processaPortao(outro_portao, false, false, momento_fora_da_janela);
+  if (!outro_portao.alarme_abertura_indevida_ativo ||
+      calculaSaidas(portao, outro_portao, true, true, momento_fora_da_janela).sirene != HIGH) {
+    print_log("teste_janela_abertura_comando_estendida: portao sem comando nao manteve o arrombamento.");
+    return false;
+  }
+
+  return true;
 }
 
 // Verifica que os portões 1 e 2 são independentes: comando do portão 2 só aciona a SAÍDA 2 e
@@ -3433,10 +3815,13 @@ bool teste_intertravamento_tres_portoes() {
       break;
     }
     processaPortao(portao_3, false, false, 900, true);
-    NiveisSaidas niveis = calculaSaidas(portao_1, portao_2, true, true, 900, false, &portao_3, true);
+    NiveisSaidas niveis = calculaSaidas(portao_1, portao_2, true, true, 900, false, &portao_3, true, 3);
+    uint8_t byte_arrombamento_portao_3 = montaByteSaidasPca9534(niveis);
+    bool sirene_ligada_portao_3 = (byte_arrombamento_portao_3 & (uint8_t)(1 << (canal_saida_sirene - 1))) != 0;
+    bool rele_alarme_desligado = (byte_arrombamento_portao_3 & (uint8_t)(1 << (canal_saida_central_alarme - 1))) == 0;
     if (!portao_3.alarme_abertura_indevida_ativo || portao_3.eventos_registrados_teste.indexOf("gate_broken") < 0 ||
-        niveis.sirene != HIGH || niveis.central_alarme != LOW) {
-      print_log("teste_intertravamento_tres_portoes: arrombamento do portao 3 nao gerou gate_broken nem sirene.");
+        niveis.sirene != HIGH || niveis.central_alarme != LOW || !sirene_ligada_portao_3 || !rele_alarme_desligado) {
+      print_log("teste_intertravamento_tres_portoes: arrombamento do portao 3 nao ligou a sirene nem desligou o rele 8.");
       break;
     }
 
@@ -3834,10 +4219,18 @@ bool teste_portoes_da_placa_e_rele_alarme() {
     }
     iniciaEstadoPortao(portao_3, 3, false, true, 0, true);
     processaPortao(portao_3, false, false, 200, false);
-    NiveisSaidas niveis_portao_3 = calculaSaidas(portao_3, portao_3, true, true, 200, false, &portao_3, true, 3);
+    EstadoPortao portao_1_fechado;
+    EstadoPortao portao_2_fechado;
+    iniciaEstadoPortao(portao_1_fechado, 1, false, true, 0, true);
+    iniciaEstadoPortao(portao_2_fechado, 2, false, true, 0, true);
+    NiveisSaidas niveis_portao_3 = calculaSaidas(portao_1_fechado, portao_2_fechado, true, true, 200, false, &portao_3, true, 3);
+    uint8_t byte_portao_3 = montaByteSaidasPca9534(niveis_portao_3);
+    bool sirene_do_portao_3 = (byte_portao_3 & (uint8_t)(1 << (canal_saida_sirene - 1))) != 0;
+    bool rele_8_desligado_no_portao_3 = (byte_portao_3 & (uint8_t)(1 << (canal_saida_central_alarme - 1))) == 0;
     if (!portao_3.alarme_abertura_indevida_ativo || portao_3.eventos_registrados_teste.indexOf("gate_broken") < 0 ||
-        niveis_portao_3.sirene != HIGH) {
-      print_log("teste_portoes_da_placa_e_rele_alarme: sensor da entrada 6 nao gerou arrombamento.");
+        niveis_portao_3.sirene != HIGH || niveis_portao_3.central_alarme != LOW || !sirene_do_portao_3 ||
+        !rele_8_desligado_no_portao_3) {
+      print_log("teste_portoes_da_placa_e_rele_alarme: arrombamento do portao 3 nao ligou a sirene nem desligou o rele 8.");
       break;
     }
 
@@ -4186,6 +4579,14 @@ bool teste_receptor_frequencia_433() {
   bool aguardando_original = aguardando_repeticao_quadro_rf433;
   bool comando_original = comando_rf433_portao_1_pendente;
   unsigned long momento_original = momento_ultimo_comando_rf433_reconhecido;
+  bool cadastro_original = cadastro_controle_rf433_ativo;
+  uint8_t quantidade_original = quantidade_controles_rf433_gravados;
+  uint32_t codigos_originais[quantidade_maxima_controles_rf433];
+  uint8_t bits_originais_lista[quantidade_maxima_controles_rf433];
+  for (uint8_t indice = 0; indice < quantidade_maxima_controles_rf433; indice++) {
+    codigos_originais[indice] = codigos_controles_rf433[indice];
+    bits_originais_lista[indice] = bits_controles_rf433[indice];
+  }
 
   codigo_rf433_esta_gravado = false;
   codigo_rf433_gravado = 0;
@@ -4195,6 +4596,8 @@ bool teste_receptor_frequencia_433() {
   comando_rf433_portao_1_pendente = false;
   momento_ultimo_comando_rf433_reconhecido = 0;
   quadro_rf433_injetado_pendente = false;
+  cadastro_controle_rf433_ativo = false;
+  quantidade_controles_rf433_gravados = 0;
 
   bool sucesso = true;
   uint16_t quadro_valido[] = {900, 300, 300, 900, 900, 300, 300, 900, 300, 900, 900, 300, 300, 900, 900, 300};
@@ -4246,37 +4649,55 @@ bool teste_receptor_frequencia_433() {
   if (sucesso) {
     injeta_quadro(false, 0, 0, 1000);
     injeta_quadro(true, 0xA5, 8, 1100);
+    injeta_quadro(true, 0xA5, 8, 1200);
+    if (codigo_rf433_esta_gravado || quantidade_controles_rf433_gravados != 0) {
+      print_log("teste_receptor_frequencia_433: gravou sem o botao cadastrar controle.");
+      sucesso = false;
+    }
+  }
+  if (sucesso) {
+    abreCadastroControleRf433(1300);
+    injeta_quadro(true, 0xA5, 8, 1400);
     if (codigo_rf433_esta_gravado) {
       print_log("teste_receptor_frequencia_433: gravou sem quadro repetido.");
       sucesso = false;
     }
   }
   if (sucesso) {
-    injeta_quadro(true, 0xA5, 8, 1200);
+    injeta_quadro(true, 0xA5, 8, 1500);
     if (!codigo_rf433_esta_gravado || codigo_rf433_gravado != 0xA5 || !gravacao_codigo_rf433_pendente ||
-        comando_rf433_portao_1_pendente) {
+        !controleRf433JaCadastrado(0xA5, 8) || comando_rf433_portao_1_pendente || cadastro_controle_rf433_ativo) {
       print_log("teste_receptor_frequencia_433: quadro repetido nao gravou ou ja acionou o portao.");
       sucesso = false;
     }
   }
   if (sucesso) {
-    injeta_quadro(true, 0x5A, 8, 1300);
-    injeta_quadro(true, 0x5A, 8, 1400);
-    if (codigo_rf433_gravado != 0xA5 || comando_rf433_portao_1_pendente) {
+    injeta_quadro(true, 0x5A, 8, 1600);
+    injeta_quadro(true, 0x5A, 8, 1700);
+    if (!controleRf433JaCadastrado(0xA5, 8) || controleRf433JaCadastrado(0x5A, 8) || comando_rf433_portao_1_pendente) {
       print_log("teste_receptor_frequencia_433: codigo diferente sobrescreveu o gravado ou acionou o portao.");
       sucesso = false;
     }
   }
   if (sucesso) {
-    injeta_quadro(true, 0xA5, 8, 1500);
-    injeta_quadro(true, 0xA5, 8, 1600);
+    abreCadastroControleRf433(1800);
+    injeta_quadro(true, 0x5A, 8, 1900);
+    injeta_quadro(true, 0x5A, 8, 2000);
+    if (!controleRf433JaCadastrado(0xA5, 8) || !controleRf433JaCadastrado(0x5A, 8) || comando_rf433_portao_1_pendente) {
+      print_log("teste_receptor_frequencia_433: segundo controle nao foi cadastrado.");
+      sucesso = false;
+    }
+  }
+  if (sucesso) {
+    injeta_quadro(true, 0xA5, 8, 2100);
+    injeta_quadro(true, 0xA5, 8, 2200);
     if (comando_rf433_portao_1_pendente) {
       print_log("teste_receptor_frequencia_433: comando dentro do cooldown de 1 s.");
       sucesso = false;
     }
   }
   if (sucesso) {
-    unsigned long momento_liberado = 1200 + intervalo_minimo_comando_rf433_ms;
+    unsigned long momento_liberado = 2000 + intervalo_minimo_comando_rf433_ms;
     injeta_quadro(true, 0xA5, 8, momento_liberado);
     injeta_quadro(true, 0xA5, 8, momento_liberado);
     if (!consomeComandoReceptorRf433()) {
@@ -4305,10 +4726,229 @@ bool teste_receptor_frequencia_433() {
   comando_rf433_portao_1_pendente = comando_original;
   momento_ultimo_comando_rf433_reconhecido = momento_original;
   quadro_rf433_injetado_pendente = false;
+  cadastro_controle_rf433_ativo = cadastro_original;
+  quantidade_controles_rf433_gravados = quantidade_original;
+  for (uint8_t indice = 0; indice < quantidade_maxima_controles_rf433; indice++) {
+    codigos_controles_rf433[indice] = codigos_originais[indice];
+    bits_controles_rf433[indice] = bits_originais_lista[indice];
+  }
+  return sucesso;
+}
+
+// Confere a assinatura do quadro RF e que ela so sai na janela de 20 s do botao de gravar controle.
+bool teste_assinatura_quadro_controle_rf433() {
+  uint32_t capturados_originais = quantidade_quadros_assinatura_rf433;
+  uint32_t regulares_originais = quantidade_quadros_assinatura_rf433_regulares;
+  uint32_t rejeitados_originais = quantidade_quadros_assinatura_rf433_rejeitados;
+  unsigned long mensagem_original = momento_ultima_mensagem_assinatura_rf433;
+  bool comando_original = comando_rf433_portao_1_pendente;
+  momento_ultima_mensagem_assinatura_rf433 = millis();
+
+  bool sucesso = true;
+  if (classificaIntervaloPulsoRf433(350) != 'S' || classificaIntervaloPulsoRf433(650) != 'S' ||
+      classificaIntervaloPulsoRf433(349) != '?' || classificaIntervaloPulsoRf433(651) != '?') {
+    print_log("teste_assinatura_quadro_controle_rf433: faixa do pulso curto incorreta.");
+    sucesso = false;
+  }
+  if (sucesso && (classificaIntervaloPulsoRf433(800) != 'L' || classificaIntervaloPulsoRf433(1150) != 'L' ||
+                  classificaIntervaloPulsoRf433(799) != '?' || classificaIntervaloPulsoRf433(1151) != '?')) {
+    print_log("teste_assinatura_quadro_controle_rf433: faixa do pulso longo incorreta.");
+    sucesso = false;
+  }
+
+  char simbolos_curtos[58];
+  for (int indice = 0; indice < 57; indice++) {
+    simbolos_curtos[indice] = 'S';
+  }
+  simbolos_curtos[57] = '\0';
+  if (sucesso && calculaAssinaturaSimbolosRf433(simbolos_curtos, 57) != 0x0259279DUL) {
+    print_log("teste_assinatura_quadro_controle_rf433: assinatura FNV do quadro curto nao confere.");
+    sucesso = false;
+  }
+
+  uint16_t quadro_curto[57];
+  for (int indice = 0; indice < 57; indice++) {
+    quadro_curto[indice] = 400;
+  }
+  uint32_t assinatura = 0;
+  if (sucesso && (!analisaQuadroAssinaturaRf433(quadro_curto, 57, assinatura) || assinatura != 0x0259279DUL)) {
+    print_log("teste_assinatura_quadro_controle_rf433: quadro de 57 pulsos curtos nao gerou a assinatura esperada.");
+    sucesso = false;
+  }
+  if (sucesso && comando_rf433_portao_1_pendente != comando_original) {
+    print_log("teste_assinatura_quadro_controle_rf433: exibir a assinatura acionou o portao.");
+    sucesso = false;
+  }
+  if (sucesso && (quantidade_quadros_assinatura_rf433 != capturados_originais + 1 ||
+                  quantidade_quadros_assinatura_rf433_regulares != regulares_originais + 1 ||
+                  quantidade_quadros_assinatura_rf433_rejeitados != rejeitados_originais)) {
+    print_log("teste_assinatura_quadro_controle_rf433: contadores do quadro regular incorretos.");
+    sucesso = false;
+  }
+
+  uint16_t quadro_longo[57];
+  for (int indice = 0; indice < 57; indice++) {
+    quadro_longo[indice] = 900;
+  }
+  uint32_t assinatura_longa = 0;
+  if (sucesso && (!analisaQuadroAssinaturaRf433(quadro_longo, 57, assinatura_longa) ||
+                  assinatura_longa != 0xD4900788UL || assinatura_longa == assinatura)) {
+    print_log("teste_assinatura_quadro_controle_rf433: quadro longo nao gerou assinatura propria.");
+    sucesso = false;
+  }
+
+  uint16_t quadro_curto_demais[49];
+  for (int indice = 0; indice < 49; indice++) {
+    quadro_curto_demais[indice] = 400;
+  }
+  if (sucesso && analisaQuadroAssinaturaRf433(quadro_curto_demais, 49, assinatura)) {
+    print_log("teste_assinatura_quadro_controle_rf433: quadro com menos de 50 intervalos foi aceito.");
+    sucesso = false;
+  }
+
+  uint16_t quadro_longo_demais[71];
+  for (int indice = 0; indice < 71; indice++) {
+    quadro_longo_demais[indice] = 400;
+  }
+  if (sucesso && analisaQuadroAssinaturaRf433(quadro_longo_demais, 71, assinatura)) {
+    print_log("teste_assinatura_quadro_controle_rf433: quadro com mais de 70 intervalos foi aceito.");
+    sucesso = false;
+  }
+
+  uint16_t quadro_irregular[57];
+  for (int indice = 0; indice < 57; indice++) {
+    quadro_irregular[indice] = 400;
+  }
+  for (int indice = 0; indice < 6; indice++) {
+    quadro_irregular[indice] = 100;
+  }
+  if (sucesso && analisaQuadroAssinaturaRf433(quadro_irregular, 57, assinatura)) {
+    print_log("teste_assinatura_quadro_controle_rf433: quadro com menos de 90% de intervalos regulares foi aceito.");
+    sucesso = false;
+  }
+
+  uint16_t quadro_limite[50];
+  for (int indice = 0; indice < 50; indice++) {
+    quadro_limite[indice] = 400;
+  }
+  uint32_t assinatura_limite = 0;
+  if (sucesso && (!analisaQuadroAssinaturaRf433(quadro_limite, 50, assinatura_limite) ||
+                  assinatura_limite != 0xDCFB1AC3UL)) {
+    print_log("teste_assinatura_quadro_controle_rf433: quadro de 50 intervalos foi rejeitado.");
+    sucesso = false;
+  }
+
+  uint16_t quadro_teto[70];
+  for (int indice = 0; indice < 70; indice++) {
+    quadro_teto[indice] = 400;
+  }
+  uint32_t assinatura_teto = 0;
+  if (sucesso && (!analisaQuadroAssinaturaRf433(quadro_teto, 70, assinatura_teto) || assinatura_teto != 0xD26BA6ABUL)) {
+    print_log("teste_assinatura_quadro_controle_rf433: quadro de 70 intervalos foi rejeitado.");
+    sucesso = false;
+  }
+
+  if (sucesso && (identificaAssinaturaControleRf433(assinatura_botao_1_controle_rf433).indexOf("BOTAO 1") < 0 ||
+                  identificaAssinaturaControleRf433(assinatura_botao_2_controle_rf433).indexOf("BOTAO 2") < 0 ||
+                  identificaAssinaturaControleRf433(assinatura_botao_3_controle_rf433).indexOf("BOTAO 3") < 0 ||
+                  identificaAssinaturaControleRf433(0x0259279DUL).indexOf("DESCONHECIDA") < 0)) {
+    print_log("teste_assinatura_quadro_controle_rf433: identificacao dos botoes 1, 2 e 3 incorreta.");
+    sucesso = false;
+  }
+
+  bool cadastro_antes_da_janela = cadastro_controle_rf433_ativo;
+  bool quadro_pronto_antes_da_janela = quadro_rf433_pronto_para_decodificar;
+  bool quadro_excedeu_antes_da_janela = quadro_rf433_excedeu_pulsos;
+  int quantidade_pulsos_antes_da_janela = quantidade_pulsos_capturados_rf433;
+  uint32_t capturados_antes_da_janela = quantidade_quadros_assinatura_rf433;
+  momento_ultima_mensagem_assinatura_rf433 = millis();
+
+  for (int indice = 0; indice < 57; indice++) {
+    duracoes_pulsos_rf433[indice] = 400;
+  }
+  quantidade_pulsos_capturados_rf433 = 57;
+  quadro_rf433_excedeu_pulsos = false;
+  quadro_rf433_pronto_para_decodificar = true;
+  cadastro_controle_rf433_ativo = false;
+  uint32_t codigo_fora_da_janela = 0;
+  uint8_t bits_fora_da_janela = 0;
+  consomeQuadroCapturadoRf433(codigo_fora_da_janela, bits_fora_da_janela);
+  if (sucesso && (quantidade_quadros_assinatura_rf433 != capturados_antes_da_janela ||
+                  comando_rf433_portao_1_pendente != comando_original)) {
+    print_log("teste_assinatura_quadro_controle_rf433: quadro RF foi lido fora da janela de 20 s ou acionou o rele.");
+    sucesso = false;
+  }
+
+  for (int indice = 0; indice < 57; indice++) {
+    duracoes_pulsos_rf433[indice] = 400;
+  }
+  quantidade_pulsos_capturados_rf433 = 57;
+  quadro_rf433_excedeu_pulsos = false;
+  quadro_rf433_pronto_para_decodificar = true;
+  cadastro_controle_rf433_ativo = true;
+  uint32_t codigo_dentro_da_janela = 0;
+  uint8_t bits_dentro_da_janela = 0;
+  consomeQuadroCapturadoRf433(codigo_dentro_da_janela, bits_dentro_da_janela);
+  if (sucesso && (quantidade_quadros_assinatura_rf433 != capturados_antes_da_janela + 1 ||
+                  comando_rf433_portao_1_pendente != comando_original)) {
+    print_log("teste_assinatura_quadro_controle_rf433: quadro RF nao foi lido na janela de 20 s ou acionou o rele.");
+    sucesso = false;
+  }
+
+  cadastro_controle_rf433_ativo = cadastro_antes_da_janela;
+  quadro_rf433_pronto_para_decodificar = quadro_pronto_antes_da_janela;
+  quadro_rf433_excedeu_pulsos = quadro_excedeu_antes_da_janela;
+  quantidade_pulsos_capturados_rf433 = quantidade_pulsos_antes_da_janela;
+
+  quantidade_quadros_assinatura_rf433 = capturados_originais;
+  quantidade_quadros_assinatura_rf433_regulares = regulares_originais;
+  quantidade_quadros_assinatura_rf433_rejeitados = rejeitados_originais;
+  momento_ultima_mensagem_assinatura_rf433 = mensagem_original;
+  comando_rf433_portao_1_pendente = comando_original;
   return sucesso;
 }
 
 // Executa todos os testes da placa. Retorna false (e mostra o motivo) no primeiro teste que falhar.
+// Verifica os GPIOs dos três LEDs e o ritmo de 1 s aceso e 1 s apagado do LED de status.
+bool teste_leds_indicadores_rede() {
+  if (pino_led_wifi != 3 || pino_led_ethernet != 21 || pino_led_status_servidor != 47) {
+    print_log("teste_leds_indicadores_rede: GPIO do LED diferente do manual (D6=3, D7=21, D8=47).");
+    return false;
+  }
+
+  const uint8_t pinos_reservados[] = {8, 9, 48, 5, 11, 12, 13, 14, 10, 7, 15, 16, 19, 20};
+  const uint8_t pinos_led[] = {pino_led_wifi, pino_led_ethernet, pino_led_status_servidor};
+  for (uint8_t pino_led : pinos_led) {
+    for (uint8_t pino_reservado : pinos_reservados) {
+      if (pino_led == pino_reservado) {
+        print_log("teste_leds_indicadores_rede: LED no GPIO de I2C, Ethernet, RF, USB ou RTC.");
+        return false;
+      }
+    }
+  }
+
+  if (tempo_piscada_led_status_servidor_ms != 1000) {
+    print_log("teste_leds_indicadores_rede: ritmo diferente de 1 segundo.");
+    return false;
+  }
+
+  if (nivelLedConexao(true) != HIGH || nivelLedConexao(false) != LOW) {
+    print_log("teste_leds_indicadores_rede: LED de Wi-Fi ou cabo nao acompanha a conexao.");
+    return false;
+  }
+
+  if (nivelLedStatusServidor(0) != HIGH ||
+      nivelLedStatusServidor(tempo_piscada_led_status_servidor_ms - 1) != HIGH ||
+      nivelLedStatusServidor(tempo_piscada_led_status_servidor_ms) != LOW ||
+      nivelLedStatusServidor((tempo_piscada_led_status_servidor_ms * 2) - 1) != LOW ||
+      nivelLedStatusServidor(tempo_piscada_led_status_servidor_ms * 2) != HIGH) {
+    print_log("teste_leds_indicadores_rede: LED de status fora do ritmo 1 s aceso e 1 s apagado.");
+    return false;
+  }
+
+  return true;
+}
+
 bool teste_completo() {
   print_log("");
   print_log("======== TESTE COMPLETO ========");
@@ -4339,6 +4979,10 @@ bool teste_completo() {
   }
   if (!teste_validade_comando_autorizado()) {
     print_log("FALHA: teste_validade_comando_autorizado - janela de autorizacao ou need_maintenance incorretos.");
+    return false;
+  }
+  if (!teste_janela_abertura_comando_estendida()) {
+    print_log("FALHA: teste_janela_abertura_comando_estendida - os 5 s a mais da abertura ou a sirene apos 13 s falharam.");
     return false;
   }
   if (!teste_independencia_portoes()) {
@@ -4397,8 +5041,16 @@ bool teste_completo() {
     print_log("FALHA: teste_receptor_frequencia_433 - aprendizado ou reconhecimento do controle 433 incorreto.");
     return false;
   }
+  if (!teste_assinatura_quadro_controle_rf433()) {
+    print_log("FALHA: teste_assinatura_quadro_controle_rf433 - leitura da assinatura do controle no monitor serial incorreta.");
+    return false;
+  }
   if (!teste_comunicacao_pca9534()) {
     print_log("FALHA: teste_comunicacao_pca9534 - PCA9534 nao confirmou escrita da sirene ou polaridade das entradas.");
+    return false;
+  }
+  if (!teste_leds_indicadores_rede()) {
+    print_log("FALHA: teste_leds_indicadores_rede - LED de Wi-Fi, cabo ou status fora do ritmo pedido.");
     return false;
   }
 
@@ -4474,6 +5126,10 @@ void setup() {
   print_log("SAIDA 7 sirene               = PCA9534 0x20 canal 7 (LOW)");
   print_log("SAIDA 8 central de alarme    = PCA9534 0x20 canal 8 (HIGH, inverso da sirene)");
   print_log("RF433                        = GPIO48");
+  print_log("Botao cadastrar controle     = GPIO5 (ativo em nivel baixo)");
+  print_log("LED Wi-Fi D6                 = GPIO3 (aceso com conexao)");
+  print_log("LED Ethernet D7              = GPIO21 (aceso com cabo)");
+  print_log("LED status D8                = GPIO47 (1 s aceso, 1 s apagado)");
 
   carregarConfigWifi();
   registraEventosWifiEsp32S3();

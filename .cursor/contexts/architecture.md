@@ -26,6 +26,8 @@ SAÍDA 8: segue a lógica exata da sirene (SAÍDA 7), mas normalmente HIGH, para
 
 O portão 3 usa os canais que sobram no PCA9534 (8 entradas e 8 saídas). GPIO do ESP32-S3 permanece no I2C, Ethernet, USB, RTC e RF433.
 
-GPIO48: receptor RF433 (sinal invertido). Primeiro quadro completo e repetido é gravado; nas próximas pressões iguais do controle, aciona a SAÍDA 1 (portão 1). Ver `business-rule-receptor-rf433.md`.
+GPIO5: botão cadastrar controle, ativo em nível baixo. GPIO48: receptor RF433 (sinal invertido). Com o botão pressionado, abre 20 s em que cada tecla imprime o quadro RF no monitor serial, sem acionar relé por esse aviso; o quadro completo e repetido é gravado. Nas próximas pressões iguais, aciona a SAÍDA 1 (portão 1). Ver `business-rule-receptor-rf433.md`.
 
 Wi-Fi no ESP32-S3: sleep do modem desligado + auto-reconnect com credenciais persistidas, para não perder a sessão com o aplicativo. Ver `business-rule-wifi-esp32-s3.md`.
+
+LEDs da placa (GPIO direto, fora do PCA9534): GPIO3 LED azul D6 aceso com Wi-Fi e IP; GPIO21 LED vermelho D7 aceso com cabo Ethernet; GPIO47 LED laranja D8 pisca 1 s aceso e 1 s apagado (status de contato com o servidor). Ver `business-rule-leds-indicadores-rede.md`.

@@ -29,7 +29,7 @@ Entradas/saídas via PCA9534 (0x21 / 0x20) no I2C GPIO8/GPIO9. Ethernet W5500: M
 ## Regras (aplicadas por portão)
 - Entradas passam por estabilização de 50 ms antes de serem consideradas.
 - Borda de subida estável da receptora: pulso de 1 s no motor do portão.
-  - Portão fechado: abre janela de autorização de 8 s. Repique do sensor enquanto o relé está atracado não gasta a autorização nem vira arrombamento.
+  - Portão fechado: abre janela de autorização de 13 s (8 s originais mais 5 s). Vale para comando da receptora e para `open_or_close_gate`. Repique do sensor enquanto o relé está atracado não gasta a autorização nem vira arrombamento. Se o sensor desse portão abrir depois dos 13 s, é arrombamento e a sirene dispara.
   - Portão aberto: é comando de fechamento, não abre janela.
   - Intertravamento: abertura ignorada se o outro portão estiver aberto (ver `business-rule-intertravamento.md`).
 - Sensor passa a LOW (portão abriu): evento `gate_open`.
@@ -54,4 +54,4 @@ Entradas/saídas via PCA9534 (0x21 / 0x20) no I2C GPIO8/GPIO9. Ethernet W5500: M
 - `EstadoPortao.modo_teste = true` guarda eventos em `eventos_registrados_teste` em vez de enviar à API.
 
 ## Testes
-`teste_configuracao_pinos`, `teste_estabilizacao_entrada`, `teste_comando_autorizado`, `teste_comando_com_portao_aberto`, `teste_abertura_indevida`, `teste_portao_aberto_tempo_excessivo`, `teste_validade_comando_autorizado`, `teste_independencia_portoes`, `teste_alimentacao_fotocelula`, `teste_saida_fotocelula_e_central_alarme` — todos chamados em `teste_completo()`, executado no fim do `setup()` antes de iniciar a tarefa dos portões.
+`teste_configuracao_pinos`, `teste_estabilizacao_entrada`, `teste_comando_autorizado`, `teste_comando_com_portao_aberto`, `teste_abertura_indevida`, `teste_portao_aberto_tempo_excessivo`, `teste_validade_comando_autorizado`, `teste_janela_abertura_comando_estendida`, `teste_independencia_portoes`, `teste_alimentacao_fotocelula`, `teste_saida_fotocelula_e_central_alarme` — todos chamados em `teste_completo()`, executado no fim do `setup()` antes de iniciar a tarefa dos portões.

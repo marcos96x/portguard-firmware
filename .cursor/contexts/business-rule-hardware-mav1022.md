@@ -49,9 +49,14 @@ Canal da placa N = bit (N−1) do expansor (P0..P7). Confirmar na serigrafia se 
 
 Repouso lógico (igual à regra de negócio geral): motores/sirene desenergizados; fotocélulas e central de alarme energizadas (HIGH lógico = bit 1).
 
+## LEDs (GPIO direto)
+- **GPIO3** — LED azul D6, Wi-Fi: aceso com associação e IP, apagado se a conexão cair.
+- **GPIO21** — LED vermelho D7, Ethernet: aceso com cabo e IP, apagado sem link.
+- **GPIO47** — LED laranja D8, status: 1 s aceso e 1 s apagado. Ver `business-rule-leds-indicadores-rede.md`.
+
 ## Receptor RF433
 - **GPIO48** — entrada do receptor 433 MHz (sinal invertido por Q2). Não passa pelo PCA9534.
-- Aprendizado e acionamento da SAÍDA 1: ver `business-rule-receptor-rf433.md`.
+- Janela de 20 s do botão de cadastrar controle imprime o quadro RF, sem acionar relé. Aprendizado e acionamento da SAÍDA 1: ver `business-rule-receptor-rf433.md`.
 
 ## Funções
 - `configuraPinos()`: I2C 100 kHz em GPIO8/9, polaridade 0x02=0x00, PCA9534 0x20 saída / 0x21 entrada, confirma escrita lendo de volta; `pinMode(GPIO48, INPUT)`.
@@ -63,4 +68,4 @@ Repouso lógico (igual à regra de negócio geral): motores/sirene desenergizado
 - Tarefa dos portões: pilha 12288 bytes (evita crash que matava I/O).
 
 ## Testes
-`teste_configuracao_pinos`, `teste_comunicacao_pca9534` (write/readback da sirene + polaridade do sensor) e `teste_saida_fotocelula_e_central_alarme`. `teste_receptor_frequencia_433` cobre o GPIO48 / RF433.
+`teste_configuracao_pinos`, `teste_comunicacao_pca9534` (write/readback da sirene + polaridade do sensor) e `teste_saida_fotocelula_e_central_alarme`. `teste_receptor_frequencia_433` cobre o cadastro no GPIO48. `teste_assinatura_quadro_controle_rf433` cobre a leitura tecla a tecla no monitor serial. `teste_leds_indicadores_rede` cobre os três LEDs.
