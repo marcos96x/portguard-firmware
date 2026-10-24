@@ -50,9 +50,14 @@
   GPIO48 = receptor RF433 (sinal invertido por Q2). Com o botao de gravar
            controle, a janela de 20 s imprime o quadro RF de cada tecla.
            Esse aviso nao aciona rele.
-  GPIO5  = botao cadastrar controle (ativo em nivel baixo). Depois do botao,
-           o comando repetido do controle e gravado e aparece no monitor serial.
-           Acionar esse controle abre o portao 1.
+  GPIO5  = botao cadastrar controle (ativo em nivel baixo). A assinatura
+           repetida entra em Preferences "buttons" com portao 0 e status livre
+           e o loop envia JSON para /api/app/v1/plaque-buttons/save.
+           Cadastrar de novo o mesmo botao volta para livre/portao 0 e envia
+           /api/app/v1/plaque-buttons/update com control_id 0 e port_number 0.
+           O pulso so abre o portao indicado se o status estiver vinculado.
+           Controle gravado so na lista binaria antiga, sem entrada em buttons,
+           continua abrindo o portao 1.
   GPIO19/GPIO20 = USB nativa (não usar)
   GPIO15/GPIO16 = cristal do RTC (não usar)
   GPIO3  = LED azul D6 (Wi-Fi): aceso com IP, apagado sem conexao
@@ -80,9 +85,11 @@
      - Envia gate_broken para API (no máximo 1 a cada 60 segundos,
        contando a partir do último gate_broken enviado, de qualquer portão).
 
-  3. Portão aberto por mais de 1 minuto:
-     - Sirene 1 segundo ligada / 2 segundos desligada.
-     - Repete até fechar.
+  3. Portão aberto por mais de 120 segundos (tempo_maximo_portao_aberto_ms):
+     - Envia gate_timeout_open uma vez por abertura, com o título
+       "Portão aberto por mais de 2 minutos" e event_data {"port": N}.
+     - Sirene 1 segundo ligada / 2 segundos desligada até fechar.
+     - O cronômetro é de cada portão e zera a cada abertura.
 
   4. Portão fecha:
      - Alarmes daquele portão são encerrados, exceto após abertura sem
@@ -94,8 +101,10 @@
 
   5. Rede:
      - Com Wi-Fi conectado, as requisições usam Wi-Fi.
-     - Se o Wi-Fi não conectar (credenciais erradas, fora de alcance, etc.),
-       tenta o cabo. Se o cabo tiver IP, as requisições usam Ethernet.
+     - Sem Wi-Fi persistido, o cabo com IP assume a comunicação com o aplicativo:
+       as requisições saem pela Ethernet e a config_plaque pendente é confirmada
+       (completed), para a placa não permanecer em aguardando configuração.
+     - Se o Wi-Fi já estava persistido e não conectar, o cabo segue como reserva.
      - Sem os dois, o Serial explica o que falhou em cada meio.
 
   6. API:
@@ -103,7 +112,8 @@
        com rede disponível (5 s de espera após uma falha); sem rede,
        tenta a cada 30 segundos.
      - Heartbeat a cada 30 segundos quando houver link.
-     - config_plaque: aplica o Wi-Fi recebido em action_data.
+     - config_plaque: aplica o Wi-Fi recebido em action_data. Sem Wi-Fi persistido
+       e com o cabo no ar, a configuração é confirmada pelo cabo.
      - reset_plaque: apaga o Wi-Fi e usa cabo até um novo config_plaque.
      - open_or_close_gate: action_data vazio ou 1 = portão 1, 2 = portão 2, 3 = portão 3.
        Mesmo efeito da receptora (abre se fechado, fecha se aberto),
@@ -122,6 +132,15 @@
        o mesmo a todos os portões que a placa tem. Em manutenção aquele portão
        não toca sirene, não arma alarme e não envia evento. Os outros portões
        e o heartbeat seguem normais. A fila continua sendo consultada.
+     - update_button_control: action_data traz button_id, port_number e status
+       (um objeto ou varios). Atualiza cada botao no indice Preferences "buttons",
+       confere a gravacao e so entao responde a fila. O pulso do botao passa pelo
+       intertravamento.
+     - Cadastro de botao envia JSON para /api/app/v1/plaque-buttons/save.
+       Re-cadastro volta o botao para livre/portao 0 e envia
+       /api/app/v1/plaque-buttons/update com control_id 0 e port_number 0.
+     - Pulso de controle vinculado envia abertura/fechamento para
+       /api/app/v1/plaques/logs com button_id e port_number.
   ============================================================
 */
 
@@ -147,7 +166,14 @@ const String plaque_serial = "1port-7PWV7S9536CF";
 const uint8_t quantidade_portoes_configurada = 3;
 uint8_t quantidade_portoes_placa = quantidade_portoes_configurada;
 const String api_url = "https://portguard.milesmp.com.br/api/v1";
+const String api_url_aplicativo = "https://portguard.milesmp.com.br/api/app/v1";
 const String api_token = "bananapratadoisreaisoquilo";
+const char rota_cadastro_botao_controle[] = "/plaque-buttons/save";
+const char rota_atualizacao_botao_controle[] = "/plaque-buttons/update";
+const char rota_log_pulso_botao_controle[] = "/plaques/logs";
+const char tipo_conteudo_json[] = "application/json";
+const char operacao_api_botao_cadastrar = 'c';
+const char operacao_api_botao_resetar = 'r';
 
 // ============================================================
 // WI-FI (cache em RAM — persistência em Preferences)
@@ -293,6 +319,18 @@ const uint32_t assinatura_botao_1_controle_rf433 = 0xFE280B33UL;
 const uint32_t assinatura_botao_2_controle_rf433 = 0xE5B7B297UL;
 const uint32_t assinatura_botao_3_controle_rf433 = 0x6958C26BUL;
 
+// Cadastro dos botões de controle no índice "buttons" da Preferences (array JSON).
+const char chave_armazenamento_botoes_controle[] = "buttons";
+const uint8_t quantidade_maxima_botoes_controle = 20;
+const uint8_t tamanho_identificador_botao_controle = 24;
+const uint8_t tamanho_numero_portao_botao_controle = 4;
+const uint8_t tamanho_status_botao_controle = 16;
+const uint16_t tamanho_buffer_json_botoes_controle = 2560;
+const unsigned long intervalo_reenvio_cadastro_botao_controle_ms = 5000;
+const unsigned long intervalo_nova_tentativa_gravacao_botoes_controle_ms = 1000;
+const uint8_t limite_tentativas_gravacao_botao_controle = 5;
+const uint8_t tamanho_fila_logs_pulsos_botoes_controle = 8;
+
 // Bits 0, 2 e 4 em alto: receptoras inativas. Bits 1, 3 e 5 em baixo: sensores ativos (portões fechados).
 const uint8_t byte_entradas_repouso_seguro_pca9534 = 0x15;
 
@@ -305,7 +343,9 @@ const unsigned long tempo_pulso_motor_ms = 1000;
 const unsigned long acrescimo_janela_abertura_comando_ms = 5000;
 const unsigned long janela_comando_autorizado_ms = 8000 + acrescimo_janela_abertura_comando_ms;
 const unsigned long tempo_sirene_apos_fechamento_abertura_indevida_ms = 120000;
-const unsigned long tempo_maximo_portao_aberto_ms = 60000;
+const unsigned long tempo_maximo_portao_aberto_ms = 120000;
+const char titulo_aviso_portao_aberto_sem_fechar[] = "Portão aberto por mais de 2 minutos";
+const char tipo_evento_portao_aberto_sem_fechar[] = "gate_timeout_open";
 const unsigned long tempo_sirene_ligada_alerta_ms = 1000;
 const unsigned long tempo_sirene_desligada_alerta_ms = 2000;
 const unsigned long tempo_estabilizacao_entrada_ms = 50;
@@ -358,6 +398,39 @@ struct EventoPendente {
   uint8_t numero_portao;
 };
 
+struct BotaoControleCadastrado {
+  char identificador[tamanho_identificador_botao_controle];
+  char numero_portao[tamanho_numero_portao_botao_controle];
+  char status[tamanho_status_botao_controle];
+  char operacao_api_pendente;
+  bool ocupado;
+};
+
+struct ResultadoConsultaBotaoControle {
+  bool cadastrado;
+  bool pode_pulsar;
+  uint8_t numero_portao_pulso;
+  char identificador[tamanho_identificador_botao_controle];
+  char numero_portao[tamanho_numero_portao_botao_controle];
+  char status[tamanho_status_botao_controle];
+  char operacao_api_pendente;
+};
+
+struct ResultadoAtualizacaoBotaoControle {
+  bool dados_validos;
+  bool localizado;
+  bool atualizado_na_memoria;
+  char identificador[tamanho_identificador_botao_controle];
+  char numero_portao[tamanho_numero_portao_botao_controle];
+  char status[tamanho_status_botao_controle];
+};
+
+struct LogPulsoBotaoControle {
+  char identificador_botao[tamanho_identificador_botao_controle];
+  char numero_portao[tamanho_numero_portao_botao_controle];
+  char tipo_evento[16];
+};
+
 EstadoPortao estado_portao_1;
 EstadoPortao estado_portao_2;
 EstadoPortao estado_portao_3;
@@ -402,6 +475,24 @@ bool quadro_rf433_injetado_pendente = false;
 bool quadro_rf433_injetado_valido = false;
 uint32_t codigo_rf433_injetado = 0;
 uint8_t quantidade_bits_codigo_rf433_injetado = 0;
+bool assinatura_rf433_injetada_pendente = false;
+uint32_t assinatura_rf433_injetada = 0;
+bool assinatura_quadro_rf433_disponivel = false;
+uint32_t assinatura_quadro_rf433_capturada = 0;
+bool assinatura_rf433_candidata_disponivel = false;
+uint32_t assinatura_rf433_candidata = 0;
+volatile uint8_t comando_botao_controle_portao_pendente = 0;
+char identificador_comando_botao_controle_pendente[tamanho_identificador_botao_controle] = "";
+char numero_portao_comando_botao_controle_pendente[tamanho_numero_portao_botao_controle] = "";
+
+BotaoControleCadastrado botoes_controle[quantidade_maxima_botoes_controle];
+uint8_t quantidade_botoes_controle = 0;
+volatile bool gravacao_botoes_controle_pendente = false;
+uint32_t geracao_botoes_controle = 0;
+unsigned long momento_proxima_gravacao_botoes_controle = 0;
+char buffer_json_botoes_controle[tamanho_buffer_json_botoes_controle];
+unsigned long momento_proxima_tentativa_envio_cadastro_botao_controle = 0;
+portMUX_TYPE protecao_botoes_controle = portMUX_INITIALIZER_UNLOCKED;
 
 volatile uint16_t duracoes_pulsos_rf433[quantidade_maxima_pulsos_rf433];
 volatile int quantidade_pulsos_capturados_rf433 = 0;
@@ -427,7 +518,12 @@ QueueHandle_t fila_eventos_pendentes = nullptr;
 const uint8_t comando_remoto_desligar_sirene = 4;
 QueueHandle_t fila_comandos_remotos_portao = nullptr;
 QueueHandle_t fila_resultados_comandos_remotos = nullptr;
-const unsigned long tempo_espera_resultado_comando_remoto_ms = 500;
+QueueHandle_t fila_logs_pulsos_botoes_controle = nullptr;
+// A tarefa dos portões não pode consultar Wi-Fi nem Ethernet: isso segura o cadeado da rede
+// enquanto o loop espera o resultado e o comando de abertura é apagado antes do pulso.
+const unsigned long tempo_espera_resultado_comando_remoto_ms = 1000;
+volatile bool wifi_conectado_para_led = false;
+volatile bool cabo_conectado_para_led = false;
 TaskHandle_t tarefa_controle_portoes = nullptr;
 
 void conectarWifi();
@@ -441,10 +537,25 @@ bool atualizarStatusFila(long queueId, const char *actionStatus);
 bool wifiEstaConfigurado();
 bool wifiConectado();
 bool caboConectado();
-bool executarPostHttp(const char *destino, const String &url, const String &body, int timeoutMs, String *payloadOut);
+bool deveTentarWifiAntesDoCabo();
+const char *statusDaConfiguracaoQuandoWifiNaoSobe(bool cabo_disponivel);
+bool caboDeveAssumirConfiguracaoDoAplicativo(bool cabo_disponivel, bool wifi_esta_conectado,
+                                             bool configuracao_wifi_persistida);
+bool confirmaConfiguracaoPeloCabo(long queue_id);
+bool executarPostHttp(const char *destino, const String &url, const String &body, int timeoutMs, String *payloadOut,
+                      const char *tipo_conteudo = "application/x-www-form-urlencoded");
 void falharConfigWifiRecebida();
 void limparConfigWifi();
 bool processarResetPlaque(long queueId);
+void carregaBotoesControle();
+bool adicionaBotaoControleLivre(uint32_t assinatura);
+ResultadoConsultaBotaoControle consultaBotaoControle(uint32_t assinatura);
+uint8_t consomeComandoBotaoControle(char *identificador_botao, char *numero_portao_texto);
+void enfileiraLogPulsoBotaoControle(const char *identificador_botao, const char *numero_portao_texto, bool comando_de_abertura);
+bool salvaBotoesControle();
+void enviaCadastrosBotoesControlePendentes();
+void enviaLogsPulsosBotoesControle();
+bool processarAtualizacaoBotaoControle(long queue_id, const String &payload);
 
 // ============================================================
 // LOG
@@ -463,7 +574,13 @@ bool wifiEstaConfigurado() {
   return setup_finished && wifi_ssid.length() > 0 && wifi_password.length() > 0;
 }
 
+// Diz se o Wi-Fi está associado e com IP. Com o rádio desligado não consulta WiFi.status(),
+// porque no ESP32-S3 isso sobe a interface Wi-Fi e tira a rota padrão do cabo.
 bool wifiConectado() {
+  wifi_mode_t modo_wifi = WiFi.getMode();
+  if (modo_wifi == WIFI_MODE_NULL || modo_wifi == WIFI_OFF) {
+    return false;
+  }
   return WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0, 0, 0, 0);
 }
 
@@ -479,6 +596,38 @@ bool caboConectado() {
   }
 
   return ethComIp && ETH.linkUp();
+}
+
+// O Wi-Fi só é tentado antes do cabo quando já está no ar, tem credencial salva ou há config_plaque em andamento.
+bool deveTentarWifiAntesDoCabo() {
+  return wifiConectado() || wifiEstaConfigurado() || wifiCredenciaisPendentes;
+}
+
+// Sem o Wi-Fi no ar, o cabo com IP fecha a configuração como completed. Sem cabo, a ação falha.
+const char *statusDaConfiguracaoQuandoWifiNaoSobe(bool cabo_disponivel) {
+  return cabo_disponivel ? "completed" : "failed";
+}
+
+// O cabo só assume a configuração do aplicativo quando tem IP, o Wi-Fi não está conectado e não há Wi-Fi persistido.
+bool caboDeveAssumirConfiguracaoDoAplicativo(bool cabo_disponivel, bool wifi_esta_conectado,
+                                             bool configuracao_wifi_persistida) {
+  return cabo_disponivel && !wifi_esta_conectado && !configuracao_wifi_persistida;
+}
+
+// Confirma na API a configuração pendente pelo cabo, para o aplicativo sair de aguardando configuração.
+// Não altera o Wi-Fi já persistido. Devolve true quando o cabo assumiu esta ação.
+bool confirmaConfiguracaoPeloCabo(long queue_id) {
+  if (!caboDeveAssumirConfiguracaoDoAplicativo(caboConectado(), wifiConectado(), setup_finished)) {
+    return false;
+  }
+  if (queue_id <= 0 || queue_id == ultimoQueueIdNotificado) {
+    return queue_id > 0 && queue_id == ultimoQueueIdNotificado;
+  }
+
+  ultimoQueueIdNotificado = queue_id;
+  atualizarStatusFila(queue_id, statusDaConfiguracaoQuandoWifiNaoSobe(true));
+  print_log("Cabo de rede assumiu a comunicacao com o aplicativo. Configuracao confirmada sem Wi-Fi.");
+  return true;
 }
 
 String redeAtual() {
@@ -563,6 +712,9 @@ void onEthEvent(arduino_event_id_t event, arduino_event_info_t info) {
 
       if (!wifiConectado()) {
         Network.setDefaultInterface(ETH);
+        if (!setup_finished) {
+          print_log("Sem Wi-Fi configurado. Cabo de rede assumiu a comunicacao com o aplicativo.");
+        }
       }
 
       cicloApiAssimQueRedeSubir = true;
@@ -946,14 +1098,15 @@ uint8_t nivelLedStatusServidor(unsigned long agora) {
   return aceso ? HIGH : LOW;
 }
 
-// Atualiza os três LEDs da placa. Wi-Fi e cabo seguem a conexão; o status pisca sem usar delay.
+// Atualiza os três LEDs da placa com o estado já lido no loop. Não consulta Wi-Fi nem Ethernet:
+// a tarefa dos portões chama esta função, e essa consulta travava o pulso de abertura vindo do aplicativo.
 void atualizaLedsIndicadoresRede(unsigned long agora) {
   static uint8_t nivel_anterior_led_wifi = 0xFF;
   static uint8_t nivel_anterior_led_ethernet = 0xFF;
   static uint8_t nivel_anterior_led_status = 0xFF;
 
-  uint8_t nivel_wifi = nivelLedConexao(wifiConectado());
-  uint8_t nivel_ethernet = nivelLedConexao(caboConectado());
+  uint8_t nivel_wifi = nivelLedConexao(wifi_conectado_para_led);
+  uint8_t nivel_ethernet = nivelLedConexao(cabo_conectado_para_led);
   uint8_t nivel_status = nivelLedStatusServidor(agora);
 
   if (nivel_wifi != nivel_anterior_led_wifi) {
@@ -1196,7 +1349,7 @@ bool processaPortao(EstadoPortao &portao, bool receptora_acionada, bool sensor_f
     portao.momento_inicio_alerta_tempo_aberto = agora;
     print_log(prefixo_log + "ALERTA: PORTAO ABERTO POR MAIS DE " + String(tempo_maximo_portao_aberto_ms / 1000) +
               " s! Sirene 1 s ligada / 2 s desligada ate fechar.");
-    registraEventoPortao(portao, "gate_timeout_open");
+    registraEventoPortao(portao, tipo_evento_portao_aberto_sem_fechar);
   }
 
   return !comando_bloqueado;
@@ -1383,12 +1536,18 @@ String identificaAssinaturaControleRf433(uint32_t assinatura) {
   return ">>> ASSINATURA DESCONHECIDA";
 }
 
-// Aceita o quadro do controle, calcula a assinatura e mostra no formato QUADRO RF. Nao aciona rele.
-bool analisaQuadroAssinaturaRf433(const uint16_t *duracoes_us, int quantidade_intervalos, uint32_t &assinatura) {
-  quantidade_quadros_assinatura_rf433++;
+// Aceita o quadro do controle e calcula a assinatura. Com publicar_no_monitor_serial, mostra o QUADRO RF
+// e conta o quadro. Fora da janela de cadastro o calculo segue silencioso e nao aciona rele.
+bool analisaQuadroAssinaturaRf433(const uint16_t *duracoes_us, int quantidade_intervalos, uint32_t &assinatura,
+                                  bool publicar_no_monitor_serial = true) {
+  if (publicar_no_monitor_serial) {
+    quantidade_quadros_assinatura_rf433++;
+  }
   if (quantidade_intervalos < quantidade_minima_intervalos_assinatura_rf433 ||
       quantidade_intervalos > quantidade_maxima_intervalos_assinatura_rf433) {
-    quantidade_quadros_assinatura_rf433_rejeitados++;
+    if (publicar_no_monitor_serial) {
+      quantidade_quadros_assinatura_rf433_rejeitados++;
+    }
     return false;
   }
 
@@ -1403,12 +1562,18 @@ bool analisaQuadroAssinaturaRf433(const uint16_t *duracoes_us, int quantidade_in
   simbolos[quantidade_intervalos] = '\0';
 
   if ((uint32_t)intervalos_regulares * 100 < (uint32_t)quantidade_intervalos * 90) {
-    quantidade_quadros_assinatura_rf433_rejeitados++;
+    if (publicar_no_monitor_serial) {
+      quantidade_quadros_assinatura_rf433_rejeitados++;
+    }
     return false;
   }
 
-  quantidade_quadros_assinatura_rf433_regulares++;
   assinatura = calculaAssinaturaSimbolosRf433(simbolos, (uint8_t)quantidade_intervalos);
+  if (!publicar_no_monitor_serial) {
+    return true;
+  }
+
+  quantidade_quadros_assinatura_rf433_regulares++;
   if (millis() - momento_ultima_mensagem_assinatura_rf433 < intervalo_minimo_mensagem_assinatura_rf433_ms) {
     return true;
   }
@@ -1462,8 +1627,11 @@ bool decodificaTremDePulsosRf433(const uint16_t *duracoes_us, int quantidade_pul
   return true;
 }
 
-// Copia o quadro fechado pela interrupção (ou pelo silêncio) e tenta decodificá-lo.
+// Copia o quadro fechado pela interrupção (ou pelo silêncio), calcula a assinatura e tenta decodificá-lo.
+// A assinatura fica disponível mesmo quando o código binário não fecha, para o cadastro dos botões.
 bool consomeQuadroCapturadoRf433(uint32_t &codigo, uint8_t &quantidade_bits) {
+  assinatura_quadro_rf433_disponivel = false;
+  assinatura_quadro_rf433_capturada = 0;
   uint16_t copia_duracoes[quantidade_maxima_pulsos_rf433];
   int quantidade = 0;
 
@@ -1489,9 +1657,10 @@ bool consomeQuadroCapturadoRf433(uint32_t &codigo, uint8_t &quantidade_bits) {
   if (quantidade <= 0) {
     return false;
   }
-  if (cadastro_controle_rf433_ativo) {
-    uint32_t assinatura_quadro = 0;
-    analisaQuadroAssinaturaRf433(copia_duracoes, quantidade, assinatura_quadro);
+  uint32_t assinatura_quadro = 0;
+  if (analisaQuadroAssinaturaRf433(copia_duracoes, quantidade, assinatura_quadro, cadastro_controle_rf433_ativo)) {
+    assinatura_quadro_rf433_disponivel = true;
+    assinatura_quadro_rf433_capturada = assinatura_quadro;
   }
   return decodificaTremDePulsosRf433(copia_duracoes, quantidade, codigo, quantidade_bits);
 }
@@ -1526,7 +1695,9 @@ bool controleRf433JaCadastrado(uint32_t codigo, uint8_t quantidade_bits) {
 }
 
 // Fecha a captura por silêncio, exige o mesmo quadro duas vezes e, com o botão de cadastrar controle,
-// grava o comando. Controle já cadastrado abre o portão 1.
+// grava a assinatura em buttons (livre, portão 0) e o código binário na lista antiga.
+// Botão presente em buttons só pulsa se estiver vinculado a um portão válido.
+// Código binário sem entrada em buttons continua abrindo o portão 1.
 void processaReceptorFrequencia433(unsigned long agora) {
   if (escuta_botao_cadastrar_controle) {
     static bool leitura_anterior_botao = false;
@@ -1553,8 +1724,10 @@ void processaReceptorFrequencia433(unsigned long agora) {
 
   bool tem_quadro = false;
   bool quadro_valido = false;
+  bool assinatura_disponivel = false;
   uint32_t codigo = 0;
   uint8_t quantidade_bits = 0;
+  uint32_t assinatura_deste_quadro = 0;
 
   if (quadro_rf433_injetado_pendente) {
     quadro_rf433_injetado_pendente = false;
@@ -1562,26 +1735,49 @@ void processaReceptorFrequencia433(unsigned long agora) {
     quadro_valido = quadro_rf433_injetado_valido;
     codigo = codigo_rf433_injetado;
     quantidade_bits = quantidade_bits_codigo_rf433_injetado;
+    if (assinatura_rf433_injetada_pendente) {
+      assinatura_rf433_injetada_pendente = false;
+      assinatura_disponivel = true;
+      assinatura_deste_quadro = assinatura_rf433_injetada;
+    }
   } else if (consomeQuadroCapturadoRf433(codigo, quantidade_bits)) {
     tem_quadro = true;
     quadro_valido = true;
+    assinatura_disponivel = assinatura_quadro_rf433_disponivel;
+    assinatura_deste_quadro = assinatura_quadro_rf433_capturada;
+    assinatura_quadro_rf433_disponivel = false;
+  } else if (assinatura_quadro_rf433_disponivel) {
+    tem_quadro = true;
+    quadro_valido = false;
+    assinatura_disponivel = true;
+    assinatura_deste_quadro = assinatura_quadro_rf433_capturada;
+    assinatura_quadro_rf433_disponivel = false;
   }
 
   if (!tem_quadro) {
     return;
   }
-  if (!quadro_valido) {
+  if (!quadro_valido && !assinatura_disponivel) {
     aguardando_repeticao_quadro_rf433 = false;
+    assinatura_rf433_candidata_disponivel = false;
     return;
   }
 
+  bool mesma_assinatura = assinatura_disponivel == assinatura_rf433_candidata_disponivel &&
+                          (!assinatura_disponivel || assinatura_deste_quadro == assinatura_rf433_candidata);
   if (!aguardando_repeticao_quadro_rf433 || codigo != codigo_rf433_candidato ||
-      quantidade_bits != quantidade_bits_codigo_rf433_candidato) {
+      quantidade_bits != quantidade_bits_codigo_rf433_candidato || !mesma_assinatura) {
     codigo_rf433_candidato = codigo;
     quantidade_bits_codigo_rf433_candidato = quantidade_bits;
+    assinatura_rf433_candidata_disponivel = assinatura_disponivel;
+    assinatura_rf433_candidata = assinatura_deste_quadro;
     aguardando_repeticao_quadro_rf433 = true;
     if (cadastro_controle_rf433_ativo) {
-      imprimeComandoControleRf433("Comando enviado pelo controle:", codigo, quantidade_bits);
+      if (quadro_valido) {
+        imprimeComandoControleRf433("Comando enviado pelo controle:", codigo, quantidade_bits);
+      } else {
+        print_log("Assinatura do botao de controle recebida. Aperte o mesmo botao outra vez para confirmar.");
+      }
     }
     return;
   }
@@ -1589,9 +1785,22 @@ void processaReceptorFrequencia433(unsigned long agora) {
 
   if (cadastro_controle_rf433_ativo) {
     cadastro_controle_rf433_ativo = false;
-    imprimeComandoControleRf433("Comando confirmado do controle:", codigo, quantidade_bits);
+    if (quadro_valido) {
+      imprimeComandoControleRf433("Comando confirmado do controle:", codigo, quantidade_bits);
+    }
+    if (assinatura_disponivel) {
+      adicionaBotaoControleLivre(assinatura_deste_quadro);
+    }
+    if (!quadro_valido) {
+      momento_ultimo_comando_rf433_reconhecido = agora;
+      return;
+    }
     if (controleRf433JaCadastrado(codigo, quantidade_bits)) {
-      print_log("Este controle ja estava cadastrado. Aciona-lo abre o portao 1.");
+      if (assinatura_disponivel) {
+        print_log("Codigo binario deste botao ja estava na lista antiga. O pulso passa a seguir o status gravado em buttons.");
+      } else {
+        print_log("Este controle ja estava cadastrado. Aciona-lo abre o portao 1.");
+      }
       return;
     }
     if (quantidade_controles_rf433_gravados >= quantidade_maxima_controles_rf433) {
@@ -1610,7 +1819,40 @@ void processaReceptorFrequencia433(unsigned long agora) {
     quantidade_bits_codigo_rf433_gravado = quantidade_bits;
     gravacao_codigo_rf433_pendente = true;
     momento_ultimo_comando_rf433_reconhecido = agora;
-    print_log("Controle cadastrado. Os proximos acionamentos deste comando abrem o portao 1.");
+    if (assinatura_disponivel) {
+      print_log("Botao de controle cadastrado como livre no portao 0. O pulso so abre o portao depois que o aplicativo vincular.");
+    } else {
+      print_log("Controle cadastrado. Os proximos acionamentos deste comando abrem o portao 1.");
+    }
+    return;
+  }
+
+  if (assinatura_disponivel) {
+    ResultadoConsultaBotaoControle consulta = consultaBotaoControle(assinatura_deste_quadro);
+    if (consulta.cadastrado) {
+      if (agora - momento_ultimo_comando_rf433_reconhecido < intervalo_minimo_comando_rf433_ms) {
+        return;
+      }
+      momento_ultimo_comando_rf433_reconhecido = agora;
+      if (!consulta.pode_pulsar || consulta.numero_portao_pulso == 0) {
+        print_log("Botao de controle " + String(consulta.identificador) + " nao acionou portao. Status " +
+                  String(consulta.status) + ", portao " + String(consulta.numero_portao) + ".");
+        return;
+      }
+      comando_botao_controle_portao_pendente = consulta.numero_portao_pulso;
+      strncpy(identificador_comando_botao_controle_pendente, consulta.identificador,
+              tamanho_identificador_botao_controle - 1);
+      identificador_comando_botao_controle_pendente[tamanho_identificador_botao_controle - 1] = '\0';
+      strncpy(numero_portao_comando_botao_controle_pendente, consulta.numero_portao,
+              tamanho_numero_portao_botao_controle - 1);
+      numero_portao_comando_botao_controle_pendente[tamanho_numero_portao_botao_controle - 1] = '\0';
+      print_log("Botao de controle " + String(consulta.identificador) + " vinculado. Pulso no portao " +
+                String(consulta.numero_portao_pulso) + ".");
+      return;
+    }
+  }
+
+  if (!quadro_valido) {
     return;
   }
 
@@ -1774,6 +2016,7 @@ void carregaConfiguracaoPortoes() {
   print_log(String("Manutencao portao 2: ") + (manutencao_portao_2 ? "ativa" : "desativada"));
   print_log(String("Manutencao portao 3: ") + (manutencao_portao_3 ? "ativa" : "desativada"));
   carregaCodigoRf433();
+  carregaBotoesControle();
 }
 
 // Salva na Preferences as flags de intertravamento, fotocélulas e modo manutenção para valerem após reiniciar a placa.
@@ -1798,7 +2041,11 @@ void tarefaControlePortoes(void *parametro) {
 
   for (;;) {
     unsigned long agora = millis();
-    atualizaLedsIndicadoresRede(agora);
+    // Tira o comando da fila antes de qualquer I2C. Se a espera do loop estourar, o pulso já foi separado.
+    uint8_t comando_remoto_recebido = 0;
+    if (fila_comandos_remotos_portao != nullptr) {
+      xQueueReceive(fila_comandos_remotos_portao, &comando_remoto_recebido, 0);
+    }
     static unsigned long momento_ultima_garantia_entradas = 0;
     if (agora - momento_ultima_garantia_entradas >= 1000) {
       momento_ultima_garantia_entradas = agora;
@@ -1829,11 +2076,9 @@ void tarefaControlePortoes(void *parametro) {
 
     processaReceptorFrequencia433(agora);
     bool comando_rf433 = consomeComandoReceptorRf433();
-
-    uint8_t comando_remoto_recebido = 0;
-    if (fila_comandos_remotos_portao != nullptr) {
-      xQueueReceive(fila_comandos_remotos_portao, &comando_remoto_recebido, 0);
-    }
+    char identificador_botao_pulso[tamanho_identificador_botao_controle] = {0};
+    char numero_portao_botao_pulso[tamanho_numero_portao_botao_controle] = {0};
+    uint8_t portao_do_botao_controle = consomeComandoBotaoControle(identificador_botao_pulso, numero_portao_botao_pulso);
 
     if (quantidade_portoes_placa < 2) {
       receptora_portao_2_acionada = false;
@@ -1842,6 +2087,17 @@ void tarefaControlePortoes(void *parametro) {
     if (quantidade_portoes_placa < 3) {
       receptora_portao_3_acionada = false;
       sensor_portao_3_fechado = true;
+    }
+
+    if (portao_do_botao_controle == 1) {
+      receptora_portao_1_acionada = true;
+    } else if (portao_do_botao_controle == 2 && quantidade_portoes_placa >= 2) {
+      receptora_portao_2_acionada = true;
+    } else if (portao_do_botao_controle == 3 && quantidade_portoes_placa >= 3) {
+      receptora_portao_3_acionada = true;
+    } else if (portao_do_botao_controle != 0) {
+      print_log("Pulso do botao de controle ignorado: a placa nao tem o portao " + String(portao_do_botao_controle) + ".");
+      portao_do_botao_controle = 0;
     }
 
     bool bloqueia_portao_1 = sensorBloqueiaIntertravamento(2, sensor_portao_2_fechado) ||
@@ -1868,6 +2124,26 @@ void tarefaControlePortoes(void *parametro) {
                                                   portaoEmManutencao(3));
     } else if (comando_remoto_recebido == 3) {
       comando_portao_3_executado = false;
+    }
+
+    bool comando_do_botao_executado = false;
+    bool sensor_fechado_no_pulso = true;
+    if (portao_do_botao_controle == 1) {
+      comando_do_botao_executado = comando_portao_1_executado;
+      sensor_fechado_no_pulso = sensor_portao_1_fechado;
+    } else if (portao_do_botao_controle == 2) {
+      comando_do_botao_executado = comando_portao_2_executado;
+      sensor_fechado_no_pulso = sensor_portao_2_fechado;
+    } else if (portao_do_botao_controle == 3) {
+      comando_do_botao_executado = comando_portao_3_executado;
+      sensor_fechado_no_pulso = sensor_portao_3_fechado;
+    }
+    if (portao_do_botao_controle != 0 && comando_do_botao_executado) {
+      enfileiraLogPulsoBotaoControle(identificador_botao_pulso, numero_portao_botao_pulso, sensor_fechado_no_pulso);
+    } else if (portao_do_botao_controle != 0) {
+      print_log("Botao de controle " + String(identificador_botao_pulso) + " nao enviou o comando ao portao " +
+                String(portao_do_botao_controle) +
+                ": o intertravamento bloqueou a abertura porque outro portao esta aberto.");
     }
 
     if (comando_remoto_recebido == comando_remoto_desligar_sirene) {
@@ -1903,6 +2179,7 @@ void tarefaControlePortoes(void *parametro) {
       niveis_saidas.central_alarme = LOW;
     }
     aplicaSaidas(niveis_saidas);
+    atualizaLedsIndicadoresRede(agora);
 
     vTaskDelay(pdMS_TO_TICKS(intervalo_tarefa_portoes_ms));
   }
@@ -1961,7 +2238,12 @@ void limparConfigWifi() {
 
   salvarConfigWifi();
 
-  WiFi.disconnect(true, false);
+  // disconnect(true) desliga o rádio com WiFi.mode(WIFI_OFF) e derruba o W5500.
+  if (ethIniciado) {
+    WiFi.disconnect(false, false);
+  } else {
+    WiFi.disconnect(true, false);
+  }
   delay(100);
 
   if (!ethIniciado) {
@@ -2152,7 +2434,8 @@ String motivoCaboIndisponivel() {
   return "cabo indisponivel";
 }
 
-bool postHttpNoMeio(bool usarWifi, const char *destino, const String &url, const String &body, int timeoutMs, String *payloadOut) {
+bool postHttpNoMeio(bool usarWifi, const char *destino, const String &url, const String &body, int timeoutMs, String *payloadOut,
+                    const char *tipo_conteudo) {
   imprimirCabecalhoRequisicao(destino, usarWifi);
 
   if (usarWifi) {
@@ -2186,7 +2469,10 @@ bool postHttpNoMeio(bool usarWifi, const char *destino, const String &url, const
   }
 
   http.setTimeout(timeoutMs);
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  if (tipo_conteudo == nullptr || tipo_conteudo[0] == '\0') {
+    tipo_conteudo = "application/x-www-form-urlencoded";
+  }
+  http.addHeader("Content-Type", tipo_conteudo);
 
   int httpCode = http.POST(body);
 
@@ -2221,18 +2507,22 @@ bool postHttpNoMeio(bool usarWifi, const char *destino, const String &url, const
   return true;
 }
 
-bool executarPostHttp(const char *destino, const String &url, const String &body, int timeoutMs, String *payloadOut) {
-  bool tentarWifi = wifiConectado() || wifiEstaConfigurado() || wifiCredenciaisPendentes;
+bool executarPostHttp(const char *destino, const String &url, const String &body, int timeoutMs, String *payloadOut,
+                      const char *tipo_conteudo) {
+  if (tipo_conteudo == nullptr || tipo_conteudo[0] == '\0') {
+    tipo_conteudo = "application/x-www-form-urlencoded";
+  }
+  bool tentarWifi = deveTentarWifiAntesDoCabo();
 
   if (tentarWifi) {
-    if (postHttpNoMeio(true, destino, url, body, timeoutMs, payloadOut)) {
+    if (postHttpNoMeio(true, destino, url, body, timeoutMs, payloadOut, tipo_conteudo)) {
       return true;
     }
   }
 
   preferirCaboSeWifiCaiu();
 
-  if (postHttpNoMeio(false, destino, url, body, timeoutMs, payloadOut)) {
+  if (postHttpNoMeio(false, destino, url, body, timeoutMs, payloadOut, tipo_conteudo)) {
     return true;
   }
 
@@ -2277,6 +2567,11 @@ String textoFalhaSensorFimDeCurso(uint8_t numero_portao) {
   return "Falha de leitura no sensor de fim de curso do portão " + String(numero_portao);
 }
 
+// JSON do event_data do gate_timeout_open: {"port": N}.
+String montaEventDataPortaoAbertoSemFechar(uint8_t numero_portao) {
+  return "{\"port\": " + String(numero_portao) + "}";
+}
+
 // Codifica um texto para o corpo application/x-www-form-urlencoded.
 String codificaTextoParaUrl(const String &texto) {
   const char *digitos_hexadecimais = "0123456789ABCDEF";
@@ -2319,11 +2614,18 @@ bool enviarEventoLog(const char *eventType, uint8_t numero_portao) {
                 + "&event_type=" + String(eventType);
 
   // Falha do sensor vai como texto, com o número do portão, para a notificação do sistema.
+  // gate_timeout_open leva o título de portão aberto por mais de 2 minutos e event_data {"port": N}.
   // Os demais eventos de portão seguem event_data = {"port":N}.
   if (strcmp(eventType, "plaque_problem") == 0 && numero_portao > 0) {
     String texto_falha = textoFalhaSensorFimDeCurso(numero_portao);
     body += "&event_title=" + codificaTextoParaUrl("Possivel defeito na placa");
     body += "&event_data=" + codificaTextoParaUrl(texto_falha);
+  } else if (strcmp(eventType, tipo_evento_portao_aberto_sem_fechar) == 0 && numero_portao > 0) {
+    String event_data = montaEventDataPortaoAbertoSemFechar(numero_portao);
+    body += "&event_title=" + codificaTextoParaUrl(titulo_aviso_portao_aberto_sem_fechar);
+    body += "&event_data=" + codificaTextoParaUrl(event_data);
+    print_log("Requisicao gate_timeout_open do portao " + String(numero_portao) + ": titulo \"" +
+              String(titulo_aviso_portao_aberto_sem_fechar) + "\", event_data " + event_data + ".");
   } else if (numero_portao > 0) {
     body += "&event_data=%7B%22port%22%3A" + String(numero_portao) + "%7D";
   }
@@ -2668,6 +2970,876 @@ bool enviaComandoRemotoParaTarefaPortoes(uint8_t comando_remoto, bool &comando_e
   return resultado_recebido;
 }
 
+// Converte o button_id (decimal ou assinatura hexadecimal) para o número da assinatura capturada.
+bool converteIdentificadorBotaoControle(const String &texto, uint32_t &assinatura) {
+  String limpo = texto;
+  limpo.trim();
+  if (limpo.startsWith("\"")) {
+    limpo = limpo.substring(1);
+    limpo.trim();
+  }
+  if (limpo.endsWith("\"")) {
+    limpo.remove(limpo.length() - 1);
+    limpo.trim();
+  }
+  if (limpo.length() == 0) {
+    return false;
+  }
+
+  int base = 10;
+  if (limpo.length() > 2 && (limpo.startsWith("0x") || limpo.startsWith("0X"))) {
+    base = 16;
+    limpo = limpo.substring(2);
+  } else {
+    for (unsigned int indice = 0; indice < limpo.length(); indice++) {
+      char caractere = limpo[indice];
+      bool digito = caractere >= '0' && caractere <= '9';
+      bool hexadecimal = (caractere >= 'a' && caractere <= 'f') || (caractere >= 'A' && caractere <= 'F');
+      if (hexadecimal) {
+        base = 16;
+      } else if (!digito) {
+        return false;
+      }
+    }
+  }
+  if (limpo.length() == 0) {
+    return false;
+  }
+
+  char *fim = nullptr;
+  unsigned long valor = strtoul(limpo.c_str(), &fim, base);
+  if (fim == nullptr || fim == limpo.c_str() || *fim != '\0') {
+    return false;
+  }
+  assinatura = (uint32_t)valor;
+  return true;
+}
+
+// Diz se o identificador gravado é a mesma assinatura, sem alocar texto.
+bool assinaturaConfereComIdentificadorArmazenado(const char *identificador, uint32_t assinatura) {
+  if (identificador == nullptr || identificador[0] == '\0') {
+    return false;
+  }
+  char *fim = nullptr;
+  unsigned long valor = strtoul(identificador, &fim, 10);
+  if (fim == identificador || (fim != nullptr && *fim != '\0')) {
+    return false;
+  }
+  return (uint32_t)valor == assinatura;
+}
+
+// Texto decimal da assinatura. É o button_id gravado e enviado à API.
+String textoIdentificadorBotaoControle(uint32_t assinatura) {
+  char texto[tamanho_identificador_botao_controle];
+  snprintf(texto, sizeof(texto), "%lu", (unsigned long)assinatura);
+  return String(texto);
+}
+
+// Escreve o array JSON de uma cópia da lista num buffer fixo, sem depender do heap.
+// Se não couber a lista inteira, não escreve um JSON pela metade.
+bool escreveJsonDaCopiaBotoesControle(const BotaoControleCadastrado *copia, uint8_t quantidade, char *buffer,
+                                     size_t tamanho_buffer) {
+  if (buffer == nullptr || tamanho_buffer < 3) {
+    return false;
+  }
+
+  size_t usado = 0;
+  buffer[usado++] = '[';
+  buffer[usado] = '\0';
+  bool primeiro = true;
+  for (uint8_t indice = 0; indice < quantidade; indice++) {
+    if (!copia[indice].ocupado) {
+      continue;
+    }
+
+    const char *pendencia = "";
+    if (copia[indice].operacao_api_pendente == operacao_api_botao_cadastrar) {
+      pendencia = ", \"api_pendente\": \"cadastrar\"";
+    } else if (copia[indice].operacao_api_pendente == operacao_api_botao_resetar) {
+      pendencia = ", \"api_pendente\": \"resetar\"";
+    }
+
+    char objeto[160];
+    int escrito = snprintf(objeto, sizeof(objeto),
+                           "{\"button_id\": \"%s\", \"port_number\": \"%s\", \"status\": \"%s\"%s}",
+                           copia[indice].identificador, copia[indice].numero_portao, copia[indice].status, pendencia);
+    if (escrito < 0 || (size_t)escrito >= sizeof(objeto)) {
+      buffer[0] = '\0';
+      return false;
+    }
+    size_t precisa = (size_t)escrito + (primeiro ? 0 : 1);
+    if (usado + precisa + 2 > tamanho_buffer) {
+      buffer[0] = '\0';
+      return false;
+    }
+    if (!primeiro) {
+      buffer[usado++] = ',';
+    }
+    memcpy(buffer + usado, objeto, (size_t)escrito);
+    usado += (size_t)escrito;
+    buffer[usado] = '\0';
+    primeiro = false;
+  }
+
+  if (usado + 2 > tamanho_buffer) {
+    buffer[0] = '\0';
+    return false;
+  }
+  buffer[usado++] = ']';
+  buffer[usado] = '\0';
+  return true;
+}
+
+// Monta o array JSON de botões a partir de uma cópia já tirada da lista.
+String montaJsonDaCopiaBotoesControle(const BotaoControleCadastrado *copia, uint8_t quantidade) {
+  if (!escreveJsonDaCopiaBotoesControle(copia, quantidade, buffer_json_botoes_controle,
+                                        tamanho_buffer_json_botoes_controle)) {
+    return "[]";
+  }
+  return String(buffer_json_botoes_controle);
+}
+
+// Monta o array JSON atualmente gravado em memória, no formato do índice buttons.
+String montaJsonBotoesControle() {
+  BotaoControleCadastrado copia[quantidade_maxima_botoes_controle];
+  uint8_t quantidade = 0;
+  portENTER_CRITICAL(&protecao_botoes_controle);
+  quantidade = quantidade_botoes_controle;
+  memcpy(copia, botoes_controle, sizeof(copia));
+  portEXIT_CRITICAL(&protecao_botoes_controle);
+  return montaJsonDaCopiaBotoesControle(copia, quantidade);
+}
+
+// Lê um campo de um objeto de botão, com ou sem aspas e com espaço depois dos dois-pontos.
+String extraiCampoObjetoBotaoControle(const String &objeto, const char *campo) {
+  String chave = String("\"") + campo + "\"";
+  int indice = objeto.indexOf(chave);
+  if (indice < 0) {
+    return "";
+  }
+  indice += chave.length();
+  while (indice < (int)objeto.length() &&
+         (objeto[indice] == ' ' || objeto[indice] == '\t' || objeto[indice] == ':')) {
+    indice++;
+  }
+  if (indice >= (int)objeto.length()) {
+    return "";
+  }
+  if (objeto[indice] == '"') {
+    int fim = objeto.indexOf('"', indice + 1);
+    if (fim < 0) {
+      return "";
+    }
+    return objeto.substring(indice + 1, fim);
+  }
+  int fim = indice;
+  while (fim < (int)objeto.length() && objeto[fim] != ',' && objeto[fim] != '}') {
+    fim++;
+  }
+  String valor = objeto.substring(indice, fim);
+  valor.trim();
+  return valor;
+}
+
+// Tira o escape de um action_data que veio como texto dentro do JSON da fila.
+// Repete poucas vezes para o caso de o servidor ter escapado o JSON mais de uma vez.
+String normalizaJsonBotaoControle(const String &texto) {
+  String normalizado = texto;
+  for (uint8_t tentativa = 0; tentativa < 3; tentativa++) {
+    if (normalizado.indexOf("\\\"") < 0) {
+      break;
+    }
+    normalizado.replace("\\\"", "\"");
+  }
+  return normalizado;
+}
+
+// Substitui a lista em memória pelo array JSON, ou só acrescenta os botões que a memória perdeu.
+// substituir_lista true recupera cadastro ou reset que ainda não foi confirmado pela API.
+// substituir_lista false não apaga nem altera o que já está na memória.
+uint8_t interpretaJsonBotoesControle(const String &json, bool substituir_lista = true) {
+  BotaoControleCadastrado temporarios[quantidade_maxima_botoes_controle];
+  memset(temporarios, 0, sizeof(temporarios));
+  uint8_t quantidade_lidos = 0;
+  int cursor = 0;
+  while (cursor < (int)json.length() && quantidade_lidos < quantidade_maxima_botoes_controle) {
+    int inicio = json.indexOf('{', cursor);
+    if (inicio < 0) {
+      break;
+    }
+    int fim = json.indexOf('}', inicio);
+    if (fim < 0) {
+      break;
+    }
+    String objeto = json.substring(inicio, fim + 1);
+    String identificador = extraiCampoObjetoBotaoControle(objeto, "button_id");
+    String numero_portao = extraiCampoObjetoBotaoControle(objeto, "port_number");
+    String status = extraiCampoObjetoBotaoControle(objeto, "status");
+    String envio_pendente = extraiCampoObjetoBotaoControle(objeto, "api_pendente");
+    identificador.trim();
+    numero_portao.trim();
+    status.trim();
+    status.toLowerCase();
+    uint32_t assinatura = 0;
+    bool identificador_valido = converteIdentificadorBotaoControle(identificador, assinatura);
+    bool status_valido = status == "livre" || status == "vinculado" || status == "desativado";
+    bool porta_valida = numero_portao == "0" || numero_portao == "1" || numero_portao == "2" || numero_portao == "3";
+    if (identificador_valido && status_valido && porta_valida) {
+      snprintf(temporarios[quantidade_lidos].identificador, tamanho_identificador_botao_controle, "%lu",
+               (unsigned long)assinatura);
+      snprintf(temporarios[quantidade_lidos].numero_portao, tamanho_numero_portao_botao_controle, "%s",
+               numero_portao.c_str());
+      snprintf(temporarios[quantidade_lidos].status, tamanho_status_botao_controle, "%s", status.c_str());
+      envio_pendente.trim();
+      envio_pendente.toLowerCase();
+      if (envio_pendente == "cadastrar") {
+        temporarios[quantidade_lidos].operacao_api_pendente = operacao_api_botao_cadastrar;
+      } else if (envio_pendente == "resetar") {
+        temporarios[quantidade_lidos].operacao_api_pendente = operacao_api_botao_resetar;
+      }
+      temporarios[quantidade_lidos].ocupado = true;
+      quantidade_lidos++;
+    }
+    cursor = fim + 1;
+  }
+
+  if (substituir_lista) {
+    portENTER_CRITICAL(&protecao_botoes_controle);
+    memset(botoes_controle, 0, sizeof(botoes_controle));
+    memcpy(botoes_controle, temporarios, sizeof(temporarios));
+    quantidade_botoes_controle = quantidade_lidos;
+    portEXIT_CRITICAL(&protecao_botoes_controle);
+    return quantidade_lidos;
+  }
+
+  uint32_t assinaturas_lidas[quantidade_maxima_botoes_controle];
+  bool assinatura_valida[quantidade_maxima_botoes_controle];
+  memset(assinaturas_lidas, 0, sizeof(assinaturas_lidas));
+  memset(assinatura_valida, 0, sizeof(assinatura_valida));
+  for (uint8_t indice = 0; indice < quantidade_lidos; indice++) {
+    assinatura_valida[indice] =
+        converteIdentificadorBotaoControle(temporarios[indice].identificador, assinaturas_lidas[indice]);
+  }
+
+  uint8_t acrescentados = 0;
+  portENTER_CRITICAL(&protecao_botoes_controle);
+  for (uint8_t indice = 0; indice < quantidade_lidos; indice++) {
+    if (!assinatura_valida[indice] || quantidade_botoes_controle >= quantidade_maxima_botoes_controle) {
+      continue;
+    }
+    bool ja_existe = false;
+    for (uint8_t atual = 0; atual < quantidade_botoes_controle; atual++) {
+      if (botoes_controle[atual].ocupado &&
+          assinaturaConfereComIdentificadorArmazenado(botoes_controle[atual].identificador, assinaturas_lidas[indice])) {
+        ja_existe = true;
+        break;
+      }
+    }
+    if (ja_existe) {
+      continue;
+    }
+    botoes_controle[quantidade_botoes_controle] = temporarios[indice];
+    quantidade_botoes_controle++;
+    acrescentados++;
+  }
+  if (acrescentados > 0) {
+    geracao_botoes_controle++;
+    gravacao_botoes_controle_pendente = true;
+  }
+  portEXIT_CRITICAL(&protecao_botoes_controle);
+  return acrescentados;
+}
+
+// Carrega o índice buttons da Preferences para a lista em memória.
+void carregaBotoesControle() {
+  preferences.begin("portguard", true);
+  String json = preferences.getString(chave_armazenamento_botoes_controle, "[]");
+  preferences.end();
+  uint8_t quantidade = interpretaJsonBotoesControle(json);
+  print_log("Botoes de controle carregados de buttons: " + String(quantidade) + ".");
+}
+
+// Grava a lista inteira no índice buttons e só encerra a pendência se a leitura devolver o mesmo JSON.
+// Uma gravação cortada ou antiga não apaga o que a memória já atualizou.
+bool salvaBotoesControle() {
+  if (momento_proxima_gravacao_botoes_controle != 0 &&
+      (long)(millis() - momento_proxima_gravacao_botoes_controle) < 0) {
+    return false;
+  }
+
+  for (uint8_t tentativa = 0; tentativa < 3; tentativa++) {
+    BotaoControleCadastrado copia[quantidade_maxima_botoes_controle];
+    uint8_t quantidade = 0;
+    uint32_t geracao_vista = 0;
+    portENTER_CRITICAL(&protecao_botoes_controle);
+    if (!gravacao_botoes_controle_pendente) {
+      portEXIT_CRITICAL(&protecao_botoes_controle);
+      momento_proxima_gravacao_botoes_controle = 0;
+      return true;
+    }
+    quantidade = quantidade_botoes_controle;
+    geracao_vista = geracao_botoes_controle;
+    memcpy(copia, botoes_controle, sizeof(copia));
+    portEXIT_CRITICAL(&protecao_botoes_controle);
+
+    if (!escreveJsonDaCopiaBotoesControle(copia, quantidade, buffer_json_botoes_controle,
+                                          tamanho_buffer_json_botoes_controle)) {
+      print_log("ERRO: a lista de botoes nao cabe na gravacao. A Preferences nao foi alterada.");
+      momento_proxima_gravacao_botoes_controle = millis() + intervalo_nova_tentativa_gravacao_botoes_controle_ms;
+      return false;
+    }
+
+    if (!preferences.begin("portguard", false)) {
+      print_log("ERRO: nao foi possivel abrir a Preferences para gravar os botoes.");
+      momento_proxima_gravacao_botoes_controle = millis() + intervalo_nova_tentativa_gravacao_botoes_controle_ms;
+      return false;
+    }
+
+    size_t tamanho_esperado = strlen(buffer_json_botoes_controle);
+    size_t tamanho_gravado = preferences.putString(chave_armazenamento_botoes_controle, buffer_json_botoes_controle);
+    if (tamanho_gravado != tamanho_esperado) {
+      preferences.remove(chave_armazenamento_botoes_controle);
+      tamanho_gravado = preferences.putString(chave_armazenamento_botoes_controle, buffer_json_botoes_controle);
+    }
+    String json_lido = preferences.getString(chave_armazenamento_botoes_controle, "");
+    preferences.end();
+
+    bool conferiu = tamanho_gravado == tamanho_esperado && json_lido == buffer_json_botoes_controle;
+    bool geracao_mudou = false;
+    portENTER_CRITICAL(&protecao_botoes_controle);
+    geracao_mudou = geracao_botoes_controle != geracao_vista;
+    if (conferiu && !geracao_mudou) {
+      gravacao_botoes_controle_pendente = false;
+    }
+    portEXIT_CRITICAL(&protecao_botoes_controle);
+
+    if (conferiu && !geracao_mudou) {
+      momento_proxima_gravacao_botoes_controle = 0;
+      print_log("Botoes de controle persistidos em buttons: " + String(quantidade) +
+                " botao(oes), leitura conferida.");
+      return true;
+    }
+    if (!conferiu) {
+      print_log("ERRO: a Preferences nao devolveu a mesma lista de botoes. Nova tentativa de gravacao.");
+    }
+  }
+
+  momento_proxima_gravacao_botoes_controle = millis() + intervalo_nova_tentativa_gravacao_botoes_controle_ms;
+  print_log("ERRO: os botoes continuam pendentes de gravacao na Preferences.");
+  return false;
+}
+
+// Inclui a assinatura como botão livre no portão 0. Se ela já existe, reseta para livre/portão 0.
+bool adicionaBotaoControleLivre(uint32_t assinatura) {
+  char identificador[tamanho_identificador_botao_controle];
+  snprintf(identificador, sizeof(identificador), "%lu", (unsigned long)assinatura);
+  bool ja_existia = false;
+  bool sem_espaco = false;
+
+  portENTER_CRITICAL(&protecao_botoes_controle);
+  for (uint8_t indice = 0; indice < quantidade_botoes_controle; indice++) {
+    if (botoes_controle[indice].ocupado &&
+        assinaturaConfereComIdentificadorArmazenado(botoes_controle[indice].identificador, assinatura)) {
+      snprintf(botoes_controle[indice].numero_portao, tamanho_numero_portao_botao_controle, "0");
+      snprintf(botoes_controle[indice].status, tamanho_status_botao_controle, "livre");
+      botoes_controle[indice].operacao_api_pendente = operacao_api_botao_resetar;
+      geracao_botoes_controle++;
+      gravacao_botoes_controle_pendente = true;
+      ja_existia = true;
+      break;
+    }
+  }
+  if (!ja_existia) {
+    if (quantidade_botoes_controle >= quantidade_maxima_botoes_controle) {
+      sem_espaco = true;
+    } else {
+      BotaoControleCadastrado *botao = &botoes_controle[quantidade_botoes_controle];
+      memset(botao, 0, sizeof(*botao));
+      snprintf(botao->identificador, tamanho_identificador_botao_controle, "%s", identificador);
+      snprintf(botao->numero_portao, tamanho_numero_portao_botao_controle, "0");
+      snprintf(botao->status, tamanho_status_botao_controle, "livre");
+      botao->operacao_api_pendente = operacao_api_botao_cadastrar;
+      botao->ocupado = true;
+      quantidade_botoes_controle++;
+      geracao_botoes_controle++;
+      gravacao_botoes_controle_pendente = true;
+    }
+  }
+  portEXIT_CRITICAL(&protecao_botoes_controle);
+
+  char hexadecimal[12];
+  snprintf(hexadecimal, sizeof(hexadecimal), "%08lX", (unsigned long)assinatura);
+  if (ja_existia) {
+    print_log("Botao de controle ja cadastrado (button_id " + String(identificador) + ", assinatura 0x" +
+              String(hexadecimal) + "). Resetando para livre no portao 0 e enviando a atualizacao para a API.");
+    return true;
+  }
+  if (sem_espaco) {
+    print_log("Lista de botoes de controle cheia. Cadastro nao gravado.");
+    return false;
+  }
+
+  print_log("Botao de controle cadastrado: button_id " + String(identificador) + " (assinatura 0x" +
+            String(hexadecimal) + "), portao 0, status livre.");
+  return true;
+}
+
+// Atualiza status e portão do botão cuja assinatura confere com o button_id recebido.
+bool atualizaBotaoControleArmazenado(const String &identificador_recebido, const String &numero_portao, const String &status) {
+  uint32_t assinatura = 0;
+  if (!converteIdentificadorBotaoControle(identificador_recebido, assinatura)) {
+    return false;
+  }
+  String status_normalizado = status;
+  status_normalizado.trim();
+  status_normalizado.toLowerCase();
+  String numero_normalizado = numero_portao;
+  numero_normalizado.trim();
+  if (numero_normalizado != "0" && numero_normalizado != "1" && numero_normalizado != "2" && numero_normalizado != "3") {
+    return false;
+  }
+  if (status_normalizado != "livre" && status_normalizado != "vinculado" && status_normalizado != "desativado") {
+    return false;
+  }
+
+  bool encontrou = false;
+  portENTER_CRITICAL(&protecao_botoes_controle);
+  for (uint8_t indice = 0; indice < quantidade_botoes_controle; indice++) {
+    if (!botoes_controle[indice].ocupado ||
+        !assinaturaConfereComIdentificadorArmazenado(botoes_controle[indice].identificador, assinatura)) {
+      continue;
+    }
+    snprintf(botoes_controle[indice].numero_portao, tamanho_numero_portao_botao_controle, "%s", numero_normalizado.c_str());
+    snprintf(botoes_controle[indice].status, tamanho_status_botao_controle, "%s", status_normalizado.c_str());
+    // O servidor ja definiu portao e status. Um cadastro ou reset antigo nao pode ser enviado depois e desfazer o vinculo.
+    botoes_controle[indice].operacao_api_pendente = 0;
+    geracao_botoes_controle++;
+    gravacao_botoes_controle_pendente = true;
+    encontrou = true;
+    break;
+  }
+  portEXIT_CRITICAL(&protecao_botoes_controle);
+  return encontrou;
+}
+
+// Localiza o botão pela assinatura e diz se ele pode pulsar um portão desta placa.
+ResultadoConsultaBotaoControle consultaBotaoControle(uint32_t assinatura) {
+  ResultadoConsultaBotaoControle resultado;
+  memset(&resultado, 0, sizeof(resultado));
+  portENTER_CRITICAL(&protecao_botoes_controle);
+  for (uint8_t indice = 0; indice < quantidade_botoes_controle; indice++) {
+    if (!botoes_controle[indice].ocupado ||
+        !assinaturaConfereComIdentificadorArmazenado(botoes_controle[indice].identificador, assinatura)) {
+      continue;
+    }
+    resultado.cadastrado = true;
+    strncpy(resultado.identificador, botoes_controle[indice].identificador, tamanho_identificador_botao_controle - 1);
+    strncpy(resultado.numero_portao, botoes_controle[indice].numero_portao, tamanho_numero_portao_botao_controle - 1);
+    strncpy(resultado.status, botoes_controle[indice].status, tamanho_status_botao_controle - 1);
+    resultado.operacao_api_pendente = botoes_controle[indice].operacao_api_pendente;
+    break;
+  }
+  portEXIT_CRITICAL(&protecao_botoes_controle);
+  if (!resultado.cadastrado) {
+    return resultado;
+  }
+
+  uint8_t numero_portao = (uint8_t)atoi(resultado.numero_portao);
+  bool vinculado = strcmp(resultado.status, "vinculado") == 0;
+  resultado.pode_pulsar = vinculado && numero_portao >= 1 && numero_portao <= 3 && portaoExisteNaPlaca(numero_portao);
+  resultado.numero_portao_pulso = resultado.pode_pulsar ? numero_portao : 0;
+  return resultado;
+}
+
+// Entrega uma vez o portão que o botão vinculado pediu para pulsar.
+uint8_t consomeComandoBotaoControle(char *identificador_botao, char *numero_portao_texto) {
+  uint8_t numero_portao = comando_botao_controle_portao_pendente;
+  if (identificador_botao != nullptr) {
+    identificador_botao[0] = '\0';
+    if (numero_portao != 0) {
+      strncpy(identificador_botao, identificador_comando_botao_controle_pendente, tamanho_identificador_botao_controle - 1);
+      identificador_botao[tamanho_identificador_botao_controle - 1] = '\0';
+    }
+  }
+  if (numero_portao_texto != nullptr) {
+    numero_portao_texto[0] = '\0';
+    if (numero_portao != 0) {
+      strncpy(numero_portao_texto, numero_portao_comando_botao_controle_pendente, tamanho_numero_portao_botao_controle - 1);
+      numero_portao_texto[tamanho_numero_portao_botao_controle - 1] = '\0';
+    }
+  }
+  if (numero_portao != 0) {
+    comando_botao_controle_portao_pendente = 0;
+    identificador_comando_botao_controle_pendente[0] = '\0';
+    numero_portao_comando_botao_controle_pendente[0] = '\0';
+  }
+  return numero_portao;
+}
+
+// Coloca na fila do loop o log de abertura ou fechamento feito pelo pulso do controle.
+void enfileiraLogPulsoBotaoControle(const char *identificador_botao, const char *numero_portao_texto,
+                                    bool comando_de_abertura) {
+  if (fila_logs_pulsos_botoes_controle == nullptr) {
+    print_log("ERRO: fila de logs de botoes de controle nao criada. Log descartado.");
+    return;
+  }
+  LogPulsoBotaoControle log_pulso;
+  memset(&log_pulso, 0, sizeof(log_pulso));
+  if (identificador_botao != nullptr) {
+    strncpy(log_pulso.identificador_botao, identificador_botao, tamanho_identificador_botao_controle - 1);
+  }
+  if (numero_portao_texto != nullptr) {
+    strncpy(log_pulso.numero_portao, numero_portao_texto, tamanho_numero_portao_botao_controle - 1);
+  }
+  strncpy(log_pulso.tipo_evento, comando_de_abertura ? "gate_open" : "gate_close", sizeof(log_pulso.tipo_evento) - 1);
+  if (xQueueSend(fila_logs_pulsos_botoes_controle, &log_pulso, 0) != pdTRUE) {
+    print_log("ERRO: fila de logs de botoes de controle cheia. Log descartado.");
+  }
+}
+
+// JSON do cadastro ou do reset. A placa não tem login_hash: identifica a placa pelo serial_id.
+String montaCorpoJsonBotaoControle(const String &identificador, bool resetar) {
+  String token = api_token;
+  String serial = plaque_serial;
+  token.replace("\\", "\\\\");
+  token.replace("\"", "\\\"");
+  serial.replace("\\", "\\\\");
+  serial.replace("\"", "\\\"");
+  String corpo = "{\"internal_token\":\"";
+  corpo += token;
+  corpo += "\",\"serial_id\":\"";
+  corpo += serial;
+  corpo += "\",\"button_id\":";
+  corpo += identificador;
+  if (resetar) {
+    corpo += ",\"control_id\":0,\"port_number\":0";
+  }
+  corpo += "}";
+  return corpo;
+}
+
+// Corpo do cadastro do botão: internal_token, serial_id e button_id numérico.
+String montaCorpoCadastroBotaoControle(const String &identificador) {
+  return montaCorpoJsonBotaoControle(identificador, false);
+}
+
+// Corpo do reset: solta o controle (control_id 0) e tira o portão (port_number 0).
+String montaCorpoResetBotaoControle(const String &identificador) {
+  return montaCorpoJsonBotaoControle(identificador, true);
+}
+
+// Corpo do log de abertura/fechamento por pulso de controle, com button_id e port_number do objeto encontrado.
+String montaCorpoLogPulsoBotaoControle(const char *tipo_evento, const char *identificador, const char *numero_portao) {
+  return "internal_token=" + api_token + "&serial=" + codificaTextoParaUrl(plaque_serial) +
+         "&serial_id=" + codificaTextoParaUrl(plaque_serial) + "&event_type=" + String(tipo_evento) +
+         "&button_id=" + codificaTextoParaUrl(identificador) + "&port_number=" + codificaTextoParaUrl(numero_portao);
+}
+
+// Envia cadastro ou reset pendente. Sem confirmação da API, repete a cada 5 s até o servidor aceitar.
+void enviaCadastrosBotoesControlePendentes() {
+  if (momento_proxima_tentativa_envio_cadastro_botao_controle != 0 &&
+      (long)(millis() - momento_proxima_tentativa_envio_cadastro_botao_controle) < 0) {
+    return;
+  }
+
+  char identificador[tamanho_identificador_botao_controle] = "";
+  char operacao = 0;
+  bool encontrou = false;
+  portENTER_CRITICAL(&protecao_botoes_controle);
+  for (uint8_t indice = 0; indice < quantidade_botoes_controle; indice++) {
+    char pendencia = botoes_controle[indice].operacao_api_pendente;
+    if (botoes_controle[indice].ocupado &&
+        (pendencia == operacao_api_botao_cadastrar || pendencia == operacao_api_botao_resetar)) {
+      strncpy(identificador, botoes_controle[indice].identificador, tamanho_identificador_botao_controle - 1);
+      identificador[tamanho_identificador_botao_controle - 1] = '\0';
+      operacao = pendencia;
+      encontrou = true;
+      break;
+    }
+  }
+  portEXIT_CRITICAL(&protecao_botoes_controle);
+  if (!encontrou) {
+    return;
+  }
+
+  bool resetar = operacao == operacao_api_botao_resetar;
+  const char *rota = resetar ? rota_atualizacao_botao_controle : rota_cadastro_botao_controle;
+  String url = api_url_aplicativo + rota;
+  String corpo = resetar ? montaCorpoResetBotaoControle(identificador) : montaCorpoCadastroBotaoControle(identificador);
+  print_log("Enviando botao " + String(identificador) + " para " + String(rota) + ".");
+  String resposta;
+  bool enviou = executarPostHttp(rota, url, corpo, 10000, &resposta, tipo_conteudo_json);
+  if (enviou && (resposta.indexOf("\"status\":400") >= 0 || resposta.indexOf("\"status\": 400") >= 0)) {
+    enviou = false;
+  }
+  momento_proxima_tentativa_envio_cadastro_botao_controle =
+      enviou ? 0 : millis() + intervalo_reenvio_cadastro_botao_controle_ms;
+
+  bool confirmou_esta_operacao = false;
+  if (enviou) {
+    portENTER_CRITICAL(&protecao_botoes_controle);
+    for (uint8_t indice = 0; indice < quantidade_botoes_controle; indice++) {
+      if (!botoes_controle[indice].ocupado || strcmp(botoes_controle[indice].identificador, identificador) != 0) {
+        continue;
+      }
+      if (botoes_controle[indice].operacao_api_pendente == operacao) {
+        botoes_controle[indice].operacao_api_pendente = 0;
+        geracao_botoes_controle++;
+        gravacao_botoes_controle_pendente = true;
+        confirmou_esta_operacao = true;
+      }
+      break;
+    }
+    portEXIT_CRITICAL(&protecao_botoes_controle);
+  }
+
+  if (confirmou_esta_operacao) {
+    salvaBotoesControle();
+    print_log((resetar ? String("Reset do botao ") : String("Cadastro do botao ")) + String(identificador) +
+              " enviado para a API.");
+  } else if (enviou) {
+    print_log("Resposta da API chegou depois de um novo cadastro do botao " + String(identificador) +
+              ". A operacao mais recente continua pendente.");
+  } else {
+    print_log("Falha ao enviar o botao " + String(identificador) + " para " + String(rota) +
+              ". Nova tentativa em seguida.");
+  }
+}
+
+// Envia os logs de pulso que a tarefa dos portões enfileirou. Se a rede falhar, devolve o item para a fila.
+void enviaLogsPulsosBotoesControle() {
+  if (fila_logs_pulsos_botoes_controle == nullptr || !redeProntaParaApi()) {
+    return;
+  }
+
+  LogPulsoBotaoControle log_pulso;
+  while (xQueueReceive(fila_logs_pulsos_botoes_controle, &log_pulso, 0) == pdTRUE) {
+    String url = api_url_aplicativo + rota_log_pulso_botao_controle;
+    String corpo = montaCorpoLogPulsoBotaoControle(log_pulso.tipo_evento, log_pulso.identificador_botao, log_pulso.numero_portao);
+    if (!executarPostHttp(rota_log_pulso_botao_controle, url, corpo, 10000, nullptr)) {
+      print_log("ERRO: log de pulso do botao " + String(log_pulso.identificador_botao) + " nao foi enviado.");
+      xQueueSendToFront(fila_logs_pulsos_botoes_controle, &log_pulso, 0);
+      return;
+    }
+    print_log("Log de " + String(log_pulso.tipo_evento) + " do botao " + String(log_pulso.identificador_botao) +
+              " no portao " + String(log_pulso.numero_portao) + " enviado.");
+  }
+}
+
+// Aceita status livre, vinculado ou desativado e portão 0, 1, 2 ou 3.
+bool dadosAtualizacaoBotaoControleValidos(const String &identificador, const String &numero_portao, const String &status) {
+  uint32_t assinatura = 0;
+  if (!converteIdentificadorBotaoControle(identificador, assinatura)) {
+    return false;
+  }
+  if (numero_portao != "0" && numero_portao != "1" && numero_portao != "2" && numero_portao != "3") {
+    return false;
+  }
+  return status == "livre" || status == "vinculado" || status == "desativado";
+}
+
+// Lê button_id, port_number e status do action_data de update_button_control.
+bool extraiAtualizacaoBotaoControleDoPayload(const String &payload, String &identificador, String &numero_portao,
+                                             String &status) {
+  String action_data = normalizaJsonBotaoControle(extraiValorActionData(payload));
+  identificador = extraiCampoObjetoBotaoControle(action_data, "button_id");
+  numero_portao = extraiCampoObjetoBotaoControle(action_data, "port_number");
+  status = extraiCampoObjetoBotaoControle(action_data, "status");
+  identificador.trim();
+  numero_portao.trim();
+  status.trim();
+  status.toLowerCase();
+  return identificador.length() > 0 && numero_portao.length() > 0 && status.length() > 0;
+}
+
+// Recoloca na lista em uso os botões que estão na Preferences e a memória não tem mais.
+// Não apaga nem troca o portão e o status dos botões que já estão na memória.
+void mesclaBotoesControleAusentesDasPreferences() {
+  if (!preferences.begin("portguard", true)) {
+    print_log("ERRO: nao foi possivel ler a Preferences para procurar os botoes.");
+    return;
+  }
+  String json = preferences.getString(chave_armazenamento_botoes_controle, "[]");
+  preferences.end();
+  uint8_t acrescentados = interpretaJsonBotoesControle(json, false);
+  if (acrescentados > 0) {
+    print_log("Botoes encontrados so na Preferences e recolocados na lista em uso: " + String(acrescentados) + ".");
+  }
+}
+
+// Aplica cada objeto de update_button_control do action_data. Um objeto ou um array inteiro.
+// Não substitui a lista: só muda o botão cujo button_id já existe.
+uint8_t aplicaAtualizacoesBotaoControleNoActionData(const String &action_data, ResultadoAtualizacaoBotaoControle *resultados,
+                                                   uint8_t capacidade) {
+  uint8_t quantidade = 0;
+  int cursor = 0;
+  while (cursor < (int)action_data.length() && quantidade < capacidade && resultados != nullptr) {
+    int inicio = action_data.indexOf('{', cursor);
+    if (inicio < 0) {
+      break;
+    }
+    int fim = action_data.indexOf('}', inicio);
+    if (fim < 0) {
+      break;
+    }
+    String objeto = action_data.substring(inicio, fim + 1);
+    cursor = fim + 1;
+
+    ResultadoAtualizacaoBotaoControle &resultado = resultados[quantidade];
+    memset(&resultado, 0, sizeof(resultado));
+    String identificador = extraiCampoObjetoBotaoControle(objeto, "button_id");
+    String numero_portao = extraiCampoObjetoBotaoControle(objeto, "port_number");
+    String status = extraiCampoObjetoBotaoControle(objeto, "status");
+    identificador.trim();
+    numero_portao.trim();
+    status.trim();
+    status.toLowerCase();
+    strncpy(resultado.identificador, identificador.c_str(), sizeof(resultado.identificador) - 1);
+    strncpy(resultado.numero_portao, numero_portao.c_str(), sizeof(resultado.numero_portao) - 1);
+    strncpy(resultado.status, status.c_str(), sizeof(resultado.status) - 1);
+
+    resultado.dados_validos = dadosAtualizacaoBotaoControleValidos(identificador, numero_portao, status);
+    if (!resultado.dados_validos) {
+      quantidade++;
+      continue;
+    }
+
+    uint32_t assinatura = 0;
+    converteIdentificadorBotaoControle(identificador, assinatura);
+    resultado.localizado = consultaBotaoControle(assinatura).cadastrado;
+    resultado.atualizado_na_memoria = atualizaBotaoControleArmazenado(identificador, numero_portao, status);
+    quantidade++;
+  }
+  return quantidade;
+}
+
+// Aplica update_button_control: acha cada botão, grava a lista inteira na Preferences e só então responde a fila.
+bool processarAtualizacaoBotaoControle(long queue_id, const String &payload) {
+  static long queue_id_gravacao_botao_em_retry = 0;
+  static uint8_t tentativas_gravacao_deste_evento = 0;
+  static ResultadoAtualizacaoBotaoControle resultados[quantidade_maxima_botoes_controle];
+
+  String action_data_recebido = extraiValorActionData(payload);
+  String action_data = normalizaJsonBotaoControle(action_data_recebido);
+  print_log("");
+  print_log("======== update_button_control ========");
+  print_log("action_data recebido: " + (action_data_recebido.length() ? action_data_recebido : String("(vazio)")));
+  if (action_data != action_data_recebido && action_data.length() > 0) {
+    print_log("action_data interpretado: " + action_data);
+  }
+
+  if (queue_id <= 0) {
+    print_log("Sem queue_id. Nenhum botao foi alterado.");
+    print_log("========================================");
+    return false;
+  }
+
+  bool aguardando_gravacao = momento_proxima_gravacao_botoes_controle != 0 &&
+                             (long)(millis() - momento_proxima_gravacao_botoes_controle) < 0;
+  if (queue_id == queue_id_gravacao_botao_em_retry && aguardando_gravacao) {
+    print_log("A gravacao deste update_button_control ainda nao foi conferida na Preferences. Nova tentativa em seguida.");
+    print_log("========================================");
+    return false;
+  }
+  if (queue_id != queue_id_gravacao_botao_em_retry) {
+    tentativas_gravacao_deste_evento = 0;
+  }
+
+  mesclaBotoesControleAusentesDasPreferences();
+  uint8_t quantidade = aplicaAtualizacoesBotaoControleNoActionData(action_data, resultados, quantidade_maxima_botoes_controle);
+  if (quantidade == 0) {
+    print_log("Nenhum botao foi lido no action_data. Nada foi alterado.");
+    print_log("========================================");
+    ultimoQueueIdNotificado = queue_id;
+    atualizarStatusFila(queue_id, "failed");
+    return false;
+  }
+
+  bool algum_invalido = false;
+  bool algum_ausente = false;
+  bool algum_atualizado = false;
+  for (uint8_t indice = 0; indice < quantidade; indice++) {
+    if (resultados[indice].dados_validos && resultados[indice].localizado && resultados[indice].atualizado_na_memoria) {
+      algum_atualizado = true;
+    }
+  }
+
+  bool gravou = true;
+  if (algum_atualizado) {
+    gravou = salvaBotoesControle();
+  }
+
+  for (uint8_t indice = 0; indice < quantidade; indice++) {
+    ResultadoAtualizacaoBotaoControle &resultado = resultados[indice];
+    if (!resultado.dados_validos) {
+      algum_invalido = true;
+      print_log("Objeto invalido no action_data. Identificador lido: " +
+                String(resultado.identificador[0] ? resultado.identificador : "(vazio)") + ", portao " +
+                String(resultado.numero_portao[0] ? resultado.numero_portao : "(vazio)") + ", status " +
+                String(resultado.status[0] ? resultado.status : "(vazio)") + ".");
+      print_log("Localizado nas Preferences: NAO.");
+      print_log("Atualizado nas Preferences: NAO.");
+      print_log("Pode acionar a abertura do portao: NAO.");
+      continue;
+    }
+
+    print_log("Botao " + String(resultado.identificador) + ":");
+    if (!resultado.localizado || !resultado.atualizado_na_memoria) {
+      algum_ausente = true;
+      print_log("Localizado nas Preferences: NAO. Este botao nao esta cadastrado na placa.");
+      print_log("Botoes cadastrados na placa: " + montaJsonBotoesControle());
+      print_log("Atualizado nas Preferences: NAO.");
+      print_log("Pode acionar a abertura do portao: NAO.");
+      continue;
+    }
+
+    print_log("Localizado nas Preferences: SIM.");
+    if (gravou) {
+      print_log("Atualizado nas Preferences: SIM. Portao " + String(resultado.numero_portao) + ", status " +
+                String(resultado.status) + ".");
+    } else {
+      print_log("Atualizado nas Preferences: NAO. A lista em uso mudou, mas a gravacao ainda nao foi conferida.");
+    }
+
+    uint32_t assinatura = 0;
+    converteIdentificadorBotaoControle(resultado.identificador, assinatura);
+    ResultadoConsultaBotaoControle consulta = consultaBotaoControle(assinatura);
+    if (consulta.pode_pulsar) {
+      print_log("Pode acionar a abertura do portao: SIM. Ao ser pressionado, envia o comando do portao " +
+                String(consulta.numero_portao_pulso) +
+                ". Se o portao estiver fechado, a abertura ainda passa pelo intertravamento.");
+    } else {
+      print_log("Pode acionar a abertura do portao: NAO. Status " + String(consulta.status) + ", portao " +
+                String(consulta.numero_portao) + ".");
+    }
+  }
+
+  if (algum_atualizado && !gravou) {
+    queue_id_gravacao_botao_em_retry = queue_id;
+    tentativas_gravacao_deste_evento++;
+    if (tentativas_gravacao_deste_evento < limite_tentativas_gravacao_botao_controle) {
+      print_log("A fila vai repetir este update_button_control ate a Preferences confirmar a gravacao.");
+      print_log("========================================");
+      return false;
+    }
+    print_log("A Preferences nao confirmou a gravacao depois de varias tentativas. Respondendo failed para a fila seguir.");
+    print_log("========================================");
+    ultimoQueueIdNotificado = queue_id;
+    queue_id_gravacao_botao_em_retry = 0;
+    tentativas_gravacao_deste_evento = 0;
+    atualizarStatusFila(queue_id, "failed");
+    return false;
+  }
+
+  bool evento_completo = algum_atualizado && !algum_invalido && !algum_ausente && gravou;
+  print_log("========================================");
+  ultimoQueueIdNotificado = queue_id;
+  queue_id_gravacao_botao_em_retry = 0;
+  tentativas_gravacao_deste_evento = 0;
+  atualizarStatusFila(queue_id, evento_completo ? "completed" : "failed");
+  return evento_completo;
+}
+
 // Trata a ação open_or_close_gate da fila: envia o comando para a tarefa dos portões (mesmo efeito da
 // receptora: abre com autorização se o portão estiver fechado, fecha se estiver aberto, respeitando o
 // intertravamento) e responde a fila com completed ou failed. O queue_id é marcado como processado antes de
@@ -2763,7 +3935,7 @@ bool buscarConfigWifiNaApi() {
 
   bool acao_comando_portoes = actionType == "open_or_close_gate" || actionType == "down_siren" ||
                               actionType == "intertravamento" || actionType.startsWith("fotocelula") ||
-                              acaoEhManutencao(actionType);
+                              acaoEhManutencao(actionType) || actionType == "update_button_control";
   if (acao_comando_portoes) {
     String status_acao = extrairValorJsonString(payload, "action_status");
     if (status_acao.length() > 0 && status_acao != "pending") {
@@ -2822,6 +3994,10 @@ bool buscarConfigWifiNaApi() {
     return processarAlteracaoFlagPortoes(queueId, actionType, payload);
   }
 
+  if (actionType == "update_button_control") {
+    return processarAtualizacaoBotaoControle(queueId, payload);
+  }
+
   // Ação sem tratamento: responde failed, senão a API continua devolvendo esta ação e a fila trava nela.
   if (actionType.length() > 0 && actionType != "config_plaque") {
     print_log("Acao desconhecida ignorada: " + actionType + ". Respondendo failed para a fila seguir.");
@@ -2834,17 +4010,23 @@ bool buscarConfigWifiNaApi() {
 
   if (ssid.length() == 0) {
     Serial.println("Nenhuma configuracao WiFi encontrada na API.");
-    if (queueId > 0) {
+    if (confirmaConfiguracaoPeloCabo(queueId)) {
+      return true;
+    }
+    if (queueId > 0 && queueId != ultimoQueueIdNotificado) {
       ultimoQueueIdNotificado = queueId;
-      atualizarStatusFila(queueId, "failed");
+      atualizarStatusFila(queueId, statusDaConfiguracaoQuandoWifiNaoSobe(false));
     }
     return false;
   }
 
   if (ssid == wifiSsidRejeitado && password == wifiPasswordRejeitado) {
     Serial.println("Credenciais WiFi ja rejeitadas. Nao vou tentar de novo.");
+    if (confirmaConfiguracaoPeloCabo(queueId)) {
+      return true;
+    }
     if (queueId > 0 && queueId != ultimoQueueIdNotificado) {
-      atualizarStatusFila(queueId, "failed");
+      atualizarStatusFila(queueId, statusDaConfiguracaoQuandoWifiNaoSobe(false));
       ultimoQueueIdNotificado = queueId;
     }
     return false;
@@ -2873,11 +4055,13 @@ bool buscarConfigWifiNaApi() {
   wifi_password = password;
   wifiCredenciaisPendentes = true;
   wifiConfigFalhou = false;
-  queueIdPendente = queueId;
   momentoInicioConfigWifi = millis();
   ultimaTentativaWifi = 0;
+  // O cabo confirma a configuração na hora. A tentativa de Wi-Fi continua e, se conectar, segue persistida.
+  confirmaConfiguracaoPeloCabo(queueId);
+  queueIdPendente = queueId;
 
-  if (WiFi.status() == WL_CONNECTED) {
+  if (wifiConectado()) {
     WiFi.disconnect(false, false);
     delay(100);
   }
@@ -2903,13 +4087,18 @@ void falharConfigWifiRecebida() {
   Serial.print("SSID rejeitado: ");
   Serial.println(wifiSsidRejeitado);
 
-  if (queueId > 0) {
-    atualizarStatusFila(queueId, "failed");
+  if (queueId > 0 && !confirmaConfiguracaoPeloCabo(queueId) && queueId != ultimoQueueIdNotificado) {
+    atualizarStatusFila(queueId, statusDaConfiguracaoQuandoWifiNaoSobe(false));
     ultimoQueueIdNotificado = queueId;
   }
   queueIdPendente = 0;
 
-  WiFi.disconnect(true, false);
+  // Com a Ethernet no ar, não desliga o rádio por completo: WiFi.mode(WIFI_OFF) derruba o cabo.
+  if (ethIniciado) {
+    WiFi.disconnect(false, false);
+  } else {
+    WiFi.disconnect(true, false);
+  }
   delay(100);
   wifi_persistido_ja_iniciado = false;
 
@@ -2932,6 +4121,7 @@ void falharConfigWifiRecebida() {
   if (!ethIniciado) {
     iniciarEthernet();
   }
+  preferirCaboSeWifiCaiu();
 }
 
 // Credencial persistida e válida: o modem fica acordado e a pilha reconecta sozinha.
@@ -3022,7 +4212,8 @@ void conectarWifi() {
     WiFi.persistent(false);
     WiFi.setSleep(false);
     WiFi.setAutoReconnect(false);
-    WiFi.disconnect(true, false);
+    // disconnect(false): desliga só a associação. disconnect(true) chama WiFi.mode(WIFI_OFF) e derruba o W5500.
+    WiFi.disconnect(false, false);
     delay(100);
     WiFi.begin(wifi_ssid.c_str(), wifi_password.c_str());
     preferirCaboSeWifiCaiu();
@@ -3092,11 +4283,16 @@ void verificarRede() {
 
   aplicarRotaDeRede();
 
-  if (!wifiConectado() && !caboConectado()) {
+  bool wifi_no_ar = wifiConectado();
+  bool cabo_no_ar = caboConectado();
+  wifi_conectado_para_led = wifi_no_ar;
+  cabo_conectado_para_led = cabo_no_ar;
+
+  if (!wifi_no_ar && !cabo_no_ar) {
     reportarErroRede("nao ha conexao com a internet.");
   }
 
-  bool redeOk = wifiConectado() || caboConectado();
+  bool redeOk = wifi_no_ar || cabo_no_ar;
   // O SNTP só pode ser iniciado depois que alguma interface de rede subiu; ele mesmo repete as tentativas.
   if (redeOk && !sincronizacao_relogio_iniciada) {
     sincronizacao_relogio_iniciada = true;
@@ -3428,6 +4624,202 @@ bool teste_portao_aberto_tempo_excessivo() {
   processaPortao(portao, false, true, inicio_alerta + 5000);
   return !portao.alerta_tempo_aberto_ativo && !portao.portao_aberto &&
          portao.eventos_registrados_teste.indexOf("gate_timeout_close") >= 0;
+}
+
+// Conta quantas vezes um evento apareceu na lista gravada pelo modo de teste.
+int contaEventoRegistradoNoTeste(const String &eventos, const char *tipo_evento) {
+  int quantidade = 0;
+  int posicao = eventos.indexOf(tipo_evento);
+  while (posicao >= 0) {
+    quantidade++;
+    posicao = eventos.indexOf(tipo_evento, posicao + (int)strlen(tipo_evento));
+  }
+  return quantidade;
+}
+
+// Verifica o gate_timeout_open: sai aos 120 s, uma vez por abertura, com título e event_data {"port": N}.
+// Aos 15 s não avisa. Cada portão conta o próprio tempo e a contagem zera quando o portão abre de novo.
+bool teste_aviso_portao_aberto_sem_fechar() {
+  if (tempo_maximo_portao_aberto_ms != 120000) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: gate_timeout_open nao esta em 120 segundos.");
+    return false;
+  }
+  if (strcmp(titulo_aviso_portao_aberto_sem_fechar, "Portão aberto por mais de 2 minutos") != 0 ||
+      strcmp(tipo_evento_portao_aberto_sem_fechar, "gate_timeout_open") != 0) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: titulo ou tipo do evento divergem do pedido.");
+    return false;
+  }
+  EventoPendente evento_tamanho;
+  if (strlen(tipo_evento_portao_aberto_sem_fechar) >= sizeof(evento_tamanho.tipo_evento)) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: gate_timeout_open nao cabe na fila de eventos.");
+    return false;
+  }
+  if (montaEventDataPortaoAbertoSemFechar(1) != "{\"port\": 1}" ||
+      montaEventDataPortaoAbertoSemFechar(2) != "{\"port\": 2}" ||
+      montaEventDataPortaoAbertoSemFechar(3) != "{\"port\": 3}" ||
+      codificaTextoParaUrl(montaEventDataPortaoAbertoSemFechar(1)) != "%7B%22port%22%3A%201%7D") {
+    print_log("teste_aviso_portao_aberto_sem_fechar: event_data nao ficou no formato {\"port\": N}.");
+    return false;
+  }
+
+  EstadoPortao portao;
+  EstadoPortao outro_portao;
+  iniciaEstadoPortao(portao, 1, false, true, 0, true);
+  iniciaEstadoPortao(outro_portao, 2, false, true, 0, true);
+
+  processaPortao(portao, true, true, 100);
+  unsigned long momento_abertura = 200;
+  processaPortao(portao, false, false, momento_abertura);
+  if (!portao.portao_aberto || portao.momento_abertura != momento_abertura) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: a abertura pelo controle nao zerou o cronometro.");
+    return false;
+  }
+
+  unsigned long momento_quinze_segundos = momento_abertura + 15000;
+  processaPortao(portao, false, false, momento_quinze_segundos);
+  if (contaEventoRegistradoNoTeste(portao.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 0 ||
+      portao.alerta_tempo_aberto_ativo ||
+      calculaSaidas(portao, outro_portao, true, true, momento_quinze_segundos).sirene != LOW) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: enviou gate_timeout_open aos 15 segundos.");
+    return false;
+  }
+
+  unsigned long momento_antes = momento_abertura + tempo_maximo_portao_aberto_ms - 1;
+  processaPortao(portao, false, false, momento_antes);
+  if (contaEventoRegistradoNoTeste(portao.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 0 ||
+      portao.alerta_tempo_aberto_ativo ||
+      calculaSaidas(portao, outro_portao, true, true, momento_antes).sirene != LOW) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: avisou antes de 120 segundos.");
+    return false;
+  }
+
+  unsigned long momento_limite = momento_abertura + tempo_maximo_portao_aberto_ms;
+  processaPortao(portao, false, false, momento_limite);
+  if (contaEventoRegistradoNoTeste(portao.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 1 ||
+      !portao.alerta_tempo_aberto_ativo ||
+      calculaSaidas(portao, outro_portao, true, true, momento_limite).sirene != HIGH) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: aos 120 segundos nao enviou gate_timeout_open uma unica vez.");
+    return false;
+  }
+
+  processaPortao(portao, false, false, momento_limite + 5000);
+  if (contaEventoRegistradoNoTeste(portao.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 1) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: repetiu gate_timeout_open na mesma abertura.");
+    return false;
+  }
+
+  processaPortao(portao, false, true, momento_limite + 1000);
+  if (portao.portao_aberto || portao.alerta_tempo_aberto_ativo) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: fechar o portao nao encerrou o alerta.");
+    return false;
+  }
+
+  unsigned long momento_novo_comando = momento_limite + 2000;
+  unsigned long momento_nova_abertura = momento_limite + 2500;
+  processaPortao(portao, true, true, momento_novo_comando);
+  processaPortao(portao, false, false, momento_nova_abertura);
+  processaPortao(portao, false, false, momento_nova_abertura + tempo_maximo_portao_aberto_ms - 1);
+  if (contaEventoRegistradoNoTeste(portao.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 1) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: a nova abertura nao zerou a contagem.");
+    return false;
+  }
+  processaPortao(portao, false, false, momento_nova_abertura + tempo_maximo_portao_aberto_ms);
+  if (contaEventoRegistradoNoTeste(portao.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 2 ||
+      portao.numero_portao != 1) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: a segunda abertura do portao 1 nao avisou de novo.");
+    return false;
+  }
+
+  EstadoPortao portao_fechado_no_limite;
+  iniciaEstadoPortao(portao_fechado_no_limite, 1, false, true, 0, true);
+  processaPortao(portao_fechado_no_limite, true, true, 100);
+  processaPortao(portao_fechado_no_limite, false, false, 200);
+  processaPortao(portao_fechado_no_limite, false, true, 200 + tempo_maximo_portao_aberto_ms);
+  if (contaEventoRegistradoNoTeste(portao_fechado_no_limite.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 0) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: avisou mesmo com o portao fechando aos 120 segundos.");
+    return false;
+  }
+
+  EstadoPortao portao_forcado;
+  iniciaEstadoPortao(portao_forcado, 1, false, true, 0, true);
+  processaPortao(portao_forcado, false, false, 100);
+  processaPortao(portao_forcado, false, false, 100 + 15000);
+  if (contaEventoRegistradoNoTeste(portao_forcado.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 0) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: abertura sem comando avisou aos 15 segundos.");
+    return false;
+  }
+  processaPortao(portao_forcado, false, false, 100 + tempo_maximo_portao_aberto_ms);
+  if (contaEventoRegistradoNoTeste(portao_forcado.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 1 ||
+      portao_forcado.eventos_registrados_teste.indexOf("gate_broken") < 0) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: abertura sem comando nao enviou gate_timeout_open aos 120 segundos.");
+    return false;
+  }
+
+  EstadoPortao portao_aplicativo;
+  EstadoPortao portao_3;
+  iniciaEstadoPortao(portao_aplicativo, 2, false, true, 0, true);
+  iniciaEstadoPortao(portao_3, 3, false, true, 0, true);
+  processaPortao(portao_aplicativo, false, true, 1000, false, true);
+  processaPortao(portao_aplicativo, false, false, 1200);
+  processaPortao(portao_3, true, true, 4000);
+  processaPortao(portao_3, false, false, 5000);
+  unsigned long momento_portao_2 = 1200 + tempo_maximo_portao_aberto_ms;
+  processaPortao(portao_aplicativo, false, false, momento_portao_2);
+  processaPortao(portao_3, false, false, momento_portao_2);
+  if (contaEventoRegistradoNoTeste(portao_aplicativo.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 1 ||
+      portao_aplicativo.numero_portao != 2 ||
+      contaEventoRegistradoNoTeste(portao_3.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 0) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: o cronometro do aplicativo afetou o outro portao.");
+    return false;
+  }
+  unsigned long momento_portao_3 = 5000 + tempo_maximo_portao_aberto_ms;
+  processaPortao(portao_aplicativo, false, false, momento_portao_3);
+  processaPortao(portao_3, false, false, momento_portao_3);
+  if (contaEventoRegistradoNoTeste(portao_aplicativo.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 1 ||
+      contaEventoRegistradoNoTeste(portao_3.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 1 ||
+      portao_3.numero_portao != 3) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: o portao 3 nao avisou no proprio cronometro.");
+    return false;
+  }
+
+  EstadoPortao portao_manutencao;
+  iniciaEstadoPortao(portao_manutencao, 1, false, true, 0, true);
+  processaPortao(portao_manutencao, true, true, 100, false, false, true);
+  processaPortao(portao_manutencao, false, false, 200, false, false, true);
+  processaPortao(portao_manutencao, false, false, 200 + 60000, false, false, true);
+  if (contaEventoRegistradoNoTeste(portao_manutencao.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 0) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: avisou durante a manutencao.");
+    return false;
+  }
+  unsigned long momento_saida_manutencao = 200 + 60000;
+  processaPortao(portao_manutencao, false, false, momento_saida_manutencao + tempo_maximo_portao_aberto_ms - 1);
+  if (contaEventoRegistradoNoTeste(portao_manutencao.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 0) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: o cronometro nao recomecou ao sair da manutencao.");
+    return false;
+  }
+  processaPortao(portao_manutencao, false, false, momento_saida_manutencao + tempo_maximo_portao_aberto_ms);
+  if (contaEventoRegistradoNoTeste(portao_manutencao.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 1) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: nao avisou 120 segundos depois de sair da manutencao.");
+    return false;
+  }
+
+  EstadoPortao portao_estouro;
+  unsigned long momento_abertura_estouro = 0xFFFFFFFFUL - 1000;
+  iniciaEstadoPortao(portao_estouro, 1, false, true, momento_abertura_estouro - 200, true);
+  processaPortao(portao_estouro, true, true, momento_abertura_estouro - 100);
+  processaPortao(portao_estouro, false, false, momento_abertura_estouro);
+  processaPortao(portao_estouro, false, false, momento_abertura_estouro + tempo_maximo_portao_aberto_ms - 1);
+  if (contaEventoRegistradoNoTeste(portao_estouro.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 0) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: avisou antes da hora no estouro do millis().");
+    return false;
+  }
+  processaPortao(portao_estouro, false, false, momento_abertura_estouro + tempo_maximo_portao_aberto_ms);
+  if (contaEventoRegistradoNoTeste(portao_estouro.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 1) {
+    print_log("teste_aviso_portao_aberto_sem_fechar: nao avisou no estouro do millis().");
+    return false;
+  }
+
+  return true;
 }
 
 // Verifica a validade da janela de autorização: abertura após a janela gera alarme e
@@ -4547,6 +5939,12 @@ bool teste_estabilidade_wifi_esp32_s3() {
   wifiCredenciaisPendentes = pendente_original;
   wifiConfigFalhou = falhou_original;
 
+  // Sem Wi-Fi persistido e com a Ethernet já iniciada, ligar e desligar o rádio derruba o W5500.
+  // A política de reconexão já foi conferida; o cabo permanece com a rota do aplicativo.
+  if (sucesso && ethIniciado && !wifiEstaConfigurado() && !wifiCredenciaisPendentes) {
+    return true;
+  }
+
   if (sucesso) {
     wifi_mode_t modo_original = WiFi.getMode();
     bool ligou_radio_so_para_teste = modo_original == WIFI_OFF || modo_original == WIFI_MODE_NULL;
@@ -4949,6 +6347,448 @@ bool teste_leds_indicadores_rede() {
   return true;
 }
 
+// Sem Wi-Fi persistido, o cabo com IP confirma a configuração e as requisições não passam pelo rádio.
+bool teste_cabo_assume_comunicacao_sem_wifi() {
+  if (strcmp(statusDaConfiguracaoQuandoWifiNaoSobe(true), "completed") != 0) {
+    print_log("teste_cabo_assume_comunicacao_sem_wifi: cabo disponivel nao confirmou a configuracao.");
+    return false;
+  }
+  if (strcmp(statusDaConfiguracaoQuandoWifiNaoSobe(false), "failed") != 0) {
+    print_log("teste_cabo_assume_comunicacao_sem_wifi: sem cabo a configuracao nao falhou.");
+    return false;
+  }
+  if (!caboDeveAssumirConfiguracaoDoAplicativo(true, false, false)) {
+    print_log("teste_cabo_assume_comunicacao_sem_wifi: cabo sem Wi-Fi persistido nao assumiu a configuracao.");
+    return false;
+  }
+  if (caboDeveAssumirConfiguracaoDoAplicativo(false, false, false) ||
+      caboDeveAssumirConfiguracaoDoAplicativo(true, true, false) ||
+      caboDeveAssumirConfiguracaoDoAplicativo(true, false, true)) {
+    print_log("teste_cabo_assume_comunicacao_sem_wifi: cabo assumiu a configuracao com Wi-Fi no ar, ja persistido ou sem IP.");
+    return false;
+  }
+
+  bool setup_original = setup_finished;
+  String ssid_original = wifi_ssid;
+  String senha_original = wifi_password;
+  bool pendente_original = wifiCredenciaisPendentes;
+  bool sucesso = true;
+
+  setup_finished = false;
+  wifi_ssid = "";
+  wifi_password = "";
+  wifiCredenciaisPendentes = false;
+  if (deveTentarWifiAntesDoCabo() != wifiConectado()) {
+    print_log("teste_cabo_assume_comunicacao_sem_wifi: sem credencial a requisicao nao ficou no cabo.");
+    sucesso = false;
+  }
+
+  setup_finished = true;
+  wifi_ssid = "rede_persistida";
+  wifi_password = "senha_persistida";
+  wifiCredenciaisPendentes = false;
+  if (sucesso && !deveTentarWifiAntesDoCabo()) {
+    print_log("teste_cabo_assume_comunicacao_sem_wifi: Wi-Fi persistido deixou de ser tentado antes do cabo.");
+    sucesso = false;
+  }
+
+  setup_finished = false;
+  wifi_ssid = "";
+  wifi_password = "";
+  wifiCredenciaisPendentes = true;
+  if (sucesso && !deveTentarWifiAntesDoCabo()) {
+    print_log("teste_cabo_assume_comunicacao_sem_wifi: config_plaque pendente deixou de tentar o Wi-Fi.");
+    sucesso = false;
+  }
+
+  setup_finished = setup_original;
+  wifi_ssid = ssid_original;
+  wifi_password = senha_original;
+  wifiCredenciaisPendentes = pendente_original;
+
+  if (sucesso && !setup_original && ssid_original.length() == 0 && !pendente_original) {
+    wifi_mode_t modo_wifi = WiFi.getMode();
+    bool conectado_antes = wifiConectado();
+    wifi_mode_t modo_depois = WiFi.getMode();
+    if (conectado_antes) {
+      print_log("teste_cabo_assume_comunicacao_sem_wifi: Wi-Fi conectou sem credencial persistida.");
+      sucesso = false;
+    }
+    if (sucesso && modo_wifi != modo_depois) {
+      print_log("teste_cabo_assume_comunicacao_sem_wifi: consultar o Wi-Fi ligou o radio e pode derrubar o cabo.");
+      sucesso = false;
+    }
+    if (sucesso && modo_wifi != WIFI_OFF && modo_wifi != WIFI_MODE_NULL) {
+      print_log("teste_cabo_assume_comunicacao_sem_wifi: radio Wi-Fi ligado sem credencial.");
+      sucesso = false;
+    }
+  }
+
+  return sucesso;
+}
+
+// A abertura pelo aplicativo não consulta Wi-Fi nem Ethernet na tarefa dos portões: o LED usa a cópia feita no loop.
+bool teste_abertura_pelo_aplicativo_nao_consulta_a_rede() {
+  if (tempo_espera_resultado_comando_remoto_ms < 1000) {
+    print_log("teste_abertura_pelo_aplicativo_nao_consulta_a_rede: espera do comando de abertura menor que 1 s.");
+    return false;
+  }
+
+  bool wifi_original = wifi_conectado_para_led;
+  bool cabo_original = cabo_conectado_para_led;
+  wifi_conectado_para_led = true;
+  cabo_conectado_para_led = false;
+  bool wifi_aceso = nivelLedConexao(wifi_conectado_para_led) == HIGH;
+  bool cabo_apagado = nivelLedConexao(cabo_conectado_para_led) == LOW;
+  wifi_conectado_para_led = false;
+  cabo_conectado_para_led = true;
+  bool wifi_apagado = nivelLedConexao(wifi_conectado_para_led) == LOW;
+  bool cabo_aceso = nivelLedConexao(cabo_conectado_para_led) == HIGH;
+  wifi_conectado_para_led = wifi_original;
+  cabo_conectado_para_led = cabo_original;
+
+  if (!wifi_aceso || !cabo_apagado || !wifi_apagado || !cabo_aceso) {
+    print_log("teste_abertura_pelo_aplicativo_nao_consulta_a_rede: LED nao segue a copia da rede lida no loop.");
+    return false;
+  }
+  return true;
+}
+
+// Confere cadastro da assinatura, atualização pela fila, pulso só quando vinculado e o corpo dos envios à API.
+bool teste_gerenciamento_botoes_controle() {
+  BotaoControleCadastrado copia_botoes[quantidade_maxima_botoes_controle];
+  uint8_t quantidade_original = quantidade_botoes_controle;
+  bool gravacao_original = gravacao_botoes_controle_pendente;
+  uint32_t geracao_original = geracao_botoes_controle;
+  memcpy(copia_botoes, botoes_controle, sizeof(copia_botoes));
+
+  bool gravado_original = codigo_rf433_esta_gravado;
+  uint32_t codigo_original = codigo_rf433_gravado;
+  uint8_t bits_originais = quantidade_bits_codigo_rf433_gravado;
+  bool gravacao_rf_original = gravacao_codigo_rf433_pendente;
+  bool aguardando_original = aguardando_repeticao_quadro_rf433;
+  bool comando_rf_original = comando_rf433_portao_1_pendente;
+  unsigned long momento_original = momento_ultimo_comando_rf433_reconhecido;
+  bool cadastro_original = cadastro_controle_rf433_ativo;
+  uint32_t codigo_candidato_original = codigo_rf433_candidato;
+  uint8_t bits_candidato_original = quantidade_bits_codigo_rf433_candidato;
+  bool assinatura_candidata_disponivel_original = assinatura_rf433_candidata_disponivel;
+  uint32_t assinatura_candidata_original = assinatura_rf433_candidata;
+  uint8_t comando_botao_original = comando_botao_controle_portao_pendente;
+
+  portENTER_CRITICAL(&protecao_botoes_controle);
+  memset(botoes_controle, 0, sizeof(botoes_controle));
+  quantidade_botoes_controle = 0;
+  gravacao_botoes_controle_pendente = false;
+  portEXIT_CRITICAL(&protecao_botoes_controle);
+  comando_botao_controle_portao_pendente = 0;
+  comando_rf433_portao_1_pendente = false;
+  aguardando_repeticao_quadro_rf433 = false;
+  cadastro_controle_rf433_ativo = false;
+  assinatura_rf433_injetada_pendente = false;
+  quadro_rf433_injetado_pendente = false;
+
+  bool sucesso = true;
+  if (strcmp(chave_armazenamento_botoes_controle, "buttons") != 0 ||
+      !api_url_aplicativo.endsWith("/api/app/v1") ||
+      strcmp(rota_cadastro_botao_controle, "/plaque-buttons/save") != 0 ||
+      strcmp(rota_atualizacao_botao_controle, "/plaque-buttons/update") != 0 ||
+      strcmp(rota_log_pulso_botao_controle, "/plaques/logs") != 0) {
+    print_log("teste_gerenciamento_botoes_controle: indice ou rota da API diferente do combinado.");
+    sucesso = false;
+  }
+
+  String identificador_a = textoIdentificadorBotaoControle(assinatura_botao_1_controle_rf433);
+  String identificador_b = textoIdentificadorBotaoControle(0x0259279DUL);
+  if (sucesso && (!adicionaBotaoControleLivre(assinatura_botao_1_controle_rf433) || quantidade_botoes_controle != 1 ||
+                  !gravacao_botoes_controle_pendente)) {
+    print_log("teste_gerenciamento_botoes_controle: assinatura nova nao entrou em buttons.");
+    sucesso = false;
+  }
+  ResultadoConsultaBotaoControle consulta = consultaBotaoControle(assinatura_botao_1_controle_rf433);
+  if (sucesso && (!consulta.cadastrado || consulta.pode_pulsar || strcmp(consulta.status, "livre") != 0 ||
+                  strcmp(consulta.numero_portao, "0") != 0 || strcmp(consulta.identificador, identificador_a.c_str()) != 0 ||
+                  consulta.operacao_api_pendente != operacao_api_botao_cadastrar)) {
+    print_log("teste_gerenciamento_botoes_controle: botao novo nao ficou livre no portao 0 com cadastro pendente.");
+    sucesso = false;
+  }
+  if (sucesso && (!adicionaBotaoControleLivre(assinatura_botao_1_controle_rf433) || quantidade_botoes_controle != 1)) {
+    print_log("teste_gerenciamento_botoes_controle: o re-cadastro duplicou o botao ou nao resetou.");
+    sucesso = false;
+  }
+  consulta = consultaBotaoControle(assinatura_botao_1_controle_rf433);
+  if (sucesso && (strcmp(consulta.status, "livre") != 0 || strcmp(consulta.numero_portao, "0") != 0 ||
+                  consulta.operacao_api_pendente != operacao_api_botao_resetar)) {
+    print_log("teste_gerenciamento_botoes_controle: re-cadastro nao voltou para livre no portao 0 com reset pendente.");
+    sucesso = false;
+  }
+  if (sucesso && (!adicionaBotaoControleLivre(0x0259279DUL) || quantidade_botoes_controle != 2)) {
+    print_log("teste_gerenciamento_botoes_controle: segundo botao nao foi acrescentado.");
+    sucesso = false;
+  }
+
+  String json = montaJsonBotoesControle();
+  if (sucesso && (!json.startsWith("[") || !json.endsWith("]") ||
+                  json.indexOf("\"button_id\": \"" + identificador_a + "\"") < 0 ||
+                  json.indexOf("\"button_id\": \"" + identificador_b + "\"") < 0 ||
+                  json.indexOf("\"port_number\": \"0\"") < 0 || json.indexOf("\"status\": \"livre\"") < 0 ||
+                  json.indexOf("\"api_pendente\": \"resetar\"") < 0 ||
+                  json.indexOf("\"api_pendente\": \"cadastrar\"") < 0)) {
+    print_log("teste_gerenciamento_botoes_controle: JSON de buttons nao guarda button_id, port_number, status e api_pendente.");
+    sucesso = false;
+  }
+  if (sucesso && (interpretaJsonBotoesControle(json) != 2 || consultaBotaoControle(assinatura_botao_1_controle_rf433).pode_pulsar)) {
+    print_log("teste_gerenciamento_botoes_controle: a leitura do JSON de buttons nao recuperou os dois botoes.");
+    sucesso = false;
+  }
+  if (sucesso && (consultaBotaoControle(assinatura_botao_1_controle_rf433).operacao_api_pendente != operacao_api_botao_resetar ||
+                  consultaBotaoControle(0x0259279DUL).operacao_api_pendente != operacao_api_botao_cadastrar)) {
+    print_log("teste_gerenciamento_botoes_controle: a leitura do JSON nao recuperou cadastro ou reset pendente.");
+    sucesso = false;
+  }
+
+  if (sucesso && !atualizaBotaoControleArmazenado(identificador_a, "2", "vinculado")) {
+    print_log("teste_gerenciamento_botoes_controle: update do botao cadastrado falhou.");
+    sucesso = false;
+  }
+  consulta = consultaBotaoControle(assinatura_botao_1_controle_rf433);
+  if (sucesso && (!consulta.pode_pulsar || consulta.numero_portao_pulso != 2 || strcmp(consulta.status, "vinculado") != 0)) {
+    print_log("teste_gerenciamento_botoes_controle: botao vinculado ao portao 2 nao liberou o pulso.");
+    sucesso = false;
+  }
+  if (sucesso && (atualizaBotaoControleArmazenado("999999", "1", "vinculado") ||
+                  atualizaBotaoControleArmazenado(identificador_b, "4", "vinculado") ||
+                  atualizaBotaoControleArmazenado(identificador_b, "1", "ativo"))) {
+    print_log("teste_gerenciamento_botoes_controle: aceitou botao inexistente, portao ou status invalido.");
+    sucesso = false;
+  }
+  if (sucesso && !dadosAtualizacaoBotaoControleValidos(identificador_a, "0", "desativado")) {
+    print_log("teste_gerenciamento_botoes_controle: portao 0 com status desativado foi recusado.");
+    sucesso = false;
+  }
+  char identificador_hexadecimal[tamanho_identificador_botao_controle];
+  snprintf(identificador_hexadecimal, sizeof(identificador_hexadecimal), "0x%lX",
+           (unsigned long)assinatura_botao_1_controle_rf433);
+  if (sucesso && !atualizaBotaoControleArmazenado(identificador_hexadecimal, "0", "livre")) {
+    print_log("teste_gerenciamento_botoes_controle: button_id hexadecimal nao encontrou a assinatura.");
+    sucesso = false;
+  }
+  consulta = consultaBotaoControle(assinatura_botao_1_controle_rf433);
+  if (sucesso && (consulta.pode_pulsar || strcmp(consulta.numero_portao, "0") != 0 || strcmp(consulta.status, "livre") != 0)) {
+    print_log("teste_gerenciamento_botoes_controle: botao livre no portao 0 ainda pode pulsar.");
+    sucesso = false;
+  }
+
+  String payload_escapado =
+      "{\"list\":[{\"id\":15,\"action_type\":\"update_button_control\",\"action_data\":\"{\\\"button_id\\\":" +
+      identificador_a + ",\\\"port_number\\\":3,\\\"status\\\":\\\"vinculado\\\"}\",\"action_status\":\"pending\"}]}";
+  String identificador_lido;
+  String numero_portao_lido;
+  String status_lido;
+  if (sucesso && (!extraiAtualizacaoBotaoControleDoPayload(payload_escapado, identificador_lido, numero_portao_lido, status_lido) ||
+                  identificador_lido != identificador_a || numero_portao_lido != "3" || status_lido != "vinculado")) {
+    print_log("teste_gerenciamento_botoes_controle: action_data escapado de update_button_control nao foi lido.");
+    sucesso = false;
+  }
+  String payload_objeto = "{\"list\":[{\"id\":9,\"action_type\":\"update_button_control\",\"action_data\":{\"button_id\": \"" +
+                          identificador_b + "\", \"port_number\": \"1\", \"status\": \"desativado\"}}]}";
+  if (sucesso && (!extraiAtualizacaoBotaoControleDoPayload(payload_objeto, identificador_lido, numero_portao_lido, status_lido) ||
+                  identificador_lido != identificador_b || numero_portao_lido != "1" || status_lido != "desativado")) {
+    print_log("teste_gerenciamento_botoes_controle: action_data em objeto nao foi lido.");
+    sucesso = false;
+  }
+
+  String corpo_cadastro = montaCorpoCadastroBotaoControle(identificador_a);
+  String corpo_reset = montaCorpoResetBotaoControle(identificador_a);
+  String corpo_log = montaCorpoLogPulsoBotaoControle("gate_open", identificador_a.c_str(), "2");
+  if (sucesso && (corpo_cadastro.indexOf("\"serial_id\":\"" + plaque_serial + "\"") < 0 ||
+                  corpo_cadastro.indexOf("\"button_id\":" + identificador_a) < 0 ||
+                  corpo_cadastro.indexOf("\"internal_token\":\"") < 0 ||
+                  corpo_reset.indexOf("\"button_id\":" + identificador_a) < 0 ||
+                  corpo_reset.indexOf("\"control_id\":0") < 0 || corpo_reset.indexOf("\"port_number\":0") < 0 ||
+                  corpo_log.indexOf("event_type=gate_open") < 0 ||
+                  corpo_log.indexOf("button_id=" + identificador_a) < 0 || corpo_log.indexOf("port_number=2") < 0 ||
+                  montaCorpoLogPulsoBotaoControle("gate_close", identificador_b.c_str(), "1").indexOf("event_type=gate_close") < 0)) {
+    print_log("teste_gerenciamento_botoes_controle: corpo do cadastro, do reset ou do log nao leva os campos da API.");
+    sucesso = false;
+  }
+
+  auto injeta_assinatura = [](uint32_t assinatura, unsigned long momento) {
+    quadro_rf433_injetado_pendente = true;
+    quadro_rf433_injetado_valido = false;
+    codigo_rf433_injetado = 0;
+    quantidade_bits_codigo_rf433_injetado = 0;
+    assinatura_rf433_injetada_pendente = true;
+    assinatura_rf433_injetada = assinatura;
+    processaReceptorFrequencia433(momento);
+  };
+
+  if (sucesso) {
+    portENTER_CRITICAL(&protecao_botoes_controle);
+    memset(botoes_controle, 0, sizeof(botoes_controle));
+    quantidade_botoes_controle = 0;
+    portEXIT_CRITICAL(&protecao_botoes_controle);
+    abreCadastroControleRf433(50000);
+    injeta_assinatura(assinatura_botao_2_controle_rf433, 50100);
+    injeta_assinatura(assinatura_botao_2_controle_rf433, 50200);
+    consulta = consultaBotaoControle(assinatura_botao_2_controle_rf433);
+    if (!consulta.cadastrado || consulta.pode_pulsar || comando_botao_controle_portao_pendente != 0 ||
+        comando_rf433_portao_1_pendente || cadastro_controle_rf433_ativo) {
+      print_log("teste_gerenciamento_botoes_controle: repetir a assinatura no cadastro nao gravou livre ou ja pulsou.");
+      sucesso = false;
+    }
+  }
+  if (sucesso) {
+    String identificador_pulso = textoIdentificadorBotaoControle(assinatura_botao_2_controle_rf433);
+    if (!atualizaBotaoControleArmazenado(identificador_pulso, "3", "vinculado")) {
+      print_log("teste_gerenciamento_botoes_controle: nao vinculou o botao ao portao 3.");
+      sucesso = false;
+    } else {
+      momento_ultimo_comando_rf433_reconhecido = 0;
+      injeta_assinatura(assinatura_botao_2_controle_rf433, 52000);
+      injeta_assinatura(assinatura_botao_2_controle_rf433, 52100);
+      char identificador_consumido[tamanho_identificador_botao_controle] = "";
+      char numero_portao_consumido[tamanho_numero_portao_botao_controle] = "";
+      uint8_t portao_consumido = consomeComandoBotaoControle(identificador_consumido, numero_portao_consumido);
+      if (portao_consumido != 3 || String(identificador_consumido) != identificador_pulso ||
+          String(numero_portao_consumido) != "3" || comando_rf433_portao_1_pendente ||
+          consomeComandoBotaoControle(identificador_consumido, numero_portao_consumido) != 0) {
+        print_log("teste_gerenciamento_botoes_controle: pulso vinculado nao foi para o portao 3 uma unica vez.");
+        sucesso = false;
+      }
+    }
+  }
+  if (sucesso) {
+    if (!atualizaBotaoControleArmazenado(textoIdentificadorBotaoControle(assinatura_botao_2_controle_rf433), "1", "desativado")) {
+      print_log("teste_gerenciamento_botoes_controle: nao desativou o botao.");
+      sucesso = false;
+    } else {
+      momento_ultimo_comando_rf433_reconhecido = 0;
+      injeta_assinatura(assinatura_botao_2_controle_rf433, 54000);
+      injeta_assinatura(assinatura_botao_2_controle_rf433, 54100);
+      if (comando_botao_controle_portao_pendente != 0 || comando_rf433_portao_1_pendente) {
+        print_log("teste_gerenciamento_botoes_controle: botao desativado acionou portao.");
+        sucesso = false;
+      }
+    }
+  }
+
+  if (sucesso) {
+    uint8_t quantidade_portoes_original_teste = quantidade_portoes_placa;
+    bool intertravamento_original_teste = intertravamento_ativo;
+    quantidade_portoes_placa = 3;
+    intertravamento_ativo = true;
+
+    const uint32_t assinaturas_sequencia[] = {assinatura_botao_3_controle_rf433, assinatura_botao_2_controle_rf433,
+                                              assinatura_botao_1_controle_rf433};
+    const char *identificadores_sequencia[] = {"1767424619", "3854021271", "4264037171"};
+    const char *action_data_separados[] = {
+        "{\"button_id\":1767424619,\"port_number\":1,\"status\":\"vinculado\"}",
+        "{\"button_id\":3854021271,\"port_number\":2,\"status\":\"vinculado\"}",
+        "{\"button_id\":4264037171,\"port_number\":3,\"status\":\"vinculado\"}"};
+
+    portENTER_CRITICAL(&protecao_botoes_controle);
+    memset(botoes_controle, 0, sizeof(botoes_controle));
+    quantidade_botoes_controle = 0;
+    gravacao_botoes_controle_pendente = false;
+    portEXIT_CRITICAL(&protecao_botoes_controle);
+
+    for (uint8_t indice = 0; indice < 3 && sucesso; indice++) {
+      String texto_identificador = textoIdentificadorBotaoControle(assinaturas_sequencia[indice]);
+      if (strcmp(texto_identificador.c_str(), identificadores_sequencia[indice]) != 0 ||
+          !adicionaBotaoControleLivre(assinaturas_sequencia[indice])) {
+        print_log("teste_gerenciamento_botoes_controle: o button_id " + String(identificadores_sequencia[indice]) +
+                  " nao entrou na lista.");
+        sucesso = false;
+      }
+    }
+
+    for (uint8_t indice = 0; indice < 3 && sucesso; indice++) {
+      ResultadoAtualizacaoBotaoControle resultado_separado;
+      memset(&resultado_separado, 0, sizeof(resultado_separado));
+      uint8_t quantidade_lida =
+          aplicaAtualizacoesBotaoControleNoActionData(action_data_separados[indice], &resultado_separado, 1);
+      String json_da_lista = montaJsonBotoesControle();
+      if (quantidade_lida != 1 || !resultado_separado.localizado || !resultado_separado.atualizado_na_memoria ||
+          interpretaJsonBotoesControle(json_da_lista) != 3) {
+        print_log("teste_gerenciamento_botoes_controle: o evento do botao " + String(identificadores_sequencia[indice]) +
+                  " nao permaneceu junto dos anteriores.");
+        sucesso = false;
+      }
+    }
+
+    if (sucesso) {
+      for (uint8_t indice = 0; indice < 3; indice++) {
+        ResultadoConsultaBotaoControle consulta_sequencia = consultaBotaoControle(assinaturas_sequencia[indice]);
+        if (!consulta_sequencia.pode_pulsar || consulta_sequencia.numero_portao_pulso != (uint8_t)(indice + 1) ||
+            strcmp(consulta_sequencia.status, "vinculado") != 0) {
+          print_log("teste_gerenciamento_botoes_controle: o botao " + String(identificadores_sequencia[indice]) +
+                    " nao ficou pronto para abrir o portao " + String(indice + 1) + ".");
+          sucesso = false;
+          break;
+        }
+      }
+    }
+
+    if (sucesso) {
+      ResultadoAtualizacaoBotaoControle resultados_juntos[3];
+      memset(resultados_juntos, 0, sizeof(resultados_juntos));
+      String action_data_junto =
+          "[{\"button_id\":1767424619,\"port_number\":1,\"status\":\"vinculado\"},"
+          "{\"button_id\":3854021271,\"port_number\":2,\"status\":\"vinculado\"},"
+          "{\"button_id\":4264037171,\"port_number\":3,\"status\":\"vinculado\"}]";
+      if (aplicaAtualizacoesBotaoControleNoActionData(action_data_junto, resultados_juntos, 3) != 3 ||
+          !resultados_juntos[0].atualizado_na_memoria || !resultados_juntos[1].atualizado_na_memoria ||
+          !resultados_juntos[2].atualizado_na_memoria) {
+        print_log("teste_gerenciamento_botoes_controle: um action_data com tres botoes nao atualizou os tres.");
+        sucesso = false;
+      }
+    }
+
+    if (sucesso) {
+      EstadoPortao portao_comando_teste;
+      iniciaEstadoPortao(portao_comando_teste, 1, false, true, 0, true);
+      bool bloqueou = !processaPortao(portao_comando_teste, true, true, 3000, true, false, false) &&
+                      !portao_comando_teste.motor_acionado && !portao_comando_teste.abertura_autorizada;
+      iniciaEstadoPortao(portao_comando_teste, 1, false, true, 0, true);
+      bool liberou = processaPortao(portao_comando_teste, true, true, 4000, false, false, false) &&
+                     portao_comando_teste.motor_acionado && portao_comando_teste.abertura_autorizada;
+      if (!bloqueou || !liberou) {
+        print_log("teste_gerenciamento_botoes_controle: o pulso do botao nao respeitou o intertravamento.");
+        sucesso = false;
+      }
+    }
+
+    quantidade_portoes_placa = quantidade_portoes_original_teste;
+    intertravamento_ativo = intertravamento_original_teste;
+  }
+
+  portENTER_CRITICAL(&protecao_botoes_controle);
+  memcpy(botoes_controle, copia_botoes, sizeof(botoes_controle));
+  quantidade_botoes_controle = quantidade_original;
+  gravacao_botoes_controle_pendente = gravacao_original;
+  geracao_botoes_controle = geracao_original;
+  portEXIT_CRITICAL(&protecao_botoes_controle);
+  codigo_rf433_esta_gravado = gravado_original;
+  codigo_rf433_gravado = codigo_original;
+  quantidade_bits_codigo_rf433_gravado = bits_originais;
+  gravacao_codigo_rf433_pendente = gravacao_rf_original;
+  aguardando_repeticao_quadro_rf433 = aguardando_original;
+  comando_rf433_portao_1_pendente = comando_rf_original;
+  momento_ultimo_comando_rf433_reconhecido = momento_original;
+  cadastro_controle_rf433_ativo = cadastro_original;
+  codigo_rf433_candidato = codigo_candidato_original;
+  quantidade_bits_codigo_rf433_candidato = bits_candidato_original;
+  assinatura_rf433_candidata_disponivel = assinatura_candidata_disponivel_original;
+  assinatura_rf433_candidata = assinatura_candidata_original;
+  comando_botao_controle_portao_pendente = comando_botao_original;
+  assinatura_rf433_injetada_pendente = false;
+  quadro_rf433_injetado_pendente = false;
+  identificador_comando_botao_controle_pendente[0] = '\0';
+  numero_portao_comando_botao_controle_pendente[0] = '\0';
+  return sucesso;
+}
+
 bool teste_completo() {
   print_log("");
   print_log("======== TESTE COMPLETO ========");
@@ -4975,6 +6815,10 @@ bool teste_completo() {
   }
   if (!teste_portao_aberto_tempo_excessivo()) {
     print_log("FALHA: teste_portao_aberto_tempo_excessivo - alerta de tempo aberto incorreto.");
+    return false;
+  }
+  if (!teste_aviso_portao_aberto_sem_fechar()) {
+    print_log("FALHA: teste_aviso_portao_aberto_sem_fechar - aviso de portao aberto por comando sem fechar incorreto.");
     return false;
   }
   if (!teste_validade_comando_autorizado()) {
@@ -5009,6 +6853,10 @@ bool teste_completo() {
     print_log("FALHA: teste_comando_remoto_portao - leitura do action_data ou acionamento via open_or_close_gate incorreto.");
     return false;
   }
+  if (!teste_abertura_pelo_aplicativo_nao_consulta_a_rede()) {
+    print_log("FALHA: teste_abertura_pelo_aplicativo_nao_consulta_a_rede - o comando de abertura ainda depende da consulta de rede na tarefa.");
+    return false;
+  }
   if (!teste_comando_flags_placa()) {
     print_log("FALHA: teste_comando_flags_placa - acoes intertravamento/fotocelula ou persistencia das flags incorretas.");
     return false;
@@ -5037,12 +6885,20 @@ bool teste_completo() {
     print_log("FALHA: teste_estabilidade_wifi_esp32_s3 - sleep do modem ou reconexao automatica incorretos.");
     return false;
   }
+  if (!teste_cabo_assume_comunicacao_sem_wifi()) {
+    print_log("FALHA: teste_cabo_assume_comunicacao_sem_wifi - sem Wi-Fi o cabo nao assumiu a comunicacao com o aplicativo.");
+    return false;
+  }
   if (!teste_receptor_frequencia_433()) {
     print_log("FALHA: teste_receptor_frequencia_433 - aprendizado ou reconhecimento do controle 433 incorreto.");
     return false;
   }
   if (!teste_assinatura_quadro_controle_rf433()) {
     print_log("FALHA: teste_assinatura_quadro_controle_rf433 - leitura da assinatura do controle no monitor serial incorreta.");
+    return false;
+  }
+  if (!teste_gerenciamento_botoes_controle()) {
+    print_log("FALHA: teste_gerenciamento_botoes_controle - cadastro, vinculo ou pulso dos botoes de controle incorreto.");
     return false;
   }
   if (!teste_comunicacao_pca9534()) {
@@ -5105,6 +6961,7 @@ void setup() {
   fila_eventos_pendentes = xQueueCreate(tamanho_fila_eventos, sizeof(EventoPendente));
   fila_comandos_remotos_portao = xQueueCreate(1, sizeof(uint8_t));
   fila_resultados_comandos_remotos = xQueueCreate(1, sizeof(bool));
+  fila_logs_pulsos_botoes_controle = xQueueCreate(tamanho_fila_logs_pulsos_botoes_controle, sizeof(LogPulsoBotaoControle));
 
   print_log("");
   print_log("======================================");
@@ -5185,5 +7042,10 @@ void loop() {
   if (gravacao_codigo_rf433_pendente) {
     salvaCodigoRf433();
   }
+  if (gravacao_botoes_controle_pendente) {
+    salvaBotoesControle();
+  }
+  enviaCadastrosBotoesControlePendentes();
+  enviaLogsPulsosBotoesControle();
   delay(10);
 }

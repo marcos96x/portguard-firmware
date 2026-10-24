@@ -17,14 +17,14 @@ Implementada em `script.cpp`.
 - A API (`limit=1`) devolve sempre a ação **pendente mais antiga**. Uma ação que a placa lê e não responde fica na frente de todas as outras para sempre (foi o que travou `open_or_close_gate`, `intertravamento` e fotocélulas atrás de um `down_siren` não tratado).
 - Por isso toda ação lida é respondida em `/plaque-queues-actions/save`:
   - ação desconhecida: `failed` (log "Acao desconhecida ignorada");
-  - `config_plaque` sem SSID: `failed`;
+  - `config_plaque` sem SSID: `failed` se o cabo não tem IP; `completed` se o cabo tem IP e não há Wi-Fi persistido (o cabo assume a comunicação com o aplicativo — ver `business-rule-ethernet-sem-wifi.md`);
   - `config_plaque` igual à persistida: `completed`, mesmo com o Wi-Fi fora (antes só respondia com Wi-Fi conectado).
 - `atualizarStatusFila()` guarda o último status respondido (`queue_id_ultimo_status_respondido`, `ultimo_status_respondido_fila`). Se a API continuar devolvendo uma ação já tratada (ex.: falha de rede no `/save`), o status é reenviado a cada `intervalo_reenvio_status_fila_ms` (5 s) **sem executar a ação de novo**.
 
 ## Ações imediatas antigas (`open_or_close_gate`, `down_siren`)
 - `acaoDaFilaExpirada(payload, agora_epoch)`: ação criada (`created_at`, horário de Brasília, `fuso_horario_servidor_segundos` = -3 h) há mais de `validade_acao_imediata_fila_segundos` (60 s) não é executada e responde `failed`. Evita abrir portão ou calar a sirene com comandos acumulados (placa desligada ou fila travada).
 - O relógio vem do NTP (`configTime` em UTC, iniciado em `verificarRede()` na primeira vez que há rede). Ação imediata lida antes da sincronização espera até `tempo_maximo_espera_sincronizacao_relogio_ms` (15 s) sem ser respondida; depois disso, sem relógio, sem `created_at` ou com `created_at` no futuro a ação é executada normalmente.
-- Ações de configuração (intertravamento, fotocélulas, manutenção) não expiram: são aplicadas em ordem e o estado final é o da última ação.
+- Ações de configuração (intertravamento, fotocélulas, manutenção, `update_button_control`) não expiram: são aplicadas em ordem e o estado final é o da última ação. `update_button_control` atualiza o botão em `buttons` (ver `business-rule-botoes-controle.md`).
 
 ## Ações `intertravamento` e fotocélulas
 - `action_data` (`extraiFlagDoActionData()`): `0`/`false` = desligar, `1`/`true` = ligar. Formato atual da API: texto `"0"` ou `"1"`. Aceita também número ou JSON (`{"value":0}`), normal ou escapado; com chave `value`, o valor é lido dela. Vazio, `null`, ausente ou outro valor = inválido, responde `failed`.

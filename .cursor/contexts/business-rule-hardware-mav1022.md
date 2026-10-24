@@ -56,7 +56,7 @@ Repouso lógico (igual à regra de negócio geral): motores/sirene desenergizado
 
 ## Receptor RF433
 - **GPIO48** — entrada do receptor 433 MHz (sinal invertido por Q2). Não passa pelo PCA9534.
-- Janela de 20 s do botão de cadastrar controle imprime o quadro RF, sem acionar relé. Aprendizado e acionamento da SAÍDA 1: ver `business-rule-receptor-rf433.md`.
+- Janela de 20 s do botão de cadastrar controle imprime o quadro RF, sem acionar relé. A assinatura entra em `buttons` e o pulso segue o status vinculado. Ver `business-rule-receptor-rf433.md` e `business-rule-botoes-controle.md`.
 
 ## Funções
 - `configuraPinos()`: I2C 100 kHz em GPIO8/9, polaridade 0x02=0x00, PCA9534 0x20 saída / 0x21 entrada, confirma escrita lendo de volta; `pinMode(GPIO48, INPUT)`.

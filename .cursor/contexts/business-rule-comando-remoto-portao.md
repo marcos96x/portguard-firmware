@@ -24,9 +24,11 @@ A consulta periódica da fila (`buscarConfigWifiNaApi()` via `/plaque-queues-act
 - Comando criado há mais de 60 s (`created_at` x relógio NTP) não é executado e responde `failed` (ver "Ações imediatas antigas" em `business-rule-configuracao-remota-placa.md`).
 
 ## Estrutura
-- `processarAbrirOuFecharPortao(queue_id, payload)` roda no `loop()` (rede). `enviaComandoRemotoParaTarefaPortoes()` envia o número do portão para `fila_comandos_remotos_portao` e espera até `tempo_espera_resultado_comando_remoto_ms` (500 ms) o resultado em `fila_resultados_comandos_remotos` (a mesma função entrega o `down_siren`, código `comando_remoto_desligar_sirene` = 4, para não colidir com o portão 3).
+- `processarAbrirOuFecharPortao(queue_id, payload)` roda no `loop()` (rede). `enviaComandoRemotoParaTarefaPortoes()` envia o número do portão para `fila_comandos_remotos_portao` e espera até `tempo_espera_resultado_comando_remoto_ms` (1 s) o resultado em `fila_resultados_comandos_remotos` (a mesma função entrega o `down_siren`, código `comando_remoto_desligar_sirene` = 4, para não colidir com o portão 3).
+- A tarefa tira o comando da fila no início do ciclo, antes do I2C. Ela não chama `WiFi.status()` nem `ETH.localIP()`: os LEDs usam a cópia feita em `verificarRede()`. Sem isso, a consulta da rede segura a tarefa, os 500 ms estouram e o pulso de abertura é apagado. A fotocélula não espera essa resposta, por isso continuava funcionando.
 - `tarefaControlePortoes()` consome o comando a cada ciclo e passa `comando_remoto = true` para `processaPortao()` do portão alvo; devolve o retorno de `processaPortao()` (false = bloqueado pelo intertravamento).
 - O portão nunca é acionado diretamente pelo `loop()`, para não haver concorrência com a tarefa dos portões.
 
 ## Testes
 `teste_comando_remoto_portao` (chamado em `teste_completo()`): formatos de `action_data`, abertura remota autorizada sem `gate_broken`, bloqueio pelo intertravamento e fechamento remoto de portão aberto.
+`teste_abertura_pelo_aplicativo_nao_consulta_a_rede` (em `teste_completo()`): a espera do comando é de pelo menos 1 s e o LED usa a cópia da rede, sem consultar Wi-Fi ou cabo na tarefa.

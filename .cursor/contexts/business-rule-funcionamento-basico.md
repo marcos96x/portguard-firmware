@@ -39,7 +39,7 @@ Entradas/saídas via PCA9534 (0x21 / 0x20) no I2C GPIO8/GPIO9. Ethernet W5500: M
 - Autorização expirada sem abertura: contador de possível falha do sensor; no 6º seguido envia `plaque_problem` com `event_data` "Falha de leitura no sensor de fim de curso do portão N".
 - A quantidade de portões é `quantidade_portoes_configurada` (3 nesta placa). Entradas de portão que a placa não tem são ignoradas em sensor, comando, sirene e intertravamento. Ver `business-rule-quantidade-portoes.md`.
 - SAÍDA 8 acompanha o inverso da sirene no próprio byte do PCA9534: sirene disparada deixa o relé 8 desenergizado (contato aberto).
-- Portão aberto por 60 s: evento `gate_timeout_open` e sirene intermitente (1 s ligada / 2 s desligada) até fechar.
+- Portão aberto por 120 s (`tempo_maximo_portao_aberto_ms`): evento `gate_timeout_open` uma vez por abertura, com título "Portão aberto por mais de 2 minutos" e `event_data` `{"port": N}`, e sirene intermitente (1 s ligada / 2 s desligada) até fechar. O cronômetro é de cada portão e zera a cada abertura. Ver `business-rule-portao-aberto-sem-fechar.md`.
 - Portão fecha: evento `gate_close`, encerra alarmes daquele portão (exceto a sirene pós-fechamento de abertura indevida) e envia `gate_timeout_close` se havia alerta de tempo.
 - Sirene liga se qualquer portão tiver alarme; abertura indevida (aberta ou nos 120 s pós-fechamento) tem prioridade (contínua) sobre a intermitente.
 - A ação `down_siren` da fila desliga a sirene (ver `business-rule-desligar-sirene.md`).

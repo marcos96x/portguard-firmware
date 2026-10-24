@@ -13,7 +13,8 @@ A placa MAV1022 possui entrada de receptor 433 MHz no **GPIO48** (sinal invertid
 - O cadastro começa no **botão local GPIO5** (manual: BUTTON, ativo em nível baixo, `pino_botao_cadastrar_controle`). A placa fica 20 s esperando o controle.
 - No monitor serial da Arduino IDE aparece o comando assim que o controle é apertado (`codigo 0x...`, quantidade de bits e a sequência binária) e de novo quando o quadro se repete e o cadastro confirma.
 - Até 8 controles ficam na Preferences (`rf433_qtd`, `rf433_c0`/`rf433_b0` …). O primeiro também permanece em `rf433_ok`, `rf433_code`, `rf433_bits`.
-- **Próximos acionamentos** de um controle cadastrado: a placa trata como comando da receptora do **portão 1**, acionando a **SAÍDA 1** (pulso do motor + janela de autorização), via `tarefaControlePortoes` → `processaPortao` do portão 1.
+- **Próximos acionamentos** de um controle que está só na lista binária (`rf433_c*` / `rf433_b*`), sem objeto em `buttons`: a placa trata como comando da receptora do **portão 1**, acionando a **SAÍDA 1** (pulso do motor + janela de autorização), via `tarefaControlePortoes` → `processaPortao` do portão 1.
+- Controle cuja **assinatura** foi gravada em `buttons` não usa esse atalho do portão 1. O pulso segue `business-rule-botoes-controle.md`: só com status `vinculado` e `port_number` 1, 2 ou 3.
 - Intervalo mínimo de **1 segundo** entre comandos RF433 reconhecidos (evita múltiplos pulsos com o botão mantido).
 - Código que não foi cadastrado pelo botão é ignorado (não grava sozinho).
 

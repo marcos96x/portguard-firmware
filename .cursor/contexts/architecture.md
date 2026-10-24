@@ -26,7 +26,7 @@ SAÍDA 8: segue a lógica exata da sirene (SAÍDA 7), mas normalmente HIGH, para
 
 O portão 3 usa os canais que sobram no PCA9534 (8 entradas e 8 saídas). GPIO do ESP32-S3 permanece no I2C, Ethernet, USB, RTC e RF433.
 
-GPIO5: botão cadastrar controle, ativo em nível baixo. GPIO48: receptor RF433 (sinal invertido). Com o botão pressionado, abre 20 s em que cada tecla imprime o quadro RF no monitor serial, sem acionar relé por esse aviso; o quadro completo e repetido é gravado. Nas próximas pressões iguais, aciona a SAÍDA 1 (portão 1). Ver `business-rule-receptor-rf433.md`.
+GPIO5: botão cadastrar controle, ativo em nível baixo. GPIO48: receptor RF433 (sinal invertido). Com o botão pressionado, abre 20 s em que cada tecla imprime o quadro RF no monitor serial, sem acionar relé por esse aviso; o quadro completo e repetido é gravado. A assinatura entra no índice Preferences `buttons` com portão 0 e status livre e o `loop()` envia JSON para `/api/app/v1/plaque-buttons/save`. Cadastrar de novo a mesma assinatura volta para livre/portão 0 e envia `/api/app/v1/plaque-buttons/update` com `control_id` 0 e `port_number` 0. O pulso no portão só ocorre se esse botão estiver `vinculado` ao portão 1, 2 ou 3. Controle gravado só na lista binária antiga, sem entrada em `buttons`, continua acionando a SAÍDA 1 (portão 1). Ver `business-rule-receptor-rf433.md` e `business-rule-botoes-controle.md`.
 
 Wi-Fi no ESP32-S3: sleep do modem desligado + auto-reconnect com credenciais persistidas, para não perder a sessão com o aplicativo. Ver `business-rule-wifi-esp32-s3.md`.
 

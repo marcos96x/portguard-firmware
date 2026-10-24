@@ -10,7 +10,7 @@ A consulta da fila (`buscarConfigWifiNaApi()` via `/plaque-queues-actions/list`,
 - Desliga a sirene dos três portões (`desligaSirenePortao()` em cada um):
   - encerra o alarme de abertura indevida, a sirene pós-fechamento (120 s) e o alerta de tempo aberto;
   - SAÍDA 7 vai para LOW e a SAÍDA 8 (central de alarme) volta para HIGH no ciclo seguinte da tarefa (até 10 ms);
-  - com o portão ainda aberto, a contagem de tempo aberto recomeça do zero: o alerta intermitente só volta depois de mais `tempo_maximo_portao_aberto_ms` (60 s) aberto;
+  - com o portão ainda aberto, a contagem de tempo aberto recomeça do zero: o alerta intermitente só volta depois de mais `tempo_maximo_portao_aberto_ms` (120 s) aberto;
   - fechar o portão depois do `down_siren` não religa a sirene pós-fechamento;
   - uma nova abertura sem autorização volta a disparar a sirene e o `gate_broken` normalmente.
 - Responde `completed` ao executar; `failed` se a tarefa dos portões não responder.
