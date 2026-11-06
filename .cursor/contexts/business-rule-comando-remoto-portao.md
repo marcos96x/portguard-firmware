@@ -21,6 +21,7 @@ A consulta periódica da fila (`buscarConfigWifiNaApi()` via `/plaque-queues-act
 - O `queue_id` é marcado em `ultimoQueueIdNotificado` antes de acionar o portão: mesmo que a resposta à API falhe, o mesmo comando nunca é executado duas vezes. Sem `queue_id` o comando não é executado.
 - O `id` da fila é lido como número (`"id":12`) ou texto (`"id":"12"`).
 - Ação com `action_status` diferente de `pending` é ignorada (evita repetir comando antigo após reiniciar a placa).
+- O `user_id` da ação (número ou texto) é lido do item da fila e fica no portão até o sensor gerar o `gate_open` ou o `gate_close`. Esse log leva `{"port":N, "user_id": "..."}`. Sem `user_id` na ação, o log segue só com o portão.
 - Comando criado há mais de 60 s (`created_at` x relógio NTP) não é executado e responde `failed` (ver "Ações imediatas antigas" em `business-rule-configuracao-remota-placa.md`).
 
 ## Estrutura
@@ -31,4 +32,5 @@ A consulta periódica da fila (`buscarConfigWifiNaApi()` via `/plaque-queues-act
 
 ## Testes
 `teste_comando_remoto_portao` (chamado em `teste_completo()`): formatos de `action_data`, abertura remota autorizada sem `gate_broken`, bloqueio pelo intertravamento e fechamento remoto de portão aberto.
+`teste_user_id_abertura_fechamento` (em `teste_completo()`): leitura do `user_id`, `event_data` do `gate_open` e do `gate_close`, e descarte quando o comando é de controle, da receptora, expirou ou foi bloqueado.
 `teste_abertura_pelo_aplicativo_nao_consulta_a_rede` (em `teste_completo()`): a espera do comando é de pelo menos 1 s e o LED usa a cópia da rede, sem consultar Wi-Fi ou cabo na tarefa.

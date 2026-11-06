@@ -7,7 +7,7 @@ alwaysApply: false
 Implementada em `script.cpp`.
 
 ## Consulta da fila a cada 500 ms
-- `verificarRede()` chama `buscarConfigWifiNaApi()` (`/plaque-queues-actions/list`) a cada `intervalo_consulta_fila_ms` (500 ms) quando há Wi-Fi ou cabo conectado.
+- `verificarRede()` chama `buscarConfigWifiNaApi()` (`/plaque-queues-actions/list`) a cada `intervalo_consulta_fila_ms` (500 ms) quando há Wi-Fi ou cabo conectado e a Preferences `serial_portguard` já tem serial. Sem serial, a fila, o heartbeat e os logs ficam parados (ver `business-rule-serial-portguard.md`).
 - Após uma falha da consulta espera `intervalo_espera_apos_falha_consulta_fila_ms` (5 s) antes de tentar de novo.
 - Sem rede, a consulta continua sendo tentada junto com o heartbeat (`INTERVALO_API_MS`, 30 s). O heartbeat não mudou.
 - Cada consulta faz um handshake HTTPS; na prática o intervalo real é 500 ms ou o tempo da requisição, o que for maior. O controle dos portões roda em tarefa própria e não é afetado.

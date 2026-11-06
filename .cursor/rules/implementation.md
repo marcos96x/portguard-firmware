@@ -6,7 +6,7 @@ alwaysApply: true
 - Linguagem de programação: C++ voltada ao ESP32
 - Consumo de API via HTTP
 - Armazenamento em Preferences do que precisar salvar mesmo com a placa desligada
-- Link da documentação da API: https://portguard.milesmp.com.br/docs/api (usar como referência ao ter implementações que envolvem requisições HTTP)
+- Link da documentação da API: https://portguard.com.br/docs/api (usar como referência ao ter implementações que envolvem requisições HTTP)
 
 # Padrões de código
 - Toda função precisa de um comentário explicando o que ela faz. 

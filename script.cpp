@@ -70,6 +70,8 @@
   0. Entradas, regras e saídas rodam numa tarefa FreeRTOS própria
      (a cada 10 ms), independente das requisições HTTP do loop.
      Eventos vão para uma fila e são enviados à API com event_data {"port": N}.
+     gate_open e gate_close feitos por botão de controle levam também
+     {"port":N, "button_id": "..."}.
 
   1. Comando na receptora do portão:
      - Motor do portão recebe pulso de 1 segundo.
@@ -86,7 +88,8 @@
        contando a partir do último gate_broken enviado, de qualquer portão).
 
   3. Portão aberto por mais de 120 segundos (tempo_maximo_portao_aberto_ms):
-     - Envia gate_timeout_open uma vez por abertura, com o título
+     - No instante em que a sirene dispara, envia gate_not_closed uma vez
+       por abertura, com o portão ainda aberto. Título
        "Portão aberto por mais de 2 minutos" e event_data {"port": N}.
      - Sirene 1 segundo ligada / 2 segundos desligada até fechar.
      - O cronômetro é de cada portão e zera a cada abertura.
@@ -105,6 +108,9 @@
        as requisições saem pela Ethernet e a config_plaque pendente é confirmada
        (completed), para a placa não permanecer em aguardando configuração.
      - Se o Wi-Fi já estava persistido e não conectar, o cabo segue como reserva.
+     - O último Wi-Fi que deixou a placa online fica guardado. Se o aplicativo
+       troca a rede ou a senha e a nova não conecta em 2 minutos, a placa
+       volta sozinha para esse Wi-Fi, sem cabo. Queda de energia reconecta nele na hora.
      - Sem os dois, o Serial explica o que falhou em cada meio.
 
   6. API:
@@ -112,6 +118,9 @@
        com rede disponível (5 s de espera após uma falha); sem rede,
        tenta a cada 30 segundos.
      - Heartbeat a cada 30 segundos quando houver link.
+     - Sem serial em Preferences "serial_portguard", a placa não consulta a fila,
+       não envia heartbeat nem logs. A cada 5 s chama /plaque-install/waiting
+       e, ao receber um serial, grava e confirma em /plaque-install/complete.
      - config_plaque: aplica o Wi-Fi recebido em action_data. Sem Wi-Fi persistido
        e com o cabo no ar, a configuração é confirmada pelo cabo.
      - reset_plaque: apaga o Wi-Fi e usa cabo até um novo config_plaque.
@@ -141,12 +150,24 @@
        /api/app/v1/plaque-buttons/update com control_id 0 e port_number 0.
      - Pulso de controle vinculado envia abertura/fechamento para
        /api/app/v1/plaques/logs com button_id e port_number.
+       Comando da receptora ou do aplicativo envia o mesmo alerta, com button_id 0.
+       O alerta de portão aberto (gate_not_closed) também segue por essa rota.
+       O gate_open e o gate_close do sensor repetem esse button_id
+       no event_data de /plaque-events-logs/save.
+       O open_or_close_gate guarda o user_id da ação e o gate_open ou
+       gate_close seguinte leva esse user_id no event_data.
+     - Todo log leva connection_type (wifi ou ethernet) do meio ativo no envio.
+       Sem internet, o log vai para a Preferences queue_logs e sai antes
+       das outras chamadas quando a rede volta.
+     - Wi-Fi que conectou fica em last_wifi_config. Se a configuração nova
+       não conectar em 2 minutos, a placa volta para esse Wi-Fi e envia wifi_error.
   ============================================================
 */
 
 #include <Arduino.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <Network.h>
 #include <NetworkClientSecure.h>
 #include <HTTPClient.h>
@@ -158,15 +179,24 @@
 // IDENTIFICAÇÃO E API
 // ============================================================
 
-const String plaque_serial = "1port-7PWV7S9536CF";
+// O serial da placa não fica mais no código. É lido da Preferences para serial_placa
+// e esse texto é o que vai em todas as requisições.
+// A chave pedida "serial_portguard" tem 16 caracteres. O NVS da ESP32 grava no máximo 15,
+// então a chave persistida é a de 15 caracteres abaixo. Sem isso a instalação nunca conclui.
+const char chave_serial_portguard[] = "serial_portguard";
+const char chave_serial_portguard_nvs[] = "serial_portguar";
+const unsigned long intervalo_consulta_instalacao_placa_ms = 5000;
+String serial_placa = "";
+unsigned long momento_proxima_consulta_instalacao_placa = 0;
+bool conclusao_instalacao_placa_pendente = false;
 
 // Quantidade de portões ligados nesta placa. O serial (1port-...) só identifica a placa na API
 // e não pode reduzir isso: com 1 a entrada 6 e a saída 3 ficam mortas.
 // Placa de 1 portão usa 1; placa de 2 portões usa 2; esta placa está cabeada para 3.
 const uint8_t quantidade_portoes_configurada = 3;
 uint8_t quantidade_portoes_placa = quantidade_portoes_configurada;
-const String api_url = "https://portguard.milesmp.com.br/api/v1";
-const String api_url_aplicativo = "https://portguard.milesmp.com.br/api/app/v1";
+const String api_url = "https://portguard.com.br/api/v1";
+const String api_url_aplicativo = "https://portguard.com.br/api/app/v1";
 const String api_token = "bananapratadoisreaisoquilo";
 const char rota_cadastro_botao_controle[] = "/plaque-buttons/save";
 const char rota_atualizacao_botao_controle[] = "/plaque-buttons/update";
@@ -188,9 +218,22 @@ bool wifi_persistido_ja_iniciado = false;
 long queueIdPendente = 0;
 long ultimoQueueIdNotificado = 0;
 unsigned long momentoInicioConfigWifi = 0;
-const unsigned long TIMEOUT_CONFIG_WIFI_MS = 10000;
 String wifiSsidRejeitado = "";
 String wifiPasswordRejeitado = "";
+String wifi_ssid_ultimo_online = "";
+String wifi_senha_ultimo_online = "";
+unsigned long momento_perda_wifi = 0;
+bool tentativa_wifi_nova_passou_pela_desconexao = false;
+const unsigned long tempo_sem_wifi_para_restaurar_ultimo_online_ms = 120000;
+
+// "last_wifi_config" tem 16 caracteres. O NVS grava no máximo 15, então a chave usada é "last_wifi_confi".
+const char chave_last_wifi_config[] = "last_wifi_config";
+const char chave_last_wifi_config_nvs[] = "last_wifi_confi";
+const char chave_fila_logs_local[] = "queue_logs";
+const int limite_caracteres_fila_logs_local = 2800;
+String json_last_wifi_config = "";
+String fila_logs_local = "[]";
+bool requisicao_http_obteve_resposta = false;
 
 Preferences preferences;
 NetworkClientSecure httpsClient;
@@ -323,6 +366,7 @@ const uint32_t assinatura_botao_3_controle_rf433 = 0x6958C26BUL;
 const char chave_armazenamento_botoes_controle[] = "buttons";
 const uint8_t quantidade_maxima_botoes_controle = 20;
 const uint8_t tamanho_identificador_botao_controle = 24;
+const uint8_t tamanho_identificador_usuario = 24;
 const uint8_t tamanho_numero_portao_botao_controle = 4;
 const uint8_t tamanho_status_botao_controle = 16;
 const uint16_t tamanho_buffer_json_botoes_controle = 2560;
@@ -345,7 +389,7 @@ const unsigned long janela_comando_autorizado_ms = 8000 + acrescimo_janela_abert
 const unsigned long tempo_sirene_apos_fechamento_abertura_indevida_ms = 120000;
 const unsigned long tempo_maximo_portao_aberto_ms = 120000;
 const char titulo_aviso_portao_aberto_sem_fechar[] = "Portão aberto por mais de 2 minutos";
-const char tipo_evento_portao_aberto_sem_fechar[] = "gate_timeout_open";
+const char tipo_evento_portao_aberto_sem_fechar[] = "gate_not_closed";
 const unsigned long tempo_sirene_ligada_alerta_ms = 1000;
 const unsigned long tempo_sirene_desligada_alerta_ms = 2000;
 const unsigned long tempo_estabilizacao_entrada_ms = 50;
@@ -380,6 +424,11 @@ struct EstadoPortao {
   bool alerta_tempo_aberto_ativo;
   unsigned long momento_inicio_alerta_tempo_aberto;
   int contador_possivel_falha_sensor;
+  char identificador_controle_comando[tamanho_identificador_botao_controle];
+  char identificador_usuario_comando[tamanho_identificador_usuario];
+  bool controle_comando_e_abertura;
+  char identificador_controle_ultimo_evento[tamanho_identificador_botao_controle];
+  char identificador_usuario_ultimo_evento[tamanho_identificador_usuario];
 };
 
 struct NiveisSaidas {
@@ -396,6 +445,8 @@ struct NiveisSaidas {
 struct EventoPendente {
   char tipo_evento[24];
   uint8_t numero_portao;
+  char identificador_controle[tamanho_identificador_botao_controle];
+  char identificador_usuario[tamanho_identificador_usuario];
 };
 
 struct BotaoControleCadastrado {
@@ -428,7 +479,7 @@ struct ResultadoAtualizacaoBotaoControle {
 struct LogPulsoBotaoControle {
   char identificador_botao[tamanho_identificador_botao_controle];
   char numero_portao[tamanho_numero_portao_botao_controle];
-  char tipo_evento[16];
+  char tipo_evento[24];
 };
 
 EstadoPortao estado_portao_1;
@@ -517,6 +568,7 @@ QueueHandle_t fila_eventos_pendentes = nullptr;
 // comando_remoto_desligar_sirene = down_siren. A tarefa devolve se o comando foi executado.
 const uint8_t comando_remoto_desligar_sirene = 4;
 QueueHandle_t fila_comandos_remotos_portao = nullptr;
+char identificador_usuario_comando_remoto[tamanho_identificador_usuario] = "";
 QueueHandle_t fila_resultados_comandos_remotos = nullptr;
 QueueHandle_t fila_logs_pulsos_botoes_controle = nullptr;
 // A tarefa dos portões não pode consultar Wi-Fi nem Ethernet: isso segura o cadeado da rede
@@ -532,7 +584,9 @@ void preferirCaboSeWifiCaiu();
 bool deveManterReconexaoAutomaticaWifi();
 void configuraEstabilidadeWifiEsp32S3();
 void registraEventosWifiEsp32S3();
-bool enviarEventoLog(const char *eventType, uint8_t numero_portao = 0);
+bool enviarEventoLog(const char *eventType, uint8_t numero_portao = 0, const char *identificador_controle = nullptr,
+                     const char *dados_evento = nullptr, const char *titulo_evento = nullptr,
+                     const char *identificador_usuario = nullptr);
 bool atualizarStatusFila(long queueId, const char *actionStatus);
 bool wifiEstaConfigurado();
 bool wifiConectado();
@@ -551,7 +605,10 @@ void carregaBotoesControle();
 bool adicionaBotaoControleLivre(uint32_t assinatura);
 ResultadoConsultaBotaoControle consultaBotaoControle(uint32_t assinatura);
 uint8_t consomeComandoBotaoControle(char *identificador_botao, char *numero_portao_texto);
-void enfileiraLogPulsoBotaoControle(const char *identificador_botao, const char *numero_portao_texto, bool comando_de_abertura);
+void enfileiraLogPulsoBotaoControle(const char *identificador_botao, const char *numero_portao_texto,
+                                    bool comando_de_abertura, const char *tipo_evento = nullptr);
+bool deveEnfileirarAlertaComandoConvencional(bool comando_convencional, bool comando_executado, bool comando_veio_de_botao,
+                                             bool portao_em_manutencao);
 bool salvaBotoesControle();
 void enviaCadastrosBotoesControlePendentes();
 void enviaLogsPulsosBotoesControle();
@@ -1176,11 +1233,32 @@ void iniciaEstadoPortao(EstadoPortao &portao, uint8_t numero_portao, bool recept
   portao.alerta_tempo_aberto_ativo = false;
   portao.momento_inicio_alerta_tempo_aberto = 0;
   portao.contador_possivel_falha_sensor = 0;
+  portao.identificador_controle_comando[0] = '\0';
+  portao.identificador_usuario_comando[0] = '\0';
+  portao.controle_comando_e_abertura = false;
+  portao.identificador_controle_ultimo_evento[0] = '\0';
+  portao.identificador_usuario_ultimo_evento[0] = '\0';
 }
 
 // Registra um evento do portão: em modo de teste guarda em memória; senão coloca na fila
 // que o loop de rede envia para a API (nunca bloqueia a tarefa dos portões).
-void registraEventoPortao(EstadoPortao &portao, const char *tipo_evento) {
+void registraEventoPortao(EstadoPortao &portao, const char *tipo_evento, const char *identificador_controle = nullptr,
+                          const char *identificador_usuario = nullptr) {
+  if (identificador_controle == nullptr) {
+    portao.identificador_controle_ultimo_evento[0] = '\0';
+  } else {
+    strncpy(portao.identificador_controle_ultimo_evento, identificador_controle,
+            sizeof(portao.identificador_controle_ultimo_evento) - 1);
+    portao.identificador_controle_ultimo_evento[sizeof(portao.identificador_controle_ultimo_evento) - 1] = '\0';
+  }
+  if (identificador_usuario == nullptr) {
+    portao.identificador_usuario_ultimo_evento[0] = '\0';
+  } else {
+    strncpy(portao.identificador_usuario_ultimo_evento, identificador_usuario,
+            sizeof(portao.identificador_usuario_ultimo_evento) - 1);
+    portao.identificador_usuario_ultimo_evento[sizeof(portao.identificador_usuario_ultimo_evento) - 1] = '\0';
+  }
+
   if (portao.modo_teste) {
     portao.eventos_registrados_teste += String(tipo_evento) + ";";
     return;
@@ -1197,10 +1275,16 @@ void registraEventoPortao(EstadoPortao &portao, const char *tipo_evento) {
     return;
   }
 
-  EventoPendente evento;
+  EventoPendente evento = {};
   strncpy(evento.tipo_evento, tipo_evento, sizeof(evento.tipo_evento) - 1);
   evento.tipo_evento[sizeof(evento.tipo_evento) - 1] = '\0';
   evento.numero_portao = portao.numero_portao;
+  if (identificador_controle != nullptr) {
+    strncpy(evento.identificador_controle, identificador_controle, sizeof(evento.identificador_controle) - 1);
+  }
+  if (identificador_usuario != nullptr) {
+    strncpy(evento.identificador_usuario, identificador_usuario, sizeof(evento.identificador_usuario) - 1);
+  }
 
   if (xQueueSend(fila_eventos_pendentes, &evento, 0) != pdTRUE) {
     print_log("ERRO: fila de eventos cheia. Evento descartado: " + String(tipo_evento) +
@@ -1215,10 +1299,14 @@ void registraEventoPortao(EstadoPortao &portao, const char *tipo_evento) {
 // comando_remoto = true equivale a uma borda de subida da receptora (open_or_close_gate vindo da API).
 // modo_manutencao = true: abertura sem autorização não arma alarme nem gera gate_broken, alarmes já ativos são
 // encerrados e a contagem de tempo aberto fica parada (recomeça do zero quando a manutenção termina).
+// identificador_controle, quando o pulso veio de um botão cadastrado, acompanha o gate_open
+// ou o gate_close seguinte. O identificador_usuario acompanha o gate_open ou gate_close do
+// open_or_close_gate. Receptora e abertura forçada seguem sem button_id e sem user_id.
 // Só altera o EstadoPortao e registra eventos; quem escreve nos pinos é aplicaSaidas().
 // Retorna false somente quando um comando recebido foi bloqueado pelo intertravamento.
 bool processaPortao(EstadoPortao &portao, bool receptora_acionada, bool sensor_fechado, unsigned long agora,
-                    bool outro_portao_aberto = false, bool comando_remoto = false, bool modo_manutencao = false) {
+                    bool outro_portao_aberto = false, bool comando_remoto = false, bool modo_manutencao = false,
+                    const char *identificador_controle = nullptr, const char *identificador_usuario = nullptr) {
   String prefixo_log = String(portao.modo_teste ? "[TESTE PORTAO " : "[PORTAO ") + String(portao.numero_portao) + "] ";
   String origem_comando = comando_remoto ? " (via API)" : "";
 
@@ -1243,6 +1331,26 @@ bool processaPortao(EstadoPortao &portao, bool receptora_acionada, bool sensor_f
     } else {
       print_log(prefixo_log + "Comando recebido com portao aberto" + origem_comando + ". Pulso no motor para fechamento.");
     }
+
+    if (identificador_controle != nullptr && identificador_controle[0] != '\0') {
+      strncpy(portao.identificador_controle_comando, identificador_controle,
+              sizeof(portao.identificador_controle_comando) - 1);
+      portao.identificador_controle_comando[sizeof(portao.identificador_controle_comando) - 1] = '\0';
+      portao.identificador_usuario_comando[0] = '\0';
+      portao.controle_comando_e_abertura = comando_de_abertura;
+      print_log(prefixo_log + "Comando associado ao controle " + String(portao.identificador_controle_comando) + ".");
+    } else if (identificador_usuario != nullptr && identificador_usuario[0] != '\0') {
+      strncpy(portao.identificador_usuario_comando, identificador_usuario,
+              sizeof(portao.identificador_usuario_comando) - 1);
+      portao.identificador_usuario_comando[sizeof(portao.identificador_usuario_comando) - 1] = '\0';
+      portao.identificador_controle_comando[0] = '\0';
+      portao.controle_comando_e_abertura = comando_de_abertura;
+      print_log(prefixo_log + "Comando associado ao usuario " + String(portao.identificador_usuario_comando) + ".");
+    } else {
+      portao.identificador_controle_comando[0] = '\0';
+      portao.identificador_usuario_comando[0] = '\0';
+      portao.controle_comando_e_abertura = false;
+    }
   }
   portao.receptora_anterior = receptora_acionada;
 
@@ -1250,10 +1358,21 @@ bool processaPortao(EstadoPortao &portao, bool receptora_acionada, bool sensor_f
     portao.portao_aberto = true;
     portao.momento_abertura = agora;
     print_log(prefixo_log + "Sensor abriu: portao aberto.");
-    registraEventoPortao(portao, "gate_open");
-
     bool autorizacao_valida = portao.abertura_autorizada &&
                               agora - portao.momento_autorizacao <= janela_comando_autorizado_ms;
+    const char *identificador_abertura = nullptr;
+    const char *identificador_usuario_abertura = nullptr;
+    if (autorizacao_valida && portao.controle_comando_e_abertura) {
+      if (portao.identificador_controle_comando[0] != '\0') {
+        identificador_abertura = portao.identificador_controle_comando;
+      }
+      if (portao.identificador_usuario_comando[0] != '\0') {
+        identificador_usuario_abertura = portao.identificador_usuario_comando;
+      }
+    }
+    registraEventoPortao(portao, "gate_open", identificador_abertura, identificador_usuario_abertura);
+    portao.identificador_controle_comando[0] = '\0';
+    portao.identificador_usuario_comando[0] = '\0';
     portao.abertura_autorizada = false;
 
     if (autorizacao_valida) {
@@ -1284,7 +1403,19 @@ bool processaPortao(EstadoPortao &portao, bool receptora_acionada, bool sensor_f
       portao.abertura_autorizada = false;
     }
     print_log(prefixo_log + "Sensor fechou: portao fechado.");
-    registraEventoPortao(portao, "gate_close");
+    const char *identificador_fechamento = nullptr;
+    const char *identificador_usuario_fechamento = nullptr;
+    if (!portao.controle_comando_e_abertura) {
+      if (portao.identificador_controle_comando[0] != '\0') {
+        identificador_fechamento = portao.identificador_controle_comando;
+      }
+      if (portao.identificador_usuario_comando[0] != '\0') {
+        identificador_usuario_fechamento = portao.identificador_usuario_comando;
+      }
+    }
+    registraEventoPortao(portao, "gate_close", identificador_fechamento, identificador_usuario_fechamento);
+    portao.identificador_controle_comando[0] = '\0';
+    portao.identificador_usuario_comando[0] = '\0';
 
     if (portao.alarme_abertura_indevida_ativo) {
       portao.alarme_abertura_indevida_ativo = false;
@@ -1312,6 +1443,10 @@ bool processaPortao(EstadoPortao &portao, bool receptora_acionada, bool sensor_f
 
   if (portao.abertura_autorizada && agora - portao.momento_autorizacao > janela_comando_autorizado_ms) {
     portao.abertura_autorizada = false;
+    if (portao.controle_comando_e_abertura) {
+      portao.identificador_controle_comando[0] = '\0';
+      portao.identificador_usuario_comando[0] = '\0';
+    }
     portao.contador_possivel_falha_sensor++;
     print_log(prefixo_log + "Autorizacao expirou sem abertura. Possivel falha no sensor: " +
               String(portao.contador_possivel_falha_sensor) + "/" + String(limite_possivel_falha_sensor));
@@ -1348,8 +1483,13 @@ bool processaPortao(EstadoPortao &portao, bool receptora_acionada, bool sensor_f
     portao.alerta_tempo_aberto_ativo = true;
     portao.momento_inicio_alerta_tempo_aberto = agora;
     print_log(prefixo_log + "ALERTA: PORTAO ABERTO POR MAIS DE " + String(tempo_maximo_portao_aberto_ms / 1000) +
-              " s! Sirene 1 s ligada / 2 s desligada ate fechar.");
+              " s! Sirene disparada. Enviando gate_not_closed agora, com o portao ainda aberto.");
     registraEventoPortao(portao, tipo_evento_portao_aberto_sem_fechar);
+    if (!portao.modo_teste) {
+      char texto_portao[2] = {(char)('0' + portao.numero_portao), '\0'};
+      enfileiraLogPulsoBotaoControle("0", texto_portao, true, tipo_evento_portao_aberto_sem_fechar);
+      print_log(prefixo_log + "Alerta de portao aberto enfileirado para o aplicativo e o WhatsApp.");
+    }
   }
 
   return !comando_bloqueado;
@@ -2046,6 +2186,12 @@ void tarefaControlePortoes(void *parametro) {
     if (fila_comandos_remotos_portao != nullptr) {
       xQueueReceive(fila_comandos_remotos_portao, &comando_remoto_recebido, 0);
     }
+    char identificador_usuario_recebido[tamanho_identificador_usuario] = "";
+    if (comando_remoto_recebido >= 1 && comando_remoto_recebido <= 3) {
+      strncpy(identificador_usuario_recebido, identificador_usuario_comando_remoto,
+              sizeof(identificador_usuario_recebido) - 1);
+      identificador_usuario_recebido[sizeof(identificador_usuario_recebido) - 1] = '\0';
+    }
     static unsigned long momento_ultima_garantia_entradas = 0;
     if (agora - momento_ultima_garantia_entradas >= 1000) {
       momento_ultima_garantia_entradas = agora;
@@ -2106,22 +2252,44 @@ void tarefaControlePortoes(void *parametro) {
                              sensorBloqueiaIntertravamento(3, sensor_portao_3_fechado);
     bool bloqueia_portao_3 = sensorBloqueiaIntertravamento(1, sensor_portao_1_fechado) ||
                              sensorBloqueiaIntertravamento(2, sensor_portao_2_fechado);
+    bool comando_convencional_portao_1 =
+        ((receptora_portao_1_acionada || comando_rf433) && !estado_portao_1.receptora_anterior) ||
+        comando_remoto_recebido == 1;
+    bool comando_convencional_portao_2 =
+        (receptora_portao_2_acionada && !estado_portao_2.receptora_anterior) || comando_remoto_recebido == 2;
+    bool comando_convencional_portao_3 =
+        (receptora_portao_3_acionada && !estado_portao_3.receptora_anterior) || comando_remoto_recebido == 3;
+    const char *identificador_controle_portao_1 = portao_do_botao_controle == 1 ? identificador_botao_pulso : nullptr;
+    const char *identificador_controle_portao_2 = portao_do_botao_controle == 2 ? identificador_botao_pulso : nullptr;
+    const char *identificador_controle_portao_3 = portao_do_botao_controle == 3 ? identificador_botao_pulso : nullptr;
+    const char *identificador_usuario_portao_1 =
+        comando_remoto_recebido == 1 && identificador_usuario_recebido[0] != '\0' ? identificador_usuario_recebido
+                                                                                  : nullptr;
+    const char *identificador_usuario_portao_2 =
+        comando_remoto_recebido == 2 && identificador_usuario_recebido[0] != '\0' ? identificador_usuario_recebido
+                                                                                  : nullptr;
+    const char *identificador_usuario_portao_3 =
+        comando_remoto_recebido == 3 && identificador_usuario_recebido[0] != '\0' ? identificador_usuario_recebido
+                                                                                  : nullptr;
     bool comando_portao_1_executado = processaPortao(estado_portao_1, receptora_portao_1_acionada || comando_rf433,
                                                      sensor_portao_1_fechado, agora, bloqueia_portao_1,
-                                                     comando_remoto_recebido == 1, portaoEmManutencao(1));
+                                                     comando_remoto_recebido == 1, portaoEmManutencao(1),
+                                                     identificador_controle_portao_1, identificador_usuario_portao_1);
     bool comando_portao_2_executado = true;
     bool comando_portao_3_executado = true;
     if (portaoExisteNaPlaca(2)) {
       comando_portao_2_executado = processaPortao(estado_portao_2, receptora_portao_2_acionada, sensor_portao_2_fechado,
                                                   agora, bloqueia_portao_2, comando_remoto_recebido == 2,
-                                                  portaoEmManutencao(2));
+                                                  portaoEmManutencao(2), identificador_controle_portao_2,
+                                                  identificador_usuario_portao_2);
     } else if (comando_remoto_recebido == 2) {
       comando_portao_2_executado = false;
     }
     if (portaoExisteNaPlaca(3)) {
       comando_portao_3_executado = processaPortao(estado_portao_3, receptora_portao_3_acionada, sensor_portao_3_fechado,
                                                   agora, bloqueia_portao_3, comando_remoto_recebido == 3,
-                                                  portaoEmManutencao(3));
+                                                  portaoEmManutencao(3), identificador_controle_portao_3,
+                                                  identificador_usuario_portao_3);
     } else if (comando_remoto_recebido == 3) {
       comando_portao_3_executado = false;
     }
@@ -2144,6 +2312,21 @@ void tarefaControlePortoes(void *parametro) {
       print_log("Botao de controle " + String(identificador_botao_pulso) + " nao enviou o comando ao portao " +
                 String(portao_do_botao_controle) +
                 ": o intertravamento bloqueou a abertura porque outro portao esta aberto.");
+    }
+    if (deveEnfileirarAlertaComandoConvencional(comando_convencional_portao_1, comando_portao_1_executado,
+                                               portao_do_botao_controle == 1, portaoEmManutencao(1))) {
+      enfileiraLogPulsoBotaoControle("0", "1", sensor_portao_1_fechado);
+      print_log("Comando convencional do portao 1 enfileirado para o aplicativo e o WhatsApp.");
+    }
+    if (deveEnfileirarAlertaComandoConvencional(comando_convencional_portao_2, comando_portao_2_executado,
+                                               portao_do_botao_controle == 2, portaoEmManutencao(2))) {
+      enfileiraLogPulsoBotaoControle("0", "2", sensor_portao_2_fechado);
+      print_log("Comando convencional do portao 2 enfileirado para o aplicativo e o WhatsApp.");
+    }
+    if (deveEnfileirarAlertaComandoConvencional(comando_convencional_portao_3, comando_portao_3_executado,
+                                               portao_do_botao_controle == 3, portaoEmManutencao(3))) {
+      enfileiraLogPulsoBotaoControle("0", "3", sensor_portao_3_fechado);
+      print_log("Comando convencional do portao 3 enfileirado para o aplicativo e o WhatsApp.");
     }
 
     if (comando_remoto_recebido == comando_remoto_desligar_sirene) {
@@ -2189,16 +2372,246 @@ void tarefaControlePortoes(void *parametro) {
 // PREFERENCES
 // ============================================================
 
+// A chave pedida "last_wifi_config" não cabe no NVS. Esta devolve a que a ESP32 grava.
+const char *chaveLastWifiConfigGravavel() {
+  if (strlen(chave_last_wifi_config) <= 15) {
+    return chave_last_wifi_config;
+  }
+  return chave_last_wifi_config_nvs;
+}
+
+// Meio que entra no log: wifi quando os dois estão no ar, porque o envio tenta o Wi-Fi primeiro.
+const char *tipoConexaoDoLog(bool wifi_ativo, bool ethernet_ativo) {
+  if (wifi_ativo) {
+    return "wifi";
+  }
+  if (ethernet_ativo) {
+    return "ethernet";
+  }
+  return "";
+}
+
+// Meio de conexão ativo agora, no instante do envio do log.
+const char *tipoConexaoAtivaParaLog() {
+  return tipoConexaoDoLog(wifiConectado(), caboConectado());
+}
+
+// Acrescenta connection_type ao corpo do log. Vazio não altera o corpo.
+String anexaTipoConexaoAoCorpo(const String &corpo, const char *tipo_conexao) {
+  if (tipo_conexao == nullptr || tipo_conexao[0] == '\0') {
+    return corpo;
+  }
+  return corpo + "&connection_type=" + String(tipo_conexao);
+}
+
+// Escapa barra invertida e aspas para um valor dentro de JSON.
+String escapaTextoJson(const String &texto) {
+  String saida;
+  saida.reserve(texto.length() + 8);
+  for (unsigned int indice = 0; indice < texto.length(); indice++) {
+    char caractere = texto[indice];
+    if (caractere == '\\' || caractere == '"') {
+      saida += '\\';
+    }
+    saida += caractere;
+  }
+  return saida;
+}
+
+// JSON de SSID e senha usado em last_wifi_config e no event_data de wifi_error.
+String montaJsonWifi(const String &ssid, const String &senha) {
+  return "{\"ssid\":\"" + escapaTextoJson(ssid) + "\",\"password\":\"" + escapaTextoJson(senha) + "\"}";
+}
+
+// Lê um campo de texto "campo":"valor" respeitando aspas escapadas.
+String extraiCampoJsonSimples(const String &objeto, const char *campo) {
+  String padrao = String("\"") + campo + "\":\"";
+  int inicio = objeto.indexOf(padrao);
+  if (inicio < 0) {
+    return "";
+  }
+  inicio += padrao.length();
+  String valor = "";
+  for (int indice = inicio; indice < (int)objeto.length(); indice++) {
+    if (objeto[indice] == '\\' && indice + 1 < (int)objeto.length()) {
+      valor += objeto[indice + 1];
+      indice++;
+      continue;
+    }
+    if (objeto[indice] == '"') {
+      break;
+    }
+    valor += objeto[indice];
+  }
+  return valor;
+}
+
+// Fecha o objeto que começa em inicio. Ignora } que esteja dentro de uma string.
+int indiceFimObjetoJson(const String &texto, int inicio) {
+  if (inicio < 0 || inicio >= (int)texto.length() || texto[inicio] != '{') {
+    return -1;
+  }
+  bool dentro_de_texto = false;
+  for (int indice = inicio; indice < (int)texto.length(); indice++) {
+    char caractere = texto[indice];
+    if (dentro_de_texto) {
+      if (caractere == '\\') {
+        indice++;
+        continue;
+      }
+      if (caractere == '"') {
+        dentro_de_texto = false;
+      }
+      continue;
+    }
+    if (caractere == '"') {
+      dentro_de_texto = true;
+      continue;
+    }
+    if (caractere == '}') {
+      return indice;
+    }
+  }
+  return -1;
+}
+
+// Separa ssid e password do JSON de last_wifi_config.
+bool extraiJsonWifi(const String &json, String &ssid, String &senha) {
+  ssid = extraiCampoJsonSimples(json, "ssid");
+  senha = extraiCampoJsonSimples(json, "password");
+  return ssid.length() > 0 && senha.length() > 0;
+}
+
+// Item da fila local para um log de /plaque-events-logs/save. connection_type entra só no envio.
+String montaItemFilaLogEvento(const char *tipo_evento, const String &dados_evento, const String &titulo_evento) {
+  String tipo = tipo_evento == nullptr ? "" : tipo_evento;
+  return "{\"origem\":\"events\",\"event_type\":\"" + escapaTextoJson(tipo) + "\",\"event_data\":\"" +
+         escapaTextoJson(dados_evento) + "\",\"event_title\":\"" + escapaTextoJson(titulo_evento) + "\"}";
+}
+
+// Item da fila local para um log de /plaques/logs.
+String montaItemFilaLogAplicativo(const char *tipo_evento, const char *identificador_botao, const char *numero_portao) {
+  String tipo = tipo_evento == nullptr ? "" : tipo_evento;
+  String botao = identificador_botao == nullptr ? "" : identificador_botao;
+  String portao = numero_portao == nullptr ? "" : numero_portao;
+  return "{\"origem\":\"app\",\"event_type\":\"" + escapaTextoJson(tipo) + "\",\"button_id\":\"" + escapaTextoJson(botao) +
+         "\",\"port_number\":\"" + escapaTextoJson(portao) + "\"}";
+}
+
+// Copia o próximo objeto da fila e avança o cursor para depois dele.
+bool proximoObjetoFilaLogs(const String &fila, int &cursor, String &objeto) {
+  int inicio = fila.indexOf('{', cursor);
+  if (inicio < 0) {
+    return false;
+  }
+  int fim = indiceFimObjetoJson(fila, inicio);
+  if (fim < 0) {
+    return false;
+  }
+  objeto = fila.substring(inicio, fim + 1);
+  cursor = fim + 1;
+  return true;
+}
+
+// Inclui um item no JSON da fila. Se passar do limite, descarta os mais antigos.
+String adicionaItemFilaLogsLocal(const String &fila_atual, const String &item_json) {
+  String fila = fila_atual;
+  fila.trim();
+  if (!fila.startsWith("[") || !fila.endsWith("]")) {
+    fila = "[]";
+  }
+
+  while (fila.length() + item_json.length() + 1 > (unsigned)limite_caracteres_fila_logs_local && fila.length() > 2) {
+    int inicio = fila.indexOf('{');
+    int fim = inicio < 0 ? -1 : indiceFimObjetoJson(fila, inicio);
+    if (inicio < 0 || fim < 0) {
+      fila = "[]";
+      break;
+    }
+    int depois = fim + 1;
+    while (depois < (int)fila.length() && (fila[depois] == ',' || fila[depois] == ' ')) {
+      depois++;
+    }
+    fila = "[" + fila.substring(depois);
+    if (!fila.endsWith("]")) {
+      fila += "]";
+    }
+  }
+
+  if (fila.length() < 2 || fila == "[]") {
+    return "[" + item_json + "]";
+  }
+  fila.remove(fila.length() - 1);
+  if (fila.endsWith("[")) {
+    return fila + item_json + "]";
+  }
+  return fila + "," + item_json + "]";
+}
+
+// Grava a fila local de logs. O heartbeat não entra aqui.
+void gravaFilaLogsLocal() {
+  preferences.begin("portguard", false);
+  preferences.putString(chave_fila_logs_local, fila_logs_local);
+  preferences.end();
+}
+
+// Guarda um log de evento que não saiu porque não havia internet.
+void guardaLogEventoNaFilaLocal(const char *tipo_evento, const String &dados_evento, const String &titulo_evento) {
+  if (tipo_evento == nullptr || tipo_evento[0] == '\0' || strcmp(tipo_evento, "heartbeat") == 0) {
+    return;
+  }
+  fila_logs_local = adicionaItemFilaLogsLocal(fila_logs_local, montaItemFilaLogEvento(tipo_evento, dados_evento, titulo_evento));
+  gravaFilaLogsLocal();
+  print_log("Sem internet. Log " + String(tipo_evento) + " guardado em queue_logs.");
+}
+
+// Guarda um log do aplicativo que não saiu porque não havia internet.
+void guardaLogAplicativoNaFilaLocal(const char *tipo_evento, const char *identificador_botao, const char *numero_portao) {
+  if (tipo_evento == nullptr || tipo_evento[0] == '\0') {
+    return;
+  }
+  fila_logs_local = adicionaItemFilaLogsLocal(
+      fila_logs_local, montaItemFilaLogAplicativo(tipo_evento, identificador_botao, numero_portao));
+  gravaFilaLogsLocal();
+  print_log("Sem internet. Log " + String(tipo_evento) + " do aplicativo guardado em queue_logs.");
+}
+
 void carregarConfigWifi() {
   preferences.begin("portguard", true);
   setup_finished = preferences.getBool("setup_finished", false);
   wifi_ssid = preferences.getString("wifi_ssid", "");
   wifi_password = preferences.getString("wifi_password", "");
   ethernetDetectado = preferences.getBool("ethernet_ok", false);
+  wifi_ssid_ultimo_online = preferences.getString("wifi_ssid_ok", "");
+  wifi_senha_ultimo_online = preferences.getString("wifi_senha_ok", "");
+  json_last_wifi_config = preferences.getString(chaveLastWifiConfigGravavel(), "");
+  fila_logs_local = preferences.getString(chave_fila_logs_local, "[]");
   preferences.end();
+
+  if (!fila_logs_local.startsWith("[") || !fila_logs_local.endsWith("]")) {
+    fila_logs_local = "[]";
+  }
+
+  if (wifi_ssid_ultimo_online.length() == 0 && setup_finished && wifi_ssid.length() > 0 && wifi_password.length() > 0) {
+    wifi_ssid_ultimo_online = wifi_ssid;
+    wifi_senha_ultimo_online = wifi_password;
+    preferences.begin("portguard", false);
+    preferences.putString("wifi_ssid_ok", wifi_ssid_ultimo_online);
+    preferences.putString("wifi_senha_ok", wifi_senha_ultimo_online);
+    preferences.end();
+    print_log("Ultimo Wi-Fi que deixou a placa online memorizado a partir da configuracao salva: " +
+              wifi_ssid_ultimo_online);
+  }
 
   if (setup_finished && wifi_ssid.length() > 0) {
     Serial.println("WiFi carregado da Preferences.");
+    if (json_last_wifi_config.length() == 0 && wifi_password.length() > 0) {
+      json_last_wifi_config = montaJsonWifi(wifi_ssid, wifi_password);
+      preferences.begin("portguard", false);
+      preferences.putString(chaveLastWifiConfigGravavel(), json_last_wifi_config);
+      preferences.end();
+      print_log("last_wifi_config preenchido com o Wi-Fi que ja estava salvo: " + wifi_ssid);
+    }
   } else {
     setup_finished = false;
     wifi_ssid = "";
@@ -2223,6 +2636,160 @@ void salvarConfigWifi() {
   Serial.println("WiFi persistido na Preferences.");
 }
 
+// Grava last_wifi_config só quando o SSID e a senha são de uma conexão que já deu certo.
+void salvaLastWifiConfig(const String &ssid, const String &senha) {
+  if (ssid.length() == 0 || senha.length() == 0) {
+    return;
+  }
+  String json = montaJsonWifi(ssid, senha);
+  if (json == json_last_wifi_config) {
+    return;
+  }
+  json_last_wifi_config = json;
+  preferences.begin("portguard", false);
+  size_t gravado = preferences.putString(chaveLastWifiConfigGravavel(), json);
+  preferences.end();
+  if (gravado == 0) {
+    print_log("ERRO: last_wifi_config nao foi gravado na Preferences.");
+    return;
+  }
+  print_log("Wi-Fi conectado. SSID salvo em last_wifi_config: " + ssid);
+}
+
+// SSID ao qual o rádio está associado agora. Vazio se não houver associação.
+// WiFi.SSID() não serve: em vários núcleos ele devolve a rede configurada, não a que está no ar.
+String ssidWifiAssociadoAgora() {
+  wifi_ap_record_t informacao_ponto_acesso;
+  if (esp_wifi_sta_get_ap_info(&informacao_ponto_acesso) != ESP_OK) {
+    return "";
+  }
+  return String(reinterpret_cast<const char *>(informacao_ponto_acesso.ssid));
+}
+
+// Copia do rádio a rede em que a placa está associada, antes de qualquer WiFi.begin da tentativa nova.
+void memorizaWifiAssociadoNoRadio() {
+  wifi_ap_record_t informacao_ponto_acesso;
+  if (esp_wifi_sta_get_ap_info(&informacao_ponto_acesso) != ESP_OK) {
+    return;
+  }
+  wifi_config_t configuracao_estacao;
+  if (esp_wifi_get_config(WIFI_IF_STA, &configuracao_estacao) != ESP_OK) {
+    return;
+  }
+
+  String ssid_associado = String(reinterpret_cast<const char *>(informacao_ponto_acesso.ssid));
+  String ssid_configurado = String(reinterpret_cast<const char *>(configuracao_estacao.sta.ssid));
+  String senha_configurada = String(reinterpret_cast<const char *>(configuracao_estacao.sta.password));
+  if (ssid_associado.length() == 0 || ssid_associado != ssid_configurado || senha_configurada.length() == 0) {
+    return;
+  }
+  salvaLastWifiConfig(ssid_configurado, senha_configurada);
+  if (wifi_ssid_ultimo_online == ssid_configurado && wifi_senha_ultimo_online == senha_configurada) {
+    return;
+  }
+
+  wifi_ssid_ultimo_online = ssid_configurado;
+  wifi_senha_ultimo_online = senha_configurada;
+  preferences.begin("portguard", false);
+  preferences.putString("wifi_ssid_ok", wifi_ssid_ultimo_online);
+  preferences.putString("wifi_senha_ok", wifi_senha_ultimo_online);
+  preferences.end();
+  print_log("Wi-Fi que esta online guardado antes da troca: " + wifi_ssid_ultimo_online);
+}
+
+// Guarda o SSID e a senha que de fato colocaram a placa online, separado da tentativa atual.
+void memorizaWifiQueDeixouOnline() {
+  if (wifi_ssid.length() == 0 || wifi_password.length() == 0) {
+    return;
+  }
+  salvaLastWifiConfig(wifi_ssid, wifi_password);
+  if (wifi_ssid_ultimo_online == wifi_ssid && wifi_senha_ultimo_online == wifi_password) {
+    return;
+  }
+
+  wifi_ssid_ultimo_online = wifi_ssid;
+  wifi_senha_ultimo_online = wifi_password;
+  preferences.begin("portguard", false);
+  preferences.putString("wifi_ssid_ok", wifi_ssid_ultimo_online);
+  preferences.putString("wifi_senha_ok", wifi_senha_ultimo_online);
+  preferences.end();
+  print_log("Ultimo Wi-Fi que deixou a placa online memorizado: " + wifi_ssid_ultimo_online);
+}
+
+// A credencial nova só pode ser gravada quando o rádio já está associado a esse SSID.
+// Enquanto a placa ainda está no Wi-Fi anterior, a senha nova não substitui a que funciona.
+bool credencialWifiRecebidaJaEstaConectada(bool credenciais_novas_pendentes, const String &ssid_recebido,
+                                           const String &ssid_associado) {
+  if (!credenciais_novas_pendentes) {
+    return true;
+  }
+  return ssid_associado.length() > 0 && ssid_associado == ssid_recebido;
+}
+
+// A tentativa vinda do aplicativo encerra aos 2 minutos se o rádio não associou no SSID novo.
+bool deveEncerrarTentativaWifiNova(unsigned long agora, unsigned long momento_inicio_tentativa,
+                                   bool credenciais_novas_pendentes, bool conectado_no_ssid_novo) {
+  if (!credenciais_novas_pendentes || momento_inicio_tentativa == 0 || conectado_no_ssid_novo) {
+    return false;
+  }
+  return agora - momento_inicio_tentativa >= tempo_sem_wifi_para_restaurar_ultimo_online_ms;
+}
+
+// A configuração nova só atualiza last_wifi_config depois de associar no SSID recebido.
+bool configuracaoWifiConectou(bool credenciais_pendentes, bool passou_pela_desconexao, bool associado_ao_ssid_novo) {
+  return credenciais_pendentes && passou_pela_desconexao && associado_ao_ssid_novo;
+}
+
+// Depois de 2 minutos sem Wi-Fi, volta para o último que deixou a placa online
+// quando a credencial em uso é outra, ainda está em teste ou já foi rejeitada.
+bool deveRestaurarWifiUltimoOnline(unsigned long agora, unsigned long momento_perda, bool wifi_esta_conectado,
+                                   bool tem_ultimo_wifi_online, bool credencial_atual_e_a_ultima_online,
+                                   bool credenciais_novas_pendentes, bool configuracao_nova_falhou) {
+  if (wifi_esta_conectado || !tem_ultimo_wifi_online || momento_perda == 0) {
+    return false;
+  }
+  if (agora - momento_perda < tempo_sem_wifi_para_restaurar_ultimo_online_ms) {
+    return false;
+  }
+  if (credencial_atual_e_a_ultima_online && !credenciais_novas_pendentes && !configuracao_nova_falhou) {
+    return false;
+  }
+  return true;
+}
+
+// Coloca em uso o último Wi-Fi online e marca a config_plaque que não conectou para a fila receber failed.
+bool aplicaCredencialWifiUltimoOnline() {
+  if (wifi_ssid_ultimo_online.length() == 0 || wifi_senha_ultimo_online.length() == 0) {
+    return false;
+  }
+
+  long queue_id_da_tentativa = queueIdPendente;
+  if (wifiCredenciaisPendentes) {
+    wifiSsidRejeitado = wifi_ssid;
+    wifiPasswordRejeitado = wifi_password;
+  }
+
+  wifi_ssid = wifi_ssid_ultimo_online;
+  wifi_password = wifi_senha_ultimo_online;
+  setup_finished = true;
+  wifiCredenciaisPendentes = false;
+  wifiConfigFalhou = false;
+  queueIdPendente = 0;
+  momentoInicioConfigWifi = 0;
+  ultimaTentativaWifi = 0;
+  wifi_persistido_ja_iniciado = false;
+  momento_perda_wifi = 0;
+  tentativa_wifi_nova_passou_pela_desconexao = false;
+
+  if (queue_id_da_tentativa > 0) {
+    ultimoQueueIdNotificado = queue_id_da_tentativa;
+    queue_id_ultimo_status_respondido = queue_id_da_tentativa;
+    ultimo_status_respondido_fila = "failed";
+    momento_ultimo_envio_status_fila = 0;
+  }
+  return true;
+}
+
 void limparConfigWifi() {
   wifi_ssid = "";
   wifi_password = "";
@@ -2235,8 +2802,18 @@ void limparConfigWifi() {
   wifiSsidRejeitado = "";
   wifiPasswordRejeitado = "";
   wifi_persistido_ja_iniciado = false;
+  wifi_ssid_ultimo_online = "";
+  wifi_senha_ultimo_online = "";
+  momento_perda_wifi = 0;
+  tentativa_wifi_nova_passou_pela_desconexao = false;
 
   salvarConfigWifi();
+  preferences.begin("portguard", false);
+  preferences.putString("wifi_ssid_ok", "");
+  preferences.putString("wifi_senha_ok", "");
+  preferences.putString(chaveLastWifiConfigGravavel(), "");
+  preferences.end();
+  json_last_wifi_config = "";
 
   // disconnect(true) desliga o rádio com WiFi.mode(WIFI_OFF) e derruba o W5500.
   if (ethIniciado) {
@@ -2484,11 +3061,16 @@ bool postHttpNoMeio(bool usarWifi, const char *destino, const String &url, const
     return false;
   }
 
+  requisicao_http_obteve_resposta = true;
+
   String payload = http.getString();
   http.end();
   httpsClient.stop();
 
   if (httpCode != HTTP_CODE_OK && httpCode != HTTP_CODE_CREATED) {
+    if (payloadOut != nullptr) {
+      *payloadOut = payload;
+    }
     imprimirStatusRequisicao(false, String("HTTP ") + String(httpCode));
     Serial.print("Resposta: ");
     Serial.println(payload);
@@ -2512,6 +3094,7 @@ bool executarPostHttp(const char *destino, const String &url, const String &body
   if (tipo_conteudo == nullptr || tipo_conteudo[0] == '\0') {
     tipo_conteudo = "application/x-www-form-urlencoded";
   }
+  requisicao_http_obteve_resposta = false;
   bool tentarWifi = deveTentarWifiAntesDoCabo();
 
   if (tentarWifi) {
@@ -2567,9 +3150,30 @@ String textoFalhaSensorFimDeCurso(uint8_t numero_portao) {
   return "Falha de leitura no sensor de fim de curso do portão " + String(numero_portao);
 }
 
-// JSON do event_data do gate_timeout_open: {"port": N}.
+// JSON do event_data do gate_not_closed: {"port": N}.
 String montaEventDataPortaoAbertoSemFechar(uint8_t numero_portao) {
   return "{\"port\": " + String(numero_portao) + "}";
+}
+
+// JSON do event_data de gate_open e gate_close. Com controle: {"port":1, "button_id": "1214212121"}.
+// Com open_or_close_gate: {"port":1, "user_id": "42"}. Sem os dois permanece {"port":N}.
+String montaEventDataAberturaFechamentoPortao(uint8_t numero_portao, const char *identificador_controle = nullptr,
+                                              const char *identificador_usuario = nullptr) {
+  String event_data = "{\"port\":" + String(numero_portao);
+  if (identificador_controle != nullptr && identificador_controle[0] != '\0') {
+    String identificador = identificador_controle;
+    identificador.replace("\\", "\\\\");
+    identificador.replace("\"", "\\\"");
+    event_data += ", \"button_id\": \"" + identificador + "\"";
+  }
+  if (identificador_usuario != nullptr && identificador_usuario[0] != '\0') {
+    String identificador = identificador_usuario;
+    identificador.replace("\\", "\\\\");
+    identificador.replace("\"", "\\\"");
+    event_data += ", \"user_id\": \"" + identificador + "\"";
+  }
+  event_data += "}";
+  return event_data;
 }
 
 // Codifica um texto para o corpo application/x-www-form-urlencoded.
@@ -2592,11 +3196,17 @@ String codificaTextoParaUrl(const String &texto) {
   return codificado;
 }
 
-bool enviarEventoLog(const char *eventType, uint8_t numero_portao) {
+bool enviarEventoLog(const char *eventType, uint8_t numero_portao, const char *identificador_controle,
+                     const char *dados_evento, const char *titulo_evento, const char *identificador_usuario) {
   // Evento de um portão em manutenção é descartado. Heartbeat (sem portão) continua sendo enviado.
   if (numero_portao > 0 && portaoEmManutencao(numero_portao)) {
     print_log("Portao " + String(numero_portao) + " em manutencao: evento " + String(eventType) +
               " nao enviado para a API.");
+    return true;
+  }
+
+  if (serial_placa.length() == 0) {
+    print_log("Sem serial em serial_portguard: evento " + String(eventType) + " nao enviado.");
     return true;
   }
 
@@ -2608,26 +3218,37 @@ bool enviarEventoLog(const char *eventType, uint8_t numero_portao) {
     return true;
   }
 
-  String url = api_url + "/plaque-events-logs/save";
-  String body = "internal_token=" + api_token
-                + "&serial=" + plaque_serial
-                + "&event_type=" + String(eventType);
-
-  // Falha do sensor vai como texto, com o número do portão, para a notificação do sistema.
-  // gate_timeout_open leva o título de portão aberto por mais de 2 minutos e event_data {"port": N}.
-  // Os demais eventos de portão seguem event_data = {"port":N}.
-  if (strcmp(eventType, "plaque_problem") == 0 && numero_portao > 0) {
-    String texto_falha = textoFalhaSensorFimDeCurso(numero_portao);
-    body += "&event_title=" + codificaTextoParaUrl("Possivel defeito na placa");
-    body += "&event_data=" + codificaTextoParaUrl(texto_falha);
+  String dados_evento_texto = "";
+  String titulo_evento_texto = "";
+  if (dados_evento != nullptr && dados_evento[0] != '\0') {
+    dados_evento_texto = dados_evento;
+    if (titulo_evento != nullptr && titulo_evento[0] != '\0') {
+      titulo_evento_texto = titulo_evento;
+    }
+  } else if (strcmp(eventType, "plaque_problem") == 0 && numero_portao > 0) {
+    dados_evento_texto = textoFalhaSensorFimDeCurso(numero_portao);
+    titulo_evento_texto = "Possivel defeito na placa";
   } else if (strcmp(eventType, tipo_evento_portao_aberto_sem_fechar) == 0 && numero_portao > 0) {
-    String event_data = montaEventDataPortaoAbertoSemFechar(numero_portao);
-    body += "&event_title=" + codificaTextoParaUrl(titulo_aviso_portao_aberto_sem_fechar);
-    body += "&event_data=" + codificaTextoParaUrl(event_data);
-    print_log("Requisicao gate_timeout_open do portao " + String(numero_portao) + ": titulo \"" +
-              String(titulo_aviso_portao_aberto_sem_fechar) + "\", event_data " + event_data + ".");
+    dados_evento_texto = montaEventDataPortaoAbertoSemFechar(numero_portao);
+    titulo_evento_texto = titulo_aviso_portao_aberto_sem_fechar;
+    print_log("Requisicao gate_not_closed do portao " + String(numero_portao) + ": titulo \"" +
+              String(titulo_aviso_portao_aberto_sem_fechar) + "\", event_data " + dados_evento_texto + ".");
+  } else if ((strcmp(eventType, "gate_open") == 0 || strcmp(eventType, "gate_close") == 0) && numero_portao > 0) {
+    dados_evento_texto = montaEventDataAberturaFechamentoPortao(numero_portao, identificador_controle,
+                                                                identificador_usuario);
+    print_log("Requisicao " + String(eventType) + " do portao " + String(numero_portao) + ": event_data " +
+              dados_evento_texto + ".");
   } else if (numero_portao > 0) {
-    body += "&event_data=%7B%22port%22%3A" + String(numero_portao) + "%7D";
+    dados_evento_texto = "{\"port\":" + String(numero_portao) + "}";
+  }
+
+  String url = api_url + "/plaque-events-logs/save";
+  String body = "internal_token=" + api_token + "&serial=" + serial_placa + "&event_type=" + String(eventType);
+  if (titulo_evento_texto.length() > 0) {
+    body += "&event_title=" + codificaTextoParaUrl(titulo_evento_texto);
+  }
+  if (dados_evento_texto.length() > 0) {
+    body += "&event_data=" + codificaTextoParaUrl(dados_evento_texto);
   }
 
   Serial.println("-------- DEBUG EVENT LOG --------");
@@ -2637,7 +3258,18 @@ bool enviarEventoLog(const char *eventType, uint8_t numero_portao) {
     print_log("Portao: " + String(numero_portao));
   }
 
-  bool ok = executarPostHttp("/plaque-events-logs/save", url, body, 10000, nullptr);
+  bool sem_rede = !redeProntaParaApi();
+  bool ok = false;
+  if (!sem_rede) {
+    String corpo_envio = anexaTipoConexaoAoCorpo(body, tipoConexaoAtivaParaLog());
+    ok = executarPostHttp("/plaque-events-logs/save", url, corpo_envio, 10000, nullptr);
+  }
+  bool falta_internet = sem_rede || (!ok && !requisicao_http_obteve_resposta);
+  if (!ok && falta_internet) {
+    guardaLogEventoNaFilaLocal(eventType, dados_evento_texto, titulo_evento_texto);
+    Serial.println("--------------------------------");
+    return strcmp(eventType, "heartbeat") == 0 ? false : true;
+  }
   if (ok && evento_gate_broken) {
     gate_broken_ja_enviado = true;
     momento_ultimo_gate_broken_enviado = millis();
@@ -2647,9 +3279,14 @@ bool enviarEventoLog(const char *eventType, uint8_t numero_portao) {
 }
 
 bool chamarApiListagem(String *payloadOut) {
+  if (serial_placa.length() == 0) {
+    print_log("Sem serial em serial_portguard: consulta da fila nao realizada.");
+    return false;
+  }
+
   String url = api_url + "/plaque-queues-actions/list";
   String body = "internal_token=" + api_token
-                + "&serial=" + plaque_serial
+                + "&serial=" + serial_placa
                 + "&limit=1";
 
   // Consultada a cada meio segundo: só erros aparecem no log da requisição.
@@ -3476,9 +4113,17 @@ uint8_t consomeComandoBotaoControle(char *identificador_botao, char *numero_port
   return numero_portao;
 }
 
+// Diz se o comando da receptora ou do aplicativo deve gerar o alerta do app e do WhatsApp.
+// O botão cadastrado já enfileira o próprio log; intertravamento e manutenção não alertam.
+bool deveEnfileirarAlertaComandoConvencional(bool comando_convencional, bool comando_executado, bool comando_veio_de_botao,
+                                             bool portao_em_manutencao) {
+  return comando_convencional && comando_executado && !comando_veio_de_botao && !portao_em_manutencao;
+}
+
 // Coloca na fila do loop o log de abertura ou fechamento feito pelo pulso do controle.
+// tipo_evento, quando informado, substitui gate_open/gate_close (usado pelo alerta de portão aberto).
 void enfileiraLogPulsoBotaoControle(const char *identificador_botao, const char *numero_portao_texto,
-                                    bool comando_de_abertura) {
+                                    bool comando_de_abertura, const char *tipo_evento) {
   if (fila_logs_pulsos_botoes_controle == nullptr) {
     print_log("ERRO: fila de logs de botoes de controle nao criada. Log descartado.");
     return;
@@ -3491,7 +4136,11 @@ void enfileiraLogPulsoBotaoControle(const char *identificador_botao, const char 
   if (numero_portao_texto != nullptr) {
     strncpy(log_pulso.numero_portao, numero_portao_texto, tamanho_numero_portao_botao_controle - 1);
   }
-  strncpy(log_pulso.tipo_evento, comando_de_abertura ? "gate_open" : "gate_close", sizeof(log_pulso.tipo_evento) - 1);
+  const char *tipo_enfileirado = comando_de_abertura ? "gate_open" : "gate_close";
+  if (tipo_evento != nullptr && tipo_evento[0] != '\0') {
+    tipo_enfileirado = tipo_evento;
+  }
+  strncpy(log_pulso.tipo_evento, tipo_enfileirado, sizeof(log_pulso.tipo_evento) - 1);
   if (xQueueSend(fila_logs_pulsos_botoes_controle, &log_pulso, 0) != pdTRUE) {
     print_log("ERRO: fila de logs de botoes de controle cheia. Log descartado.");
   }
@@ -3500,7 +4149,7 @@ void enfileiraLogPulsoBotaoControle(const char *identificador_botao, const char 
 // JSON do cadastro ou do reset. A placa não tem login_hash: identifica a placa pelo serial_id.
 String montaCorpoJsonBotaoControle(const String &identificador, bool resetar) {
   String token = api_token;
-  String serial = plaque_serial;
+  String serial = serial_placa;
   token.replace("\\", "\\\\");
   token.replace("\"", "\\\"");
   serial.replace("\\", "\\\\");
@@ -3530,13 +4179,16 @@ String montaCorpoResetBotaoControle(const String &identificador) {
 
 // Corpo do log de abertura/fechamento por pulso de controle, com button_id e port_number do objeto encontrado.
 String montaCorpoLogPulsoBotaoControle(const char *tipo_evento, const char *identificador, const char *numero_portao) {
-  return "internal_token=" + api_token + "&serial=" + codificaTextoParaUrl(plaque_serial) +
-         "&serial_id=" + codificaTextoParaUrl(plaque_serial) + "&event_type=" + String(tipo_evento) +
+  return "internal_token=" + api_token + "&serial=" + codificaTextoParaUrl(serial_placa) +
+         "&serial_id=" + codificaTextoParaUrl(serial_placa) + "&event_type=" + String(tipo_evento) +
          "&button_id=" + codificaTextoParaUrl(identificador) + "&port_number=" + codificaTextoParaUrl(numero_portao);
 }
 
 // Envia cadastro ou reset pendente. Sem confirmação da API, repete a cada 5 s até o servidor aceitar.
 void enviaCadastrosBotoesControlePendentes() {
+  if (serial_placa.length() == 0) {
+    return;
+  }
   if (momento_proxima_tentativa_envio_cadastro_botao_controle != 0 &&
       (long)(millis() - momento_proxima_tentativa_envio_cadastro_botao_controle) < 0) {
     return;
@@ -3606,23 +4258,123 @@ void enviaCadastrosBotoesControlePendentes() {
   }
 }
 
-// Envia os logs de pulso que a tarefa dos portões enfileirou. Se a rede falhar, devolve o item para a fila.
+// Envia um item da fila local. connection_type é o meio que está no ar neste envio.
+bool enviaItemFilaLogLocal(const String &objeto) {
+  requisicao_http_obteve_resposta = false;
+  String tipo_evento = extraiCampoJsonSimples(objeto, "event_type");
+  String identificador_botao = extraiCampoJsonSimples(objeto, "button_id");
+  String numero_portao = extraiCampoJsonSimples(objeto, "port_number");
+  const char *tipo_conexao = tipoConexaoAtivaParaLog();
+  if (tipo_evento.length() == 0 || tipo_conexao[0] == '\0') {
+    return false;
+  }
+
+  if (extraiCampoJsonSimples(objeto, "origem") == "app") {
+    String url = api_url_aplicativo + rota_log_pulso_botao_controle;
+    String corpo = anexaTipoConexaoAoCorpo(
+        montaCorpoLogPulsoBotaoControle(tipo_evento.c_str(), identificador_botao.c_str(), numero_portao.c_str()),
+        tipo_conexao);
+    return executarPostHttp(rota_log_pulso_botao_controle, url, corpo, 10000, nullptr);
+  }
+
+  String url = api_url + "/plaque-events-logs/save";
+  String titulo = extraiCampoJsonSimples(objeto, "event_title");
+  String dados = extraiCampoJsonSimples(objeto, "event_data");
+  String corpo = "internal_token=" + api_token + "&serial=" + serial_placa + "&event_type=" + tipo_evento;
+  if (titulo.length() > 0) {
+    corpo += "&event_title=" + codificaTextoParaUrl(titulo);
+  }
+  if (dados.length() > 0) {
+    corpo += "&event_data=" + codificaTextoParaUrl(dados);
+  }
+  corpo = anexaTipoConexaoAoCorpo(corpo, tipo_conexao);
+  return executarPostHttp("/plaque-events-logs/save", url, corpo, 10000, nullptr);
+}
+
+// Envia a fila local e, se tudo sair, apaga queue_logs. Sem internet, conserva o que ainda não saiu.
+void enviaFilaLocalDeLogs() {
+  if (fila_logs_local.length() < 3 || !redeProntaParaApi() || serial_placa.length() == 0) {
+    return;
+  }
+
+  String restante = fila_logs_local;
+  bool interrompido_sem_internet = false;
+  while (restante.indexOf('{') >= 0) {
+    int inicio = restante.indexOf('{');
+    int fim = indiceFimObjetoJson(restante, inicio);
+    if (fim < 0) {
+      restante = "[]";
+      break;
+    }
+    String objeto = restante.substring(inicio, fim + 1);
+    bool enviou = enviaItemFilaLogLocal(objeto);
+    if (!enviou && !requisicao_http_obteve_resposta) {
+      interrompido_sem_internet = true;
+      break;
+    }
+    if (!enviou) {
+      print_log("Log da fila local recusado pela API e removido de queue_logs.");
+    }
+    int depois = fim + 1;
+    while (depois < (int)restante.length() && (restante[depois] == ',' || restante[depois] == ' ')) {
+      depois++;
+    }
+    restante = "[" + restante.substring(depois);
+    if (!restante.endsWith("]")) {
+      restante += "]";
+    }
+  }
+
+  if (restante.length() < 2) {
+    restante = "[]";
+  }
+  if (restante != fila_logs_local) {
+    fila_logs_local = restante;
+    gravaFilaLogsLocal();
+  }
+  if (!interrompido_sem_internet && fila_logs_local == "[]") {
+    print_log("Fila local de logs enviada e queue_logs limpa.");
+  }
+}
+
+// Envia os logs de pulso que a tarefa dos portões enfileirou. Sem internet, o log vai para queue_logs.
 void enviaLogsPulsosBotoesControle() {
-  if (fila_logs_pulsos_botoes_controle == nullptr || !redeProntaParaApi()) {
+  if (serial_placa.length() == 0 || fila_logs_pulsos_botoes_controle == nullptr) {
     return;
   }
 
   LogPulsoBotaoControle log_pulso;
+  if (!redeProntaParaApi()) {
+    while (xQueueReceive(fila_logs_pulsos_botoes_controle, &log_pulso, 0) == pdTRUE) {
+      guardaLogAplicativoNaFilaLocal(log_pulso.tipo_evento, log_pulso.identificador_botao, log_pulso.numero_portao);
+    }
+    return;
+  }
+
   while (xQueueReceive(fila_logs_pulsos_botoes_controle, &log_pulso, 0) == pdTRUE) {
     String url = api_url_aplicativo + rota_log_pulso_botao_controle;
-    String corpo = montaCorpoLogPulsoBotaoControle(log_pulso.tipo_evento, log_pulso.identificador_botao, log_pulso.numero_portao);
+    String corpo = anexaTipoConexaoAoCorpo(
+        montaCorpoLogPulsoBotaoControle(log_pulso.tipo_evento, log_pulso.identificador_botao, log_pulso.numero_portao),
+        tipoConexaoAtivaParaLog());
     if (!executarPostHttp(rota_log_pulso_botao_controle, url, corpo, 10000, nullptr)) {
+      if (!requisicao_http_obteve_resposta) {
+        guardaLogAplicativoNaFilaLocal(log_pulso.tipo_evento, log_pulso.identificador_botao, log_pulso.numero_portao);
+        while (xQueueReceive(fila_logs_pulsos_botoes_controle, &log_pulso, 0) == pdTRUE) {
+          guardaLogAplicativoNaFilaLocal(log_pulso.tipo_evento, log_pulso.identificador_botao, log_pulso.numero_portao);
+        }
+        return;
+      }
       print_log("ERRO: log de pulso do botao " + String(log_pulso.identificador_botao) + " nao foi enviado.");
       xQueueSendToFront(fila_logs_pulsos_botoes_controle, &log_pulso, 0);
       return;
     }
-    print_log("Log de " + String(log_pulso.tipo_evento) + " do botao " + String(log_pulso.identificador_botao) +
-              " no portao " + String(log_pulso.numero_portao) + " enviado.");
+    if (strcmp(log_pulso.identificador_botao, "0") == 0) {
+      print_log("Log de " + String(log_pulso.tipo_evento) + " do comando convencional no portao " +
+                String(log_pulso.numero_portao) + " enviado ao aplicativo.");
+    } else {
+      print_log("Log de " + String(log_pulso.tipo_evento) + " do botao " + String(log_pulso.identificador_botao) +
+                " no portao " + String(log_pulso.numero_portao) + " enviado.");
+    }
   }
 }
 
@@ -3840,15 +4592,29 @@ bool processarAtualizacaoBotaoControle(long queue_id, const String &payload) {
   return evento_completo;
 }
 
+// Lê o user_id da ação da fila. Aceita número (1) ou texto ("1").
+String extraiIdentificadorUsuarioDaAcao(const String &payload) {
+  String identificador_usuario = extrairValorJsonNumero(payload, "user_id");
+  if (identificador_usuario.length() == 0) {
+    identificador_usuario = extrairValorJsonString(payload, "user_id");
+  }
+  return identificador_usuario;
+}
+
 // Trata a ação open_or_close_gate da fila: envia o comando para a tarefa dos portões (mesmo efeito da
 // receptora: abre com autorização se o portão estiver fechado, fecha se estiver aberto, respeitando o
 // intertravamento) e responde a fila com completed ou failed. O queue_id é marcado como processado antes de
 // acionar o portão para que uma falha ao responder a API nunca faça o mesmo comando ser executado de novo.
+// O user_id da ação fica guardado até o sensor gerar o gate_open ou o gate_close.
 bool processarAbrirOuFecharPortao(long queue_id, const String &payload) {
   uint8_t numero_portao = extraiNumeroPortaoDoActionData(payload);
+  String identificador_usuario = extraiIdentificadorUsuarioDaAcao(payload);
   print_log("");
   print_log("Evento open_or_close_gate recebido. Portao solicitado: " +
             (numero_portao > 0 ? String(numero_portao) : String("invalido")));
+  if (identificador_usuario.length() > 0) {
+    print_log("user_id do open_or_close_gate: " + identificador_usuario);
+  }
 
   if (queue_id <= 0) {
     print_log("open_or_close_gate sem queue_id: comando nao executado para evitar acionamentos repetidos.");
@@ -3862,6 +4628,10 @@ bool processarAbrirOuFecharPortao(long queue_id, const String &payload) {
     atualizarStatusFila(queue_id, "failed");
     return false;
   }
+
+  strncpy(identificador_usuario_comando_remoto, identificador_usuario.c_str(),
+          sizeof(identificador_usuario_comando_remoto) - 1);
+  identificador_usuario_comando_remoto[sizeof(identificador_usuario_comando_remoto) - 1] = '\0';
 
   bool comando_executado = false;
   if (!enviaComandoRemotoParaTarefaPortoes(numero_portao, comando_executado)) {
@@ -4051,12 +4821,26 @@ bool buscarConfigWifiNaApi() {
   Serial.print("SSID: ");
   Serial.println(ssid);
 
+  memorizaWifiAssociadoNoRadio();
+  if (wifi_ssid_ultimo_online.length() == 0 && wifi_ssid.length() > 0 && wifi_password.length() > 0 &&
+      ssidWifiAssociadoAgora() == wifi_ssid) {
+    memorizaWifiQueDeixouOnline();
+  }
+  if (wifi_ssid_ultimo_online.length() > 0) {
+    print_log("Se o Wi-Fi novo nao conectar em 2 minutos, a placa volta para " + wifi_ssid_ultimo_online + ".");
+  } else {
+    print_log("Nenhum Wi-Fi online foi guardado antes desta troca.");
+  }
+
   wifi_ssid = ssid;
   wifi_password = password;
   wifiCredenciaisPendentes = true;
   wifiConfigFalhou = false;
   momentoInicioConfigWifi = millis();
+  momento_perda_wifi = 0;
   ultimaTentativaWifi = 0;
+  wifi_persistido_ja_iniciado = false;
+  tentativa_wifi_nova_passou_pela_desconexao = true;
   // O cabo confirma a configuração na hora. A tentativa de Wi-Fi continua e, se conectar, segue persistida.
   confirmaConfiguracaoPeloCabo(queueId);
   queueIdPendente = queueId;
@@ -4169,7 +4953,7 @@ void conectarWifi() {
     return;
   }
 
-  if (wifiConectado()) {
+  if (wifiConectado() && ssidWifiAssociadoAgora() == wifi_ssid) {
     wifi_persistido_ja_iniciado = true;
     configuraEstabilidadeWifiEsp32S3();
     Network.setDefaultInterface(WiFi.STA);
@@ -4177,24 +4961,9 @@ void conectarWifi() {
     return;
   }
 
-  /*
-    Credenciais recém recebidas da API: uma única tentativa.
-    Se falhar, marca a queue como error e não tenta de novo.
-  */
+  // Credencial nova do aplicativo: um begin com o SSID e a senha recebidos. A volta aos 2 minutos é de verificarRede.
   if (wifiCredenciaisPendentes) {
-    if (ultimaTentativaWifi != 0) {
-      wl_status_t statusWifi = WiFi.status();
-      bool erroWifi = statusWifi == WL_CONNECT_FAILED ||
-                      statusWifi == WL_NO_SSID_AVAIL;
-      bool timeoutWifi = momentoInicioConfigWifi > 0 &&
-                         millis() - momentoInicioConfigWifi >= TIMEOUT_CONFIG_WIFI_MS;
-
-      if (erroWifi || timeoutWifi) {
-        Serial.println();
-        Serial.print("WiFi nao conectou. status=");
-        Serial.println(statusWifiTexto());
-        falharConfigWifiRecebida();
-      }
+    if (wifi_persistido_ja_iniciado) {
       return;
     }
 
@@ -4204,10 +4973,10 @@ void conectarWifi() {
     }
 
     Serial.println();
-    Serial.print("Tentativa UNICA de WiFi (queue): ");
+    Serial.print("Tentando WiFi recebido do aplicativo: ");
     Serial.println(wifi_ssid);
 
-    wifi_persistido_ja_iniciado = false;
+    wifi_persistido_ja_iniciado = true;
     WiFi.mode(WIFI_STA);
     WiFi.persistent(false);
     WiFi.setSleep(false);
@@ -4230,6 +4999,8 @@ void conectarWifi() {
 
     WiFi.mode(WIFI_STA);
     configuraEstabilidadeWifiEsp32S3();
+    WiFi.disconnect(false, false);
+    delay(100);
     WiFi.begin(wifi_ssid.c_str(), wifi_password.c_str());
     preferirCaboSeWifiCaiu();
     return;
@@ -4246,8 +5017,235 @@ void conectarWifi() {
 }
 
 // ============================================================
+// SERIAL DA PLACA (Preferences serial_portguard)
+// ============================================================
+
+// A ESP32 recusa chave de Preferences com mais de 15 caracteres. "serial_portguard" tem 16.
+const char *chaveSerialPortguardGravavel() {
+  if (strlen(chave_serial_portguard) <= 15) {
+    return chave_serial_portguard;
+  }
+  return chave_serial_portguard_nvs;
+}
+
+// Diz se a Preferences já entregou um serial para esta placa.
+bool serialPortguardConfigurado() {
+  return serial_placa.length() > 0;
+}
+
+// Lê o serial gravado. Vazio significa que a placa ainda não foi instalada.
+void carregaSerialPortguard() {
+  if (!preferences.begin("portguard", true)) {
+    serial_placa = "";
+    print_log("ERRO: nao foi possivel ler o serial da Preferences.");
+    return;
+  }
+  serial_placa = preferences.getString(chaveSerialPortguardGravavel(), "");
+  preferences.end();
+  serial_placa.trim();
+  if (serialPortguardConfigurado()) {
+    print_log("Serial carregado da Preferences: " + serial_placa);
+  } else {
+    print_log("Preferences sem serial. A placa vai consultar /plaque-install/waiting.");
+  }
+}
+
+// Grava o serial e só aceita se a leitura devolver o mesmo texto.
+bool salvaSerialPortguard(const String &serial) {
+  String serial_limpo = serial;
+  serial_limpo.trim();
+  if (serial_limpo.length() == 0 || serial_limpo.indexOf('"') >= 0 || serial_limpo.indexOf('\\') >= 0) {
+    print_log("ERRO: serial de instalacao vazio ou invalido.");
+    return false;
+  }
+  if (!preferences.begin("portguard", false)) {
+    print_log("ERRO: nao foi possivel abrir Preferences para gravar o serial.");
+    return false;
+  }
+  const char *chave = chaveSerialPortguardGravavel();
+  size_t tamanho_gravado = preferences.putString(chave, serial_limpo);
+  String serial_lido = preferences.getString(chave, "");
+  preferences.end();
+  if (tamanho_gravado == 0 || serial_lido != serial_limpo) {
+    print_log("ERRO: o serial nao foi gravado na Preferences.");
+    return false;
+  }
+  serial_placa = serial_limpo;
+  print_log("Serial configurado em preferences: " + serial_placa);
+  return true;
+}
+
+// Lê o serial da resposta de /plaque-install/waiting. Lista vazia devolve texto vazio.
+String extraiSerialInstalacaoDaResposta(const String &payload) {
+  const String campo_serial = "\"serial\"";
+  int inicio = payload.indexOf(campo_serial);
+  if (inicio < 0) {
+    return "";
+  }
+  inicio += campo_serial.length();
+  int tamanho = payload.length();
+  while (inicio < tamanho && (payload[inicio] == ' ' || payload[inicio] == '\n' || payload[inicio] == '\r' ||
+                              payload[inicio] == '\t')) {
+    inicio++;
+  }
+  if (inicio >= tamanho || payload[inicio] != ':') {
+    return "";
+  }
+  inicio++;
+  while (inicio < tamanho && (payload[inicio] == ' ' || payload[inicio] == '\n' || payload[inicio] == '\r' ||
+                              payload[inicio] == '\t')) {
+    inicio++;
+  }
+  if (inicio >= tamanho || payload[inicio] != '"') {
+    return "";
+  }
+  inicio++;
+  int fim = inicio;
+  while (fim < tamanho && payload[fim] != '"') {
+    fim++;
+  }
+  String serial = payload.substring(inicio, fim);
+  serial.trim();
+  return serial;
+}
+
+// JSON enviado em /plaque-install/complete com o token da API e o serial encontrado.
+String montaCorpoConclusaoInstalacaoPlaca(const String &serial) {
+  String token = api_token;
+  String serial_limpo = serial;
+  token.replace("\\", "\\\\");
+  token.replace("\"", "\\\"");
+  serial_limpo.replace("\\", "\\\\");
+  serial_limpo.replace("\"", "\\\"");
+  return "{\"internal_token\":\"" + token + "\",\"serial_id\":\"" + serial_limpo + "\"}";
+}
+
+// Sem serial, consulta /plaque-install/waiting a cada 5 s. Com serial na resposta, grava e confirma a instalação.
+void consultaInstalacaoPlaca() {
+  if (serialPortguardConfigurado() && !conclusao_instalacao_placa_pendente) {
+    return;
+  }
+  unsigned long agora = millis();
+  if (momento_proxima_consulta_instalacao_placa != 0 &&
+      (long)(agora - momento_proxima_consulta_instalacao_placa) < 0) {
+    return;
+  }
+
+  if (!redeProntaParaApi()) {
+    print_log("Verificando se existe serial disponível...");
+    print_log("Sem conexao com a internet. Tentando novamente em 5 segundos...");
+    momento_proxima_consulta_instalacao_placa = millis() + intervalo_consulta_instalacao_placa_ms;
+    return;
+  }
+
+  if (!serialPortguardConfigurado()) {
+    String url = api_url + "/plaque-install/waiting";
+    String corpo = "internal_token=" + codificaTextoParaUrl(api_token);
+    String resposta;
+    print_log("Verificando se existe serial disponível...");
+    bool consultou = executarPostHttp("/plaque-install/waiting", url, corpo, 10000, &resposta);
+    print_log(resposta.length() > 0 ? resposta : "(sem resposta)");
+    momento_proxima_consulta_instalacao_placa = millis() + intervalo_consulta_instalacao_placa_ms;
+    String serial_encontrado = consultou ? extraiSerialInstalacaoDaResposta(resposta) : "";
+    if (serial_encontrado.length() == 0) {
+      print_log("Nenhum serial disponível encontrado, tentando novamente em 5 segundos...");
+      return;
+    }
+    print_log("Serial encontrado: " + serial_encontrado);
+    if (!salvaSerialPortguard(serial_encontrado)) {
+      print_log("Falha ao gravar o serial na Preferences. Tentando novamente em 5 segundos...");
+      return;
+    }
+    conclusao_instalacao_placa_pendente = true;
+  }
+
+  if (conclusao_instalacao_placa_pendente) {
+    String url = api_url + "/plaque-install/complete";
+    String corpo = montaCorpoConclusaoInstalacaoPlaca(serial_placa);
+    String resposta;
+    bool confirmou = executarPostHttp("/plaque-install/complete", url, corpo, 10000, &resposta, tipo_conteudo_json);
+    momento_proxima_consulta_instalacao_placa = millis() + intervalo_consulta_instalacao_placa_ms;
+    if (!confirmou) {
+      print_log(resposta.length() > 0 ? resposta : "(sem resposta)");
+      print_log("Falha ao completar a instalacao. Tentando novamente em 5 segundos...");
+      return;
+    }
+    conclusao_instalacao_placa_pendente = false;
+    print_log("Instalação completa");
+    print_log(resposta.length() > 0 ? resposta : "(sem resposta)");
+  }
+}
+
+// ============================================================
 // GERENCIAMENTO DAS REDES
 // ============================================================
+
+// Volta SSID e senha para o último Wi-Fi que deixou a placa online e inicia a conexão.
+void restauraWifiQueDeixouOnline() {
+  if (!aplicaCredencialWifiUltimoOnline()) {
+    return;
+  }
+
+  print_log("2 minutos sem o Wi-Fi novo. Reconectando ao ultimo Wi-Fi que deixou a placa online, sem cabo: " +
+            wifi_ssid);
+  salvarConfigWifi();
+  conectarWifi();
+}
+
+// Volta para o Wi-Fi gravado em last_wifi_config e marca a configuração que não conectou como failed.
+bool restauraWifiDaLastWifiConfig() {
+  String ssid = "";
+  String senha = "";
+  if (!extraiJsonWifi(json_last_wifi_config, ssid, senha)) {
+    return false;
+  }
+
+  long queue_id_da_tentativa = queueIdPendente;
+  if (wifiCredenciaisPendentes) {
+    wifiSsidRejeitado = wifi_ssid;
+    wifiPasswordRejeitado = wifi_password;
+  }
+
+  wifi_ssid = ssid;
+  wifi_password = senha;
+  wifi_ssid_ultimo_online = ssid;
+  wifi_senha_ultimo_online = senha;
+  setup_finished = true;
+  wifiCredenciaisPendentes = false;
+  wifiConfigFalhou = false;
+  queueIdPendente = 0;
+  momentoInicioConfigWifi = 0;
+  ultimaTentativaWifi = 0;
+  wifi_persistido_ja_iniciado = false;
+  momento_perda_wifi = 0;
+  tentativa_wifi_nova_passou_pela_desconexao = false;
+
+  if (queue_id_da_tentativa > 0) {
+    ultimoQueueIdNotificado = queue_id_da_tentativa;
+    queue_id_ultimo_status_respondido = queue_id_da_tentativa;
+    ultimo_status_respondido_fila = "failed";
+    momento_ultimo_envio_status_fila = 0;
+  }
+
+  print_log("Configuracao de Wi-Fi nao conectou. Voltando ao Wi-Fi de last_wifi_config: " + wifi_ssid);
+  salvarConfigWifi();
+  preferences.begin("portguard", false);
+  preferences.putString("wifi_ssid_ok", wifi_ssid_ultimo_online);
+  preferences.putString("wifi_senha_ok", wifi_senha_ultimo_online);
+  preferences.end();
+  conectarWifi();
+  return true;
+}
+
+// Log wifi_error com o SSID e a senha que não conectaram. Sem internet, fica em queue_logs.
+void enviaLogErroWifi(const String &ssid, const String &senha) {
+  if (ssid.length() == 0) {
+    return;
+  }
+  String dados_evento = montaJsonWifi(ssid, senha);
+  print_log("Falha ao conectar no Wi-Fi " + ssid + ". Enviando wifi_error.");
+  enviarEventoLog("wifi_error", 0, nullptr, dados_evento.c_str(), nullptr);
+}
 
 void verificarRede() {
   unsigned long agora = millis();
@@ -4261,23 +5259,63 @@ void verificarRede() {
     salvarFlagEthernet(true);
   }
 
+  bool conectado_no_ssid_em_uso = wifiConectado() && ssidWifiAssociadoAgora() == wifi_ssid && wifi_ssid.length() > 0;
+  if (wifiCredenciaisPendentes && !conectado_no_ssid_em_uso) {
+    tentativa_wifi_nova_passou_pela_desconexao = true;
+  }
+
+  String ssid_erro_wifi = "";
+  String senha_erro_wifi = "";
+  bool enviar_erro_wifi = false;
+  if (deveEncerrarTentativaWifiNova(agora, momentoInicioConfigWifi, wifiCredenciaisPendentes, conectado_no_ssid_em_uso)) {
+    ssid_erro_wifi = wifi_ssid;
+    senha_erro_wifi = wifi_password;
+    enviar_erro_wifi = true;
+    bool restaurou = restauraWifiDaLastWifiConfig();
+    if (!restaurou && wifi_ssid_ultimo_online.length() > 0 && wifi_senha_ultimo_online.length() > 0) {
+      restauraWifiQueDeixouOnline();
+    } else if (!restaurou) {
+      print_log("Wi-Fi recebido do aplicativo nao conectou em 2 minutos e nao ha Wi-Fi anterior.");
+      falharConfigWifiRecebida();
+    }
+  } else if (!wifiCredenciaisPendentes && conectado_no_ssid_em_uso) {
+    momento_perda_wifi = 0;
+    memorizaWifiQueDeixouOnline();
+  } else if (!wifiCredenciaisPendentes && !conectado_no_ssid_em_uso) {
+    bool tem_ultimo_wifi_online = wifi_ssid_ultimo_online.length() > 0 && wifi_senha_ultimo_online.length() > 0;
+    bool credencial_atual_e_a_ultima_online =
+        wifi_ssid == wifi_ssid_ultimo_online && wifi_password == wifi_senha_ultimo_online;
+    if (deveRestaurarWifiUltimoOnline(agora, momento_perda_wifi, false, tem_ultimo_wifi_online,
+                                      credencial_atual_e_a_ultima_online, false, wifiConfigFalhou)) {
+      restauraWifiQueDeixouOnline();
+    } else if (tem_ultimo_wifi_online && (wifiConfigFalhou || !credencial_atual_e_a_ultima_online)) {
+      if (momento_perda_wifi == 0) {
+        momento_perda_wifi = agora;
+        print_log("Wi-Fi fora. Se nao conectar em 2 minutos, a placa volta para " + wifi_ssid_ultimo_online + ".");
+      }
+    }
+  }
+
   if (!wifiConfigFalhou &&
       (wifiEstaConfigurado() || wifiCredenciaisPendentes) &&
       agora - ultimoValidarWifi >= INTERVALO_VALIDAR_WIFI_MS) {
     ultimoValidarWifi = agora;
 
-    if (!wifiConectado()) {
+    if (!wifiConectado() || ssidWifiAssociadoAgora() != wifi_ssid) {
       conectarWifi();
-    } else if (wifiCredenciaisPendentes) {
+    } else if (configuracaoWifiConectou(wifiCredenciaisPendentes, tentativa_wifi_nova_passou_pela_desconexao,
+                                        ssidWifiAssociadoAgora() == wifi_ssid && wifi_ssid.length() > 0)) {
       setup_finished = true;
       wifiCredenciaisPendentes = false;
       wifiConfigFalhou = false;
       wifi_persistido_ja_iniciado = true;
       configuraEstabilidadeWifiEsp32S3();
       salvarConfigWifi();
+      memorizaWifiQueDeixouOnline();
       Serial.println("WiFi conectado. Credenciais persistidas.");
       atualizarStatusFila(queueIdPendente, "completed");
       momentoInicioConfigWifi = 0;
+      momento_perda_wifi = 0;
     }
   }
 
@@ -4304,6 +5342,17 @@ void verificarRede() {
   bool horaDoCiclo = agora - ultimoCicloApi >= INTERVALO_API_MS;
   if (redeOk && cicloApiAssimQueRedeSubir) {
     horaDoCiclo = true;
+  }
+
+  if (!serialPortguardConfigurado()) {
+    return;
+  }
+
+  if (redeOk) {
+    enviaFilaLocalDeLogs();
+  }
+  if (enviar_erro_wifi) {
+    enviaLogErroWifi(ssid_erro_wifi, senha_erro_wifi);
   }
 
   bool aguardando_apos_falha_consulta_fila =
@@ -4339,8 +5388,9 @@ void enviaEventosPendentes() {
   }
 
   EventoPendente evento;
-  while (redeProntaParaApi() && xQueueReceive(fila_eventos_pendentes, &evento, 0) == pdTRUE) {
-    if (!enviarEventoLog(evento.tipo_evento, evento.numero_portao)) {
+  while (xQueueReceive(fila_eventos_pendentes, &evento, 0) == pdTRUE) {
+    if (!enviarEventoLog(evento.tipo_evento, evento.numero_portao, evento.identificador_controle, nullptr, nullptr,
+                         evento.identificador_usuario)) {
       print_log("ERRO: evento " + String(evento.tipo_evento) + " do portao " +
                 String(evento.numero_portao) + " nao foi enviado para a API.");
     }
@@ -4583,7 +5633,7 @@ bool teste_abertura_indevida() {
                        momento_novo_fechamento + tempo_sirene_apos_fechamento_abertura_indevida_ms).sirene == LOW;
 }
 
-// Verifica o alerta de portão aberto por tempo excessivo: gate_timeout_open, sirene intermitente
+// Verifica o alerta de portão aberto por tempo excessivo: gate_not_closed, sirene intermitente
 // (ligada/desligada) e gate_timeout_close quando o portão fecha.
 bool teste_portao_aberto_tempo_excessivo() {
   EstadoPortao portao;
@@ -4604,7 +5654,8 @@ bool teste_portao_aberto_tempo_excessivo() {
 
   unsigned long inicio_alerta = 500 + tempo_maximo_portao_aberto_ms;
   processaPortao(portao, false, false, inicio_alerta);
-  if (!portao.alerta_tempo_aberto_ativo || portao.eventos_registrados_teste.indexOf("gate_timeout_open") < 0) {
+  if (!portao.portao_aberto || !portao.alerta_tempo_aberto_ativo ||
+      portao.eventos_registrados_teste.indexOf("gate_not_closed") < 0) {
     return false;
   }
 
@@ -4637,21 +5688,21 @@ int contaEventoRegistradoNoTeste(const String &eventos, const char *tipo_evento)
   return quantidade;
 }
 
-// Verifica o gate_timeout_open: sai aos 120 s, uma vez por abertura, com título e event_data {"port": N}.
+// Verifica o gate_not_closed: sai aos 120 s, uma vez por abertura, com título e event_data {"port": N}.
 // Aos 15 s não avisa. Cada portão conta o próprio tempo e a contagem zera quando o portão abre de novo.
 bool teste_aviso_portao_aberto_sem_fechar() {
   if (tempo_maximo_portao_aberto_ms != 120000) {
-    print_log("teste_aviso_portao_aberto_sem_fechar: gate_timeout_open nao esta em 120 segundos.");
+    print_log("teste_aviso_portao_aberto_sem_fechar: gate_not_closed nao esta em 120 segundos.");
     return false;
   }
   if (strcmp(titulo_aviso_portao_aberto_sem_fechar, "Portão aberto por mais de 2 minutos") != 0 ||
-      strcmp(tipo_evento_portao_aberto_sem_fechar, "gate_timeout_open") != 0) {
+      strcmp(tipo_evento_portao_aberto_sem_fechar, "gate_not_closed") != 0) {
     print_log("teste_aviso_portao_aberto_sem_fechar: titulo ou tipo do evento divergem do pedido.");
     return false;
   }
   EventoPendente evento_tamanho;
   if (strlen(tipo_evento_portao_aberto_sem_fechar) >= sizeof(evento_tamanho.tipo_evento)) {
-    print_log("teste_aviso_portao_aberto_sem_fechar: gate_timeout_open nao cabe na fila de eventos.");
+    print_log("teste_aviso_portao_aberto_sem_fechar: gate_not_closed nao cabe na fila de eventos.");
     return false;
   }
   if (montaEventDataPortaoAbertoSemFechar(1) != "{\"port\": 1}" ||
@@ -4680,7 +5731,7 @@ bool teste_aviso_portao_aberto_sem_fechar() {
   if (contaEventoRegistradoNoTeste(portao.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 0 ||
       portao.alerta_tempo_aberto_ativo ||
       calculaSaidas(portao, outro_portao, true, true, momento_quinze_segundos).sirene != LOW) {
-    print_log("teste_aviso_portao_aberto_sem_fechar: enviou gate_timeout_open aos 15 segundos.");
+    print_log("teste_aviso_portao_aberto_sem_fechar: enviou gate_not_closed aos 15 segundos.");
     return false;
   }
 
@@ -4696,15 +5747,15 @@ bool teste_aviso_portao_aberto_sem_fechar() {
   unsigned long momento_limite = momento_abertura + tempo_maximo_portao_aberto_ms;
   processaPortao(portao, false, false, momento_limite);
   if (contaEventoRegistradoNoTeste(portao.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 1 ||
-      !portao.alerta_tempo_aberto_ativo ||
+      !portao.portao_aberto || !portao.alerta_tempo_aberto_ativo ||
       calculaSaidas(portao, outro_portao, true, true, momento_limite).sirene != HIGH) {
-    print_log("teste_aviso_portao_aberto_sem_fechar: aos 120 segundos nao enviou gate_timeout_open uma unica vez.");
+    print_log("teste_aviso_portao_aberto_sem_fechar: aos 120 segundos nao enviou gate_not_closed com a sirene, ainda com o portao aberto.");
     return false;
   }
 
   processaPortao(portao, false, false, momento_limite + 5000);
   if (contaEventoRegistradoNoTeste(portao.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 1) {
-    print_log("teste_aviso_portao_aberto_sem_fechar: repetiu gate_timeout_open na mesma abertura.");
+    print_log("teste_aviso_portao_aberto_sem_fechar: repetiu gate_not_closed na mesma abertura.");
     return false;
   }
 
@@ -4751,7 +5802,7 @@ bool teste_aviso_portao_aberto_sem_fechar() {
   processaPortao(portao_forcado, false, false, 100 + tempo_maximo_portao_aberto_ms);
   if (contaEventoRegistradoNoTeste(portao_forcado.eventos_registrados_teste, tipo_evento_portao_aberto_sem_fechar) != 1 ||
       portao_forcado.eventos_registrados_teste.indexOf("gate_broken") < 0) {
-    print_log("teste_aviso_portao_aberto_sem_fechar: abertura sem comando nao enviou gate_timeout_open aos 120 segundos.");
+    print_log("teste_aviso_portao_aberto_sem_fechar: abertura sem comando nao enviou gate_not_closed aos 120 segundos.");
     return false;
   }
 
@@ -5595,7 +6646,7 @@ bool teste_portoes_da_placa_e_rele_alarme() {
 
   do {
     if (quantidadePortoesDoSerial("1port") != 1 || quantidadePortoesDoSerial("2port") != 2 ||
-        quantidadePortoesDoSerial("3port") != 3 || quantidadePortoesDoSerial(plaque_serial) != 3 ||
+        quantidadePortoesDoSerial("3port") != 3 || quantidadePortoesDoSerial("1port-HQ3DJM9GN2BW") != 3 ||
         quantidade_portoes_configurada != 3) {
       print_log("teste_portoes_da_placa_e_rele_alarme: serial da API desligou o portao 3.");
       break;
@@ -6601,7 +7652,7 @@ bool teste_gerenciamento_botoes_controle() {
   String corpo_cadastro = montaCorpoCadastroBotaoControle(identificador_a);
   String corpo_reset = montaCorpoResetBotaoControle(identificador_a);
   String corpo_log = montaCorpoLogPulsoBotaoControle("gate_open", identificador_a.c_str(), "2");
-  if (sucesso && (corpo_cadastro.indexOf("\"serial_id\":\"" + plaque_serial + "\"") < 0 ||
+  if (sucesso && (corpo_cadastro.indexOf("\"serial_id\":\"" + serial_placa + "\"") < 0 ||
                   corpo_cadastro.indexOf("\"button_id\":" + identificador_a) < 0 ||
                   corpo_cadastro.indexOf("\"internal_token\":\"") < 0 ||
                   corpo_reset.indexOf("\"button_id\":" + identificador_a) < 0 ||
@@ -6789,6 +7840,344 @@ bool teste_gerenciamento_botoes_controle() {
   return sucesso;
 }
 
+// Verifica a leitura do serial de instalação, o JSON de confirmação e que a placa só se considera
+// configurada quando serial_placa tem texto. Não grava Preferences nem chama a API.
+bool teste_serial_portguard() {
+  String serial_original = serial_placa;
+  bool sucesso = true;
+
+  if (strcmp(chave_serial_portguard, "serial_portguard") != 0 || intervalo_consulta_instalacao_placa_ms != 5000 ||
+      strlen(chaveSerialPortguardGravavel()) > 15 || strcmp(chaveSerialPortguardGravavel(), "serial_portguar") != 0) {
+    print_log("teste_serial_portguard: chave ou intervalo de 5 s incorretos.");
+    sucesso = false;
+  }
+
+  String lista_vazia = "{\n    \"list\": [],\n    \"status\": 200\n}";
+  String lista_com_serial =
+      "{\n    \"list\": [\n        {\n            \"serial\": \"1port-HQ3DJM9GN2BW\"\n        }\n    ],\n    \"status\": 200\n}";
+  if (sucesso && (extraiSerialInstalacaoDaResposta(lista_vazia).length() != 0 ||
+                  extraiSerialInstalacaoDaResposta(lista_com_serial) != "1port-HQ3DJM9GN2BW" ||
+                  extraiSerialInstalacaoDaResposta("{\"list\":[{\"serial\":\"2port-ABC\"}]}") != "2port-ABC" ||
+                  extraiSerialInstalacaoDaResposta("{\"serial_id\":\"nao-usar\"}").length() != 0)) {
+    print_log("teste_serial_portguard: leitura do serial em /plaque-install/waiting incorreta.");
+    sucesso = false;
+  }
+
+  String corpo = montaCorpoConclusaoInstalacaoPlaca("1port-HQ3DJM9GN2BW");
+  if (sucesso && (corpo != "{\"internal_token\":\"" + api_token + "\",\"serial_id\":\"1port-HQ3DJM9GN2BW\"}")) {
+    print_log("teste_serial_portguard: corpo de /plaque-install/complete incorreto.");
+    sucesso = false;
+  }
+
+  serial_placa = "";
+  if (sucesso && serialPortguardConfigurado()) {
+    print_log("teste_serial_portguard: placa sem serial foi tratada como configurada.");
+    sucesso = false;
+  }
+  serial_placa = "1port-HQ3DJM9GN2BW";
+  if (sucesso && (!serialPortguardConfigurado() ||
+                  montaCorpoLogPulsoBotaoControle("gate_open", "10", "1").indexOf("serial=1port-HQ3DJM9GN2BW") < 0 ||
+                  montaCorpoCadastroBotaoControle("10").indexOf("\"serial_id\":\"1port-HQ3DJM9GN2BW\"") < 0)) {
+    print_log("teste_serial_portguard: as requisicoes nao usaram o serial carregado.");
+    sucesso = false;
+  }
+
+  serial_placa = serial_original;
+  return sucesso;
+}
+
+bool teste_event_data_abertura_fechamento_portao();
+
+// Confere a espera de 2 minutos e a volta para o último Wi-Fi que deixou a placa online.
+bool teste_retorno_ultimo_wifi_online() {
+  if (tempo_sem_wifi_para_restaurar_ultimo_online_ms != 120000) {
+    print_log("teste_retorno_ultimo_wifi_online: a espera para voltar ao Wi-Fi anterior nao e de 2 minutos.");
+    return false;
+  }
+
+  if (deveEncerrarTentativaWifiNova(5000, 1000, true, true) ||
+      deveEncerrarTentativaWifiNova(1000 + 119999, 1000, true, false) ||
+      deveEncerrarTentativaWifiNova(1000 + 120000, 1000, false, false) ||
+      !deveEncerrarTentativaWifiNova(1000 + 120000, 1000, true, false)) {
+    print_log("teste_retorno_ultimo_wifi_online: os 2 minutos da troca pelo aplicativo nao encerraram a tentativa.");
+    return false;
+  }
+
+  if (credencialWifiRecebidaJaEstaConectada(true, "RedeNova", "RedeAntiga") ||
+      !credencialWifiRecebidaJaEstaConectada(true, "RedeNova", "RedeNova") ||
+      !credencialWifiRecebidaJaEstaConectada(false, "RedeNova", "RedeAntiga") ||
+      credencialWifiRecebidaJaEstaConectada(true, "RedeNova", "")) {
+    print_log("teste_retorno_ultimo_wifi_online: a senha nova seria gravada ainda no Wi-Fi anterior.");
+    return false;
+  }
+
+  unsigned long inicio = 1000;
+  if (deveRestaurarWifiUltimoOnline(inicio + 119999, inicio, false, true, false, true, false) ||
+      deveRestaurarWifiUltimoOnline(inicio + 120000, inicio, true, true, false, true, false) ||
+      deveRestaurarWifiUltimoOnline(inicio + 120000, 0, false, true, false, true, false) ||
+      deveRestaurarWifiUltimoOnline(inicio + 120000, inicio, false, false, false, true, false) ||
+      deveRestaurarWifiUltimoOnline(inicio + 120000, inicio, false, true, true, false, false)) {
+    print_log("teste_retorno_ultimo_wifi_online: a volta ao Wi-Fi anterior disparou cedo, sem queda ou sem credencial anterior.");
+    return false;
+  }
+
+  if (!deveRestaurarWifiUltimoOnline(inicio + 120000, inicio, false, true, false, true, false) ||
+      !deveRestaurarWifiUltimoOnline(inicio + 120000, inicio, false, true, false, false, true) ||
+      !deveRestaurarWifiUltimoOnline(inicio + 120000, inicio, false, true, true, true, false)) {
+    print_log("teste_retorno_ultimo_wifi_online: a troca errada de Wi-Fi nao voltou depois de 2 minutos.");
+    return false;
+  }
+
+  unsigned long quase_estouro = 4294960000UL;
+  if (deveRestaurarWifiUltimoOnline(100000, quase_estouro, false, true, false, true, false) ||
+      !deveRestaurarWifiUltimoOnline(120000, quase_estouro, false, true, false, true, false)) {
+    print_log("teste_retorno_ultimo_wifi_online: a espera de 2 minutos errou no estouro do millis.");
+    return false;
+  }
+
+  String ssid_original = wifi_ssid;
+  String senha_original = wifi_password;
+  String ssid_ultimo_original = wifi_ssid_ultimo_online;
+  String senha_ultimo_original = wifi_senha_ultimo_online;
+  bool setup_original = setup_finished;
+  bool pendente_original = wifiCredenciaisPendentes;
+  bool falhou_original = wifiConfigFalhou;
+  long queue_pendente_original = queueIdPendente;
+  long queue_notificado_original = ultimoQueueIdNotificado;
+  long queue_status_original = queue_id_ultimo_status_respondido;
+  String status_original = ultimo_status_respondido_fila;
+  unsigned long momento_status_original = momento_ultimo_envio_status_fila;
+  unsigned long momento_perda_original = momento_perda_wifi;
+  String ssid_rejeitado_original = wifiSsidRejeitado;
+  String senha_rejeitada_original = wifiPasswordRejeitado;
+  unsigned long momento_inicio_original = momentoInicioConfigWifi;
+  unsigned long ultima_tentativa_original = ultimaTentativaWifi;
+  bool wifi_ja_iniciado_original = wifi_persistido_ja_iniciado;
+
+  wifi_ssid = "rede_errada";
+  wifi_password = "senha_errada";
+  wifi_ssid_ultimo_online = "rede_que_funcionou";
+  wifi_senha_ultimo_online = "senha_que_funcionou";
+  wifiCredenciaisPendentes = true;
+  wifiConfigFalhou = false;
+  queueIdPendente = 77;
+  setup_finished = true;
+  momento_perda_wifi = 50;
+
+  bool aplicou = aplicaCredencialWifiUltimoOnline();
+  bool voltou = aplicou && wifi_ssid == "rede_que_funcionou" && wifi_password == "senha_que_funcionou" &&
+                setup_finished && !wifiCredenciaisPendentes && !wifiConfigFalhou && queueIdPendente == 0 &&
+                ultimoQueueIdNotificado == 77 && queue_id_ultimo_status_respondido == 77 &&
+                ultimo_status_respondido_fila == "failed" && momento_perda_wifi == 0 &&
+                wifiSsidRejeitado == "rede_errada" && wifiPasswordRejeitado == "senha_errada";
+
+  wifi_ssid = ssid_original;
+  wifi_password = senha_original;
+  wifi_ssid_ultimo_online = ssid_ultimo_original;
+  wifi_senha_ultimo_online = senha_ultimo_original;
+  setup_finished = setup_original;
+  wifiCredenciaisPendentes = pendente_original;
+  wifiConfigFalhou = falhou_original;
+  queueIdPendente = queue_pendente_original;
+  ultimoQueueIdNotificado = queue_notificado_original;
+  queue_id_ultimo_status_respondido = queue_status_original;
+  ultimo_status_respondido_fila = status_original;
+  momento_ultimo_envio_status_fila = momento_status_original;
+  momento_perda_wifi = momento_perda_original;
+  wifiSsidRejeitado = ssid_rejeitado_original;
+  wifiPasswordRejeitado = senha_rejeitada_original;
+  momentoInicioConfigWifi = momento_inicio_original;
+  ultimaTentativaWifi = ultima_tentativa_original;
+  wifi_persistido_ja_iniciado = wifi_ja_iniciado_original;
+
+  if (!voltou) {
+    print_log("teste_retorno_ultimo_wifi_online: a credencial que deixou a placa online nao voltou para uso.");
+    return false;
+  }
+  return true;
+}
+
+// Confere que a abertura pela receptora ou pelo aplicativo entra no alerta do app, e que o botão não duplica.
+bool teste_alerta_abertura_convencional() {
+  LogPulsoBotaoControle log_pulso;
+  if (sizeof(log_pulso.tipo_evento) <= strlen(tipo_evento_portao_aberto_sem_fechar)) {
+    print_log("teste_alerta_abertura_convencional: gate_not_closed nao cabe no log do aplicativo.");
+    return false;
+  }
+  if (!deveEnfileirarAlertaComandoConvencional(true, true, false, false) ||
+      deveEnfileirarAlertaComandoConvencional(false, true, false, false) ||
+      deveEnfileirarAlertaComandoConvencional(true, false, false, false) ||
+      deveEnfileirarAlertaComandoConvencional(true, true, true, false) ||
+      deveEnfileirarAlertaComandoConvencional(true, true, false, true)) {
+    print_log("teste_alerta_abertura_convencional: o comando convencional nao foi separado do botao, do bloqueio ou da manutencao.");
+    return false;
+  }
+
+  String corpo_abertura = montaCorpoLogPulsoBotaoControle("gate_open", "0", "1");
+  String corpo_alerta = montaCorpoLogPulsoBotaoControle(tipo_evento_portao_aberto_sem_fechar, "0", "2");
+  if (corpo_abertura.indexOf("event_type=gate_open") < 0 || corpo_abertura.indexOf("button_id=0") < 0 ||
+      corpo_abertura.indexOf("port_number=1") < 0 ||
+      corpo_alerta.indexOf("event_type=gate_not_closed") < 0 || corpo_alerta.indexOf("port_number=2") < 0) {
+    print_log("teste_alerta_abertura_convencional: o corpo do alerta convencional nao leva o portao.");
+    return false;
+  }
+  return true;
+}
+
+// Confere a URL nova, o connection_type, o JSON do Wi-Fi e a fila local de logs. Não grava Preferences nem chama a rede.
+bool teste_comunicacao_api_wifi_e_fila_logs() {
+  if (!api_url.startsWith("https://portguard.com.br/api/v1") ||
+      !api_url_aplicativo.startsWith("https://portguard.com.br/api/app/v1") ||
+      api_url.indexOf("milesmp") >= 0 || api_url_aplicativo.indexOf("milesmp") >= 0) {
+    print_log("teste_comunicacao_api_wifi_e_fila_logs: a URL ainda aponta para o endereco antigo.");
+    return false;
+  }
+  if (strcmp(chave_last_wifi_config, "last_wifi_config") != 0 || strcmp(chave_fila_logs_local, "queue_logs") != 0 ||
+      strlen(chaveLastWifiConfigGravavel()) > 15 || strcmp(chaveLastWifiConfigGravavel(), "last_wifi_confi") != 0) {
+    print_log("teste_comunicacao_api_wifi_e_fila_logs: chave de Preferences diferente do combinado.");
+    return false;
+  }
+  if (strcmp(tipoConexaoDoLog(true, true), "wifi") != 0 || strcmp(tipoConexaoDoLog(true, false), "wifi") != 0 ||
+      strcmp(tipoConexaoDoLog(false, true), "ethernet") != 0 || strcmp(tipoConexaoDoLog(false, false), "") != 0) {
+    print_log("teste_comunicacao_api_wifi_e_fila_logs: connection_type nao segue o meio ativo.");
+    return false;
+  }
+  String corpo = anexaTipoConexaoAoCorpo("event_type=gate_open", tipoConexaoDoLog(false, true));
+  if (corpo.indexOf("connection_type=ethernet") < 0) {
+    print_log("teste_comunicacao_api_wifi_e_fila_logs: o corpo do log nao recebeu connection_type.");
+    return false;
+  }
+  if (!configuracaoWifiConectou(true, true, true) || configuracaoWifiConectou(true, true, false) ||
+      configuracaoWifiConectou(true, false, true) || configuracaoWifiConectou(false, true, true)) {
+    print_log("teste_comunicacao_api_wifi_e_fila_logs: last_wifi_config seria gravado sem conexao confirmada.");
+    return false;
+  }
+
+  String ssid_lido = "";
+  String senha_lida = "";
+  String json_wifi = montaJsonWifi("Rede Boa", "sen\"ha");
+  if (!extraiJsonWifi(json_wifi, ssid_lido, senha_lida) || ssid_lido != "Rede Boa" || senha_lida != "sen\"ha") {
+    print_log("teste_comunicacao_api_wifi_e_fila_logs: JSON de last_wifi_config nao voltou o SSID e a senha.");
+    return false;
+  }
+
+  String dados_erro = montaJsonWifi("rede_errada", "senha_errada");
+  if (dados_erro.indexOf("rede_errada") < 0 || dados_erro.indexOf("senha_errada") < 0 || dados_erro.indexOf("rede_boa") >= 0) {
+    print_log("teste_comunicacao_api_wifi_e_fila_logs: wifi_error nao leva o Wi-Fi que falhou.");
+    return false;
+  }
+
+  String fila = adicionaItemFilaLogsLocal("[]", montaItemFilaLogEvento("wifi_error", dados_erro, ""));
+  fila = adicionaItemFilaLogsLocal(fila, montaItemFilaLogAplicativo("gate_open", "0", "1"));
+  int cursor = 0;
+  String objeto = "";
+  if (!proximoObjetoFilaLogs(fila, cursor, objeto) || extraiCampoJsonSimples(objeto, "event_type") != "wifi_error") {
+    print_log("teste_comunicacao_api_wifi_e_fila_logs: a fila local nao guardou o wifi_error.");
+    return false;
+  }
+  String dados_fila = extraiCampoJsonSimples(objeto, "event_data");
+  if (dados_fila.indexOf("rede_errada") < 0 || dados_fila.indexOf("senha_errada") < 0 ||
+      !proximoObjetoFilaLogs(fila, cursor, objeto) || extraiCampoJsonSimples(objeto, "origem") != "app" ||
+      extraiCampoJsonSimples(objeto, "button_id") != "0" || extraiCampoJsonSimples(objeto, "port_number") != "1") {
+    print_log("teste_comunicacao_api_wifi_e_fila_logs: a fila local misturou os logs.");
+    return false;
+  }
+
+  fila = adicionaItemFilaLogsLocal("[]", montaItemFilaLogEvento("antigo", "", ""));
+  int guardas = 0;
+  String item_novo = montaItemFilaLogEvento("novo", "", "");
+  while (fila.indexOf("antigo") >= 0 && guardas < 80) {
+    fila = adicionaItemFilaLogsLocal(fila, item_novo);
+    guardas++;
+  }
+  if (fila.indexOf("antigo") >= 0 || fila.indexOf("novo") < 0 || fila.length() > (unsigned)limite_caracteres_fila_logs_local + item_novo.length()) {
+    print_log("teste_comunicacao_api_wifi_e_fila_logs: a fila local passou do limite sem descartar o mais antigo.");
+    return false;
+  }
+  return true;
+}
+
+// Confere que o user_id do open_or_close_gate acompanha só o gate_open ou gate_close daquele comando.
+bool teste_user_id_abertura_fechamento() {
+  const String payload_numero =
+      "{\"list\":[{\"id\":228,\"user_id\":42,\"action_type\":\"open_or_close_gate\",\"action_data\":\"1\"}]}";
+  const String payload_texto =
+      "{\"list\":[{\"id\":229,\"user_id\":\"77\",\"action_type\":\"open_or_close_gate\",\"action_data\":\"2\"}]}";
+  if (extraiIdentificadorUsuarioDaAcao(payload_numero) != "42" ||
+      extraiIdentificadorUsuarioDaAcao(payload_texto) != "77" ||
+      extraiIdentificadorUsuarioDaAcao("{\"action_type\":\"open_or_close_gate\"}").length() != 0) {
+    print_log("teste_user_id_abertura_fechamento: user_id da acao nao foi lido.");
+    return false;
+  }
+  if (montaEventDataAberturaFechamentoPortao(1, nullptr, "42") != "{\"port\":1, \"user_id\": \"42\"}" ||
+      montaEventDataAberturaFechamentoPortao(2, "1214212121") != "{\"port\":2, \"button_id\": \"1214212121\"}" ||
+      montaEventDataAberturaFechamentoPortao(3, nullptr, nullptr) != "{\"port\":3}") {
+    print_log("teste_user_id_abertura_fechamento: event_data do user_id fora do formato.");
+    return false;
+  }
+
+  EstadoPortao portao;
+  iniciaEstadoPortao(portao, 1, false, true, 1000, true);
+  processaPortao(portao, false, true, 1000, false, true, false, nullptr, "42");
+  processaPortao(portao, false, false, 1100);
+  if (strcmp(portao.identificador_usuario_ultimo_evento, "42") != 0 ||
+      portao.identificador_controle_ultimo_evento[0] != '\0' ||
+      portao.identificador_usuario_comando[0] != '\0' ||
+      portao.eventos_registrados_teste.indexOf("gate_open") < 0) {
+    print_log("teste_user_id_abertura_fechamento: abertura pelo aplicativo nao guardou o user_id.");
+    return false;
+  }
+
+  processaPortao(portao, false, false, 2000, false, true, false, nullptr, "42");
+  processaPortao(portao, false, true, 2100);
+  if (strcmp(portao.identificador_usuario_ultimo_evento, "42") != 0 ||
+      portao.eventos_registrados_teste.indexOf("gate_close") < 0 ||
+      portao.identificador_usuario_comando[0] != '\0') {
+    print_log("teste_user_id_abertura_fechamento: fechamento pelo aplicativo nao guardou o user_id.");
+    return false;
+  }
+
+  processaPortao(portao, true, true, 3000, false, false, false, "1214212121", "99");
+  processaPortao(portao, false, false, 3100);
+  if (strcmp(portao.identificador_controle_ultimo_evento, "1214212121") != 0 ||
+      portao.identificador_usuario_ultimo_evento[0] != '\0') {
+    print_log("teste_user_id_abertura_fechamento: pulso de controle levou o user_id do aplicativo.");
+    return false;
+  }
+
+  EstadoPortao substituido;
+  iniciaEstadoPortao(substituido, 1, false, true, 4000, true);
+  processaPortao(substituido, false, true, 4000, false, true, false, nullptr, "42");
+  processaPortao(substituido, true, true, 4100);
+  processaPortao(substituido, false, false, 4200);
+  if (substituido.identificador_usuario_ultimo_evento[0] != '\0') {
+    print_log("teste_user_id_abertura_fechamento: user_id sobreviveu a um comando da receptora.");
+    return false;
+  }
+
+  EstadoPortao expirado;
+  iniciaEstadoPortao(expirado, 2, false, true, 5000, true);
+  processaPortao(expirado, false, true, 5000, false, true, false, nullptr, "42");
+  processaPortao(expirado, false, true, 5000 + janela_comando_autorizado_ms + 1);
+  processaPortao(expirado, false, false, 5000 + janela_comando_autorizado_ms + 2);
+  if (expirado.identificador_usuario_ultimo_evento[0] != '\0' || expirado.identificador_usuario_comando[0] != '\0') {
+    print_log("teste_user_id_abertura_fechamento: user_id sobreviveu ao fim da autorizacao.");
+    return false;
+  }
+
+  bool intertravamento_original = intertravamento_ativo;
+  intertravamento_ativo = true;
+  EstadoPortao bloqueado;
+  iniciaEstadoPortao(bloqueado, 1, false, true, 8000, true);
+  bool executou = processaPortao(bloqueado, false, true, 8000, true, true, false, nullptr, "42");
+  intertravamento_ativo = intertravamento_original;
+  if (executou || bloqueado.identificador_usuario_comando[0] != '\0') {
+    print_log("teste_user_id_abertura_fechamento: user_id ficou gravado com a abertura bloqueada.");
+    return false;
+  }
+  return true;
+}
+
 bool teste_completo() {
   print_log("");
   print_log("======== TESTE COMPLETO ========");
@@ -6909,9 +8298,101 @@ bool teste_completo() {
     print_log("FALHA: teste_leds_indicadores_rede - LED de Wi-Fi, cabo ou status fora do ritmo pedido.");
     return false;
   }
+  if (!teste_serial_portguard()) {
+    print_log("FALHA: teste_serial_portguard - leitura, gravacao ou uso do serial de instalacao incorretos.");
+    return false;
+  }
+  if (!teste_event_data_abertura_fechamento_portao()) {
+    print_log("FALHA: teste_event_data_abertura_fechamento_portao - button_id ausente no gate_open ou gate_close.");
+    return false;
+  }
+  if (!teste_retorno_ultimo_wifi_online()) {
+    print_log("FALHA: teste_retorno_ultimo_wifi_online - a placa nao voltou ao ultimo Wi-Fi que a deixou online.");
+    return false;
+  }
+  if (!teste_alerta_abertura_convencional()) {
+    print_log("FALHA: teste_alerta_abertura_convencional - abertura pela receptora ou pelo aplicativo sem alerta.");
+    return false;
+  }
+  if (!teste_comunicacao_api_wifi_e_fila_logs()) {
+    print_log("FALHA: teste_comunicacao_api_wifi_e_fila_logs - URL, connection_type, last_wifi_config ou queue_logs incorretos.");
+    return false;
+  }
+  if (!teste_user_id_abertura_fechamento()) {
+    print_log("FALHA: teste_user_id_abertura_fechamento - user_id do open_or_close_gate ausente no gate_open ou gate_close.");
+    return false;
+  }
 
   print_log("TESTE COMPLETO: todos os testes passaram.");
   print_log("================================");
+  return true;
+}
+
+// Confere o event_data de gate_open e gate_close com o button_id do controle que deu o comando.
+bool teste_event_data_abertura_fechamento_portao() {
+  if (montaEventDataAberturaFechamentoPortao(1, "1214212121") != "{\"port\":1, \"button_id\": \"1214212121\"}" ||
+      montaEventDataAberturaFechamentoPortao(2, "3854021271") != "{\"port\":2, \"button_id\": \"3854021271\"}" ||
+      montaEventDataAberturaFechamentoPortao(3, "4264037171") != "{\"port\":3, \"button_id\": \"4264037171\"}" ||
+      montaEventDataAberturaFechamentoPortao(1, nullptr) != "{\"port\":1}" ||
+      montaEventDataAberturaFechamentoPortao(1, "") != "{\"port\":1}") {
+    print_log("teste_event_data_abertura_fechamento_portao: JSON do event_data fora do formato.");
+    return false;
+  }
+
+  String event_data_codificado = codificaTextoParaUrl(montaEventDataAberturaFechamentoPortao(1, "1214212121"));
+  if (event_data_codificado.indexOf("1214212121") < 0 || event_data_codificado.indexOf("%20") < 0) {
+    print_log("teste_event_data_abertura_fechamento_portao: event_data nao foi codificado para o corpo da requisicao.");
+    return false;
+  }
+
+  EstadoPortao portao;
+  iniciaEstadoPortao(portao, 1, false, true, 1000, true);
+  processaPortao(portao, true, true, 1000, false, false, false, "1214212121");
+  processaPortao(portao, false, false, 1100);
+  if (strcmp(portao.identificador_controle_ultimo_evento, "1214212121") != 0 ||
+      portao.eventos_registrados_teste.indexOf("gate_open") < 0 ||
+      portao.identificador_controle_comando[0] != '\0') {
+    print_log("teste_event_data_abertura_fechamento_portao: abertura pelo controle nao guardou o button_id.");
+    return false;
+  }
+
+  processaPortao(portao, true, false, 2000, false, false, false, "999888777");
+  processaPortao(portao, false, true, 2100);
+  if (strcmp(portao.identificador_controle_ultimo_evento, "999888777") != 0 ||
+      portao.eventos_registrados_teste.indexOf("gate_close") < 0) {
+    print_log("teste_event_data_abertura_fechamento_portao: fechamento pelo controle nao guardou o button_id.");
+    return false;
+  }
+
+  portao.eventos_registrados_teste = "";
+  processaPortao(portao, false, true, 3000, false, true);
+  processaPortao(portao, false, false, 3100);
+  if (portao.identificador_controle_ultimo_evento[0] != '\0' ||
+      portao.eventos_registrados_teste.indexOf("gate_open") < 0) {
+    print_log("teste_event_data_abertura_fechamento_portao: comando do aplicativo levou button_id.");
+    return false;
+  }
+
+  EstadoPortao abertura_sem_controle;
+  iniciaEstadoPortao(abertura_sem_controle, 2, false, true, 4000, true);
+  processaPortao(abertura_sem_controle, false, false, 4000);
+  if (abertura_sem_controle.identificador_controle_ultimo_evento[0] != '\0' ||
+      abertura_sem_controle.eventos_registrados_teste.indexOf("gate_open") < 0) {
+    print_log("teste_event_data_abertura_fechamento_portao: abertura sem controle levou button_id.");
+    return false;
+  }
+
+  EstadoPortao autorizacao_expirada;
+  iniciaEstadoPortao(autorizacao_expirada, 3, false, true, 5000, true);
+  processaPortao(autorizacao_expirada, true, true, 5000, false, false, false, "1214212121");
+  processaPortao(autorizacao_expirada, false, true, 5000 + janela_comando_autorizado_ms + 1);
+  processaPortao(autorizacao_expirada, false, false, 5000 + janela_comando_autorizado_ms + 2);
+  if (autorizacao_expirada.identificador_controle_ultimo_evento[0] != '\0' ||
+      autorizacao_expirada.identificador_controle_comando[0] != '\0') {
+    print_log("teste_event_data_abertura_fechamento_portao: button_id sobreviveu ao fim da autorizacao.");
+    return false;
+  }
+
   return true;
 }
 
@@ -6989,6 +8470,7 @@ void setup() {
   print_log("LED status D8                = GPIO47 (1 s aceso, 1 s apagado)");
 
   carregarConfigWifi();
+  carregaSerialPortguard();
   registraEventosWifiEsp32S3();
   iniciarEthernet();
 
@@ -7034,10 +8516,23 @@ void setup() {
 // LOOP
 // ============================================================
 
-// Loop dedicado à rede: Wi-Fi/cabo, fila da API, heartbeat e envio dos eventos dos portões.
-// Entradas e saídas ficam na tarefaControlePortoes.
+// Loop dedicado à rede. Sem serial em serial_portguard, só mantém a conexão e consulta a instalação.
+// Com serial, segue a fila da API, o heartbeat e o envio dos eventos. Entradas e saídas ficam na tarefaControlePortoes.
 void loop() {
   verificarRede();
+  if (!serialPortguardConfigurado() || conclusao_instalacao_placa_pendente) {
+    consultaInstalacaoPlaca();
+  }
+  if (!serialPortguardConfigurado()) {
+    if (gravacao_codigo_rf433_pendente) {
+      salvaCodigoRf433();
+    }
+    if (gravacao_botoes_controle_pendente) {
+      salvaBotoesControle();
+    }
+    delay(10);
+    return;
+  }
   enviaEventosPendentes();
   if (gravacao_codigo_rf433_pendente) {
     salvaCodigoRf433();

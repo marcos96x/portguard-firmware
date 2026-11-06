@@ -12,7 +12,7 @@ Placa **MAV1022 / ESP32-S3**. Sem estes ajustes o modem entra em sleep e/ou o fi
   - `WiFi.setAutoReconnect(true)` — a pilha reconecta sozinha.
   - `WiFi.persistent(false)` — evita gravar NVS a cada begin.
   - Não chama `disconnect` + `begin` a cada ciclo; no máximo `WiFi.reconnect()` a cada `INTERVALO_RECONECTAR_WIFI_MS` (5 s) se ainda estiver offline.
-- Com **config_plaque** pendente: uma tentativa só, `setAutoReconnect(false)` (igual à regra antiga de validação da fila).
+- Com **config_plaque** pendente: tenta o Wi-Fi novo por até 2 minutos, com `setAutoReconnect(false)` e nova tentativa a cada 5 s. A senha nova só é gravada quando o rádio associa nesse SSID. Se não conectar, a placa volta ao último Wi-Fi que a deixou online (ver `business-rule-retorno-ultimo-wifi-online.md`).
 - Enquanto o Wi-Fi estiver com IP: `Network.setDefaultInterface(WiFi.STA)` — prioridade sobre o cabo W5500 para as requisições do app.
 - Eventos `ARDUINO_EVENT_WIFI_STA_GOT_IP` / `DISCONNECTED` reaplicam sleep off e auto-reconnect.
 
