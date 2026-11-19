@@ -161,6 +161,15 @@
        das outras chamadas quando a rede volta.
      - Wi-Fi que conectou fica em last_wifi_config. Se a configuração nova
        não conectar em 2 minutos, a placa volta para esse Wi-Fi e envia wifi_error.
+     - A cada 10 s, com serial e rede, a placa sonda controladoras faciais
+       Hikvision no Wi-Fi e no cabo, cada um pelo proprio IP (mesma rede
+       nao esconde o cabo). Grava serial e IP novos, envia /facials/discover
+       e um log facial_search com as placas achadas na rodada.
+       No mesmo ciclo busca ate 5 syncs em /facials/syncs/list
+       com internal_token, serial_id da placa e quantity. Usuario novo
+       vai com user_id, nome e e-mail; usuario que ja existe so atualiza a
+       face. Cada item aceito pela facial e confirmado em /facials/syncs/update.
+       Erro da facial vira o log erro_sync e uma linha no monitor serial.
   ============================================================
 */
 
@@ -174,6 +183,19 @@
 #include <ETH.h>
 #include <SPI.h>
 #include <Wire.h>
+#include <NetworkClient.h>
+#include <MD5Builder.h>
+#include <lwip/sockets.h>
+#include <lwip/udp.h>
+#include <lwip/netif.h>
+#include <lwip/ip.h>
+#include <lwip/ip_addr.h>
+#include <lwip/pbuf.h>
+#include <lwip/igmp.h>
+#include <lwip/tcpip.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <esp_heap_caps.h>
 
 // ============================================================
 // IDENTIFICAÇÃO E API
@@ -202,6 +224,41 @@ const char rota_cadastro_botao_controle[] = "/plaque-buttons/save";
 const char rota_atualizacao_botao_controle[] = "/plaque-buttons/update";
 const char rota_log_pulso_botao_controle[] = "/plaques/logs";
 const char tipo_conteudo_json[] = "application/json";
+
+// Controladoras faciais Hikvision na rede local. A chave cabe no NVS (15 caracteres).
+const char chave_controladoras_faciais[] = "faciais_rede";
+const unsigned long intervalo_controladoras_faciais_ms = 10000;
+const unsigned long tempo_escuta_sondagem_controladora_facial_ms = 1500;
+const uint16_t porta_sondagem_controladora_facial_hikvision = 37020;
+const uint8_t quantidade_maxima_controladoras_faciais = 8;
+const uint8_t quantidade_sincronizacoes_faciais_por_consulta = 5;
+const int limite_caracteres_nome_usuario_controladora_facial = 32;
+const size_t limite_bytes_foto_controladora_facial = 204800;
+const unsigned long tempo_limite_requisicao_controladora_facial_ms = 20000;
+const char rota_descoberta_controladora_facial[] = "/facials/discover";
+const char rota_lista_sincronizacoes_faciais[] = "/facials/syncs/list";
+const char rota_atualizacao_sincronizacoes_faciais[] = "/facials/syncs/update";
+const char caminho_busca_usuario_controladora_facial[] = "/ISAPI/AccessControl/UserInfo/Search?format=json";
+const char caminho_criacao_usuario_controladora_facial[] = "/ISAPI/AccessControl/UserInfo/Record?format=json";
+const char caminho_cadastro_foto_controladora_facial[] = "/ISAPI/Intelligent/FDLib/FDSetUp?format=json";
+const char caminho_desafio_controladora_facial[] = "/ISAPI/System/deviceInfo?format=json";
+const char tipo_evento_busca_facial[] = "facial_search";
+const char tipo_evento_erro_sincronizacao_facial[] = "erro_sync";
+const char sonda_controladora_facial_hikvision[] =
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?><Probe><Uuid>8f14e45f-ceea-467a-9b7c-5c8a1d2e3f40</Uuid><Types>inquiry</Types></Probe>";
+// HTTP Digest da ISAPI. O leitor precisa estar ativado com este usuario e esta senha.
+const char usuario_controladora_facial_hikvision[] = "admin";
+const char senha_controladora_facial_hikvision[] = "Portguard@123";
+String json_controladoras_faciais = "[]";
+unsigned long momento_ultimo_ciclo_controladoras_faciais = 0;
+String nonce_digest_controladora_facial = "";
+String realm_digest_controladora_facial = "";
+String qop_digest_controladora_facial = "";
+String opaque_digest_controladora_facial = "";
+String ip_digest_controladora_facial = "";
+uint32_t sequencia_digest_controladora_facial = 0;
+bool controladora_facial_sem_autenticacao = false;
+IPAddress endereco_local_requisicao_controladora_facial(0, 0, 0, 0);
 const char operacao_api_botao_cadastrar = 'c';
 const char operacao_api_botao_resetar = 'r';
 
@@ -480,6 +537,20 @@ struct LogPulsoBotaoControle {
   char identificador_botao[tamanho_identificador_botao_controle];
   char numero_portao[tamanho_numero_portao_botao_controle];
   char tipo_evento[24];
+};
+
+// Campos de um item de /facials/syncs/list, sem copiar o image_base64.
+// Fica antes da primeira funcao: o Arduino declara os prototipos nesse ponto.
+struct ItemSincronizacaoFacial {
+  String identificador_sync;
+  String identificador_usuario;
+  String nome_usuario;
+  String email_usuario;
+  String serial_controladora;
+  String tipo_mime;
+  int inicio_foto;
+  int fim_foto;
+  bool tem_foto;
 };
 
 EstadoPortao estado_portao_1;
@@ -7887,6 +7958,7 @@ bool teste_serial_portguard() {
 }
 
 bool teste_event_data_abertura_fechamento_portao();
+bool teste_controladoras_faciais_hikvision();
 
 // Confere a espera de 2 minutos e a volta para o último Wi-Fi que deixou a placa online.
 bool teste_retorno_ultimo_wifi_online() {
@@ -8322,6 +8394,10 @@ bool teste_completo() {
     print_log("FALHA: teste_user_id_abertura_fechamento - user_id do open_or_close_gate ausente no gate_open ou gate_close.");
     return false;
   }
+  if (!teste_controladoras_faciais_hikvision()) {
+    print_log("FALHA: teste_controladoras_faciais_hikvision - descoberta, gravacao ou sincronizacao da controladora facial incorreta.");
+    return false;
+  }
 
   print_log("TESTE COMPLETO: todos os testes passaram.");
   print_log("================================");
@@ -8394,6 +8470,1996 @@ bool teste_event_data_abertura_fechamento_portao() {
   }
 
   return true;
+}
+
+// ============================================================
+// CONTROLADORAS FACIAIS HIKVISION
+// ============================================================
+
+// Resume MD5 em hexadecimal minusculo. Usado na autenticacao Digest da ISAPI.
+String calculaResumoMd5(const String &texto) {
+  MD5Builder resumo;
+  resumo.begin();
+  resumo.add((uint8_t *)texto.c_str(), (uint16_t)texto.length());
+  resumo.calculate();
+  return resumo.toString();
+}
+
+// Resposta HTTP Digest (RFC 2617). qualidade_protecao vazio usa o calculo sem qop.
+String calculaRespostaAutenticacaoDigest(const String &usuario, const String &senha, const String &reino,
+                                         const String &nonce, const String &metodo, const String &caminho,
+                                         const String &qualidade_protecao, const String &contador_requisicao,
+                                         const String &nonce_cliente) {
+  String resumo_credencial = calculaResumoMd5(usuario + ":" + reino + ":" + senha);
+  String resumo_requisicao = calculaResumoMd5(metodo + ":" + caminho);
+  if (qualidade_protecao.length() == 0) {
+    return calculaResumoMd5(resumo_credencial + ":" + nonce + ":" + resumo_requisicao);
+  }
+  return calculaResumoMd5(resumo_credencial + ":" + nonce + ":" + contador_requisicao + ":" + nonce_cliente + ":" +
+                          qualidade_protecao + ":" + resumo_requisicao);
+}
+
+// Diz se o texto contem o trecho, sem diferenciar maiusculas.
+bool textoContemSemCaixa(const String &texto, const char *trecho) {
+  String minusculo = texto;
+  minusculo.toLowerCase();
+  String busca = trecho;
+  busca.toLowerCase();
+  return minusculo.indexOf(busca) >= 0;
+}
+
+// Diz se ha alguma letra, para nao usar um DeviceType so numerico como modelo.
+bool textoTemLetra(const String &texto) {
+  for (unsigned int indice = 0; indice < texto.length(); indice++) {
+    char caractere = texto[indice];
+    if ((caractere >= 'A' && caractere <= 'Z') || (caractere >= 'a' && caractere <= 'z')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Leitor facial Hikvision: linha DS-K1T (exceto DS-K1TA, inclui DS-K1T673), DS-K56, MinMoe ou Face/Facial.
+// Camera IP DS-2 fica de fora mesmo quando o texto cita face. O serial entra na conferencia.
+bool textoIndicaControladoraFacialHikvision(const String &modelo, const String &tipo) {
+  if (textoContemSemCaixa(modelo, "DS-2") || textoContemSemCaixa(tipo, "DS-2")) {
+    return false;
+  }
+  String juntos = modelo + " " + tipo;
+  if (textoContemSemCaixa(juntos, "DS-K1TA")) {
+    return false;
+  }
+  if (textoContemSemCaixa(juntos, "DS-K1T") || textoContemSemCaixa(juntos, "DS-K56") ||
+      textoContemSemCaixa(juntos, "MinMoe") || textoContemSemCaixa(juntos, "Facial") ||
+      textoContemSemCaixa(juntos, "Face")) {
+    return true;
+  }
+  return false;
+}
+
+// Conteudo de uma tag XML simples. Aceita prefixo e atributo, como <hik:DeviceSN id="1">.
+String extraiConteudoTagXml(const String &xml, const char *tag) {
+  String marca = String(tag);
+  int cursor = 0;
+  while (cursor < (int)xml.length()) {
+    int abre = xml.indexOf('<', cursor);
+    if (abre < 0) {
+      return "";
+    }
+    if (abre + 1 < (int)xml.length() && xml[abre + 1] == '/') {
+      cursor = abre + 1;
+      continue;
+    }
+    int fecha_tag = xml.indexOf('>', abre);
+    if (fecha_tag < 0) {
+      return "";
+    }
+    String cabeca = xml.substring(abre + 1, fecha_tag);
+    int espaco = cabeca.indexOf(' ');
+    String nome = espaco < 0 ? cabeca : cabeca.substring(0, espaco);
+    if (nome.endsWith("/")) {
+      nome = nome.substring(0, nome.length() - 1);
+    }
+    int dois_pontos = nome.lastIndexOf(':');
+    if (dois_pontos >= 0) {
+      nome = nome.substring(dois_pontos + 1);
+    }
+    if (nome != marca) {
+      cursor = fecha_tag + 1;
+      continue;
+    }
+    int inicio_valor = fecha_tag + 1;
+    int fim = -1;
+    int busca = inicio_valor;
+    while (busca < (int)xml.length()) {
+      int fecha = xml.indexOf("</", busca);
+      if (fecha < 0) {
+        break;
+      }
+      int fim_fecha = xml.indexOf('>', fecha);
+      if (fim_fecha < 0) {
+        break;
+      }
+      String nome_fecha = xml.substring(fecha + 2, fim_fecha);
+      int espaco_fecha = nome_fecha.indexOf(' ');
+      if (espaco_fecha >= 0) {
+        nome_fecha = nome_fecha.substring(0, espaco_fecha);
+      }
+      int pontos_fecha = nome_fecha.lastIndexOf(':');
+      if (pontos_fecha >= 0) {
+        nome_fecha = nome_fecha.substring(pontos_fecha + 1);
+      }
+      if (nome_fecha == marca) {
+        fim = fecha;
+        break;
+      }
+      busca = fim_fecha + 1;
+    }
+    if (fim < 0) {
+      return "";
+    }
+    String valor = xml.substring(inicio_valor, fim);
+    valor.trim();
+    if (valor.startsWith("<![CDATA[") && valor.endsWith("]]>")) {
+      valor = valor.substring(9, valor.length() - 3);
+      valor.trim();
+    }
+    return valor;
+  }
+  return "";
+}
+
+// Preenche serial, IP, porta HTTP, modelo e firmware de uma resposta SADP. Recusa o que nao for facial.
+bool interpretaSondagemControladoraFacial(const String &xml, String &serial, String &endereco_ip, String &porta_http,
+                                          String &modelo, String &firmware) {
+  serial = "";
+  endereco_ip = "";
+  porta_http = "";
+  modelo = "";
+  firmware = "";
+  if (xml.indexOf("ProbeMatch") < 0) {
+    return false;
+  }
+  serial = extraiConteudoTagXml(xml, "DeviceSN");
+  endereco_ip = extraiConteudoTagXml(xml, "IPv4Address");
+  porta_http = extraiConteudoTagXml(xml, "HttpPort");
+  modelo = extraiConteudoTagXml(xml, "DeviceDescription");
+  firmware = extraiConteudoTagXml(xml, "SoftwareVersion");
+  String tipo = extraiConteudoTagXml(xml, "DeviceType");
+  if (porta_http.length() == 0 || porta_http == "0") {
+    porta_http = "80";
+  }
+  if (serial.length() == 0 || endereco_ip.length() == 0) {
+    return false;
+  }
+  if (!textoIndicaControladoraFacialHikvision(modelo + " " + serial, tipo)) {
+    return false;
+  }
+  if (modelo.length() == 0 && textoTemLetra(tipo)) {
+    modelo = tipo;
+  }
+  if (modelo.length() == 0 && textoIndicaControladoraFacialHikvision(serial, "")) {
+    modelo = serial;
+  }
+  return true;
+}
+
+// Campo de texto JSON entre limite_inicio e limite_fim, aceitando espaco depois dos dois pontos.
+String extraiTextoJsonControladoraFacial(const String &texto, const char *campo, int limite_inicio, int limite_fim) {
+  if (limite_inicio < 0) {
+    limite_inicio = 0;
+  }
+  if (limite_fim < 0 || limite_fim >= (int)texto.length()) {
+    limite_fim = (int)texto.length() - 1;
+  }
+  if (limite_fim < limite_inicio) {
+    return "";
+  }
+  String padrao = String("\"") + campo + "\"";
+  int indice = texto.indexOf(padrao, limite_inicio);
+  if (indice < 0 || indice > limite_fim) {
+    return "";
+  }
+  indice += padrao.length();
+  while (indice <= limite_fim &&
+         (texto[indice] == ' ' || texto[indice] == '\n' || texto[indice] == '\r' || texto[indice] == '\t')) {
+    indice++;
+  }
+  if (indice > limite_fim || texto[indice] != ':') {
+    return "";
+  }
+  indice++;
+  while (indice <= limite_fim &&
+         (texto[indice] == ' ' || texto[indice] == '\n' || texto[indice] == '\r' || texto[indice] == '\t')) {
+    indice++;
+  }
+  if (indice > limite_fim || texto[indice] != '"') {
+    return "";
+  }
+  indice++;
+  String valor = "";
+  while (indice <= limite_fim) {
+    if (texto[indice] == '\\' && indice + 1 <= limite_fim) {
+      valor += texto[indice + 1];
+      indice += 2;
+      continue;
+    }
+    if (texto[indice] == '"') {
+      break;
+    }
+    valor += texto[indice];
+    indice++;
+  }
+  return valor;
+}
+
+// Campo numerico JSON na faixa, sem aspas. Vazio quando o valor veio entre aspas.
+String extraiNumeroJsonControladoraFacial(const String &texto, const char *campo, int limite_inicio, int limite_fim) {
+  if (limite_inicio < 0) {
+    limite_inicio = 0;
+  }
+  if (limite_fim < 0 || limite_fim >= (int)texto.length()) {
+    limite_fim = (int)texto.length() - 1;
+  }
+  String padrao = String("\"") + campo + "\"";
+  int indice = texto.indexOf(padrao, limite_inicio);
+  if (indice < 0 || indice > limite_fim) {
+    return "";
+  }
+  indice += padrao.length();
+  while (indice <= limite_fim &&
+         (texto[indice] == ' ' || texto[indice] == '\n' || texto[indice] == '\r' || texto[indice] == '\t')) {
+    indice++;
+  }
+  if (indice > limite_fim || texto[indice] != ':') {
+    return "";
+  }
+  indice++;
+  while (indice <= limite_fim &&
+         (texto[indice] == ' ' || texto[indice] == '\n' || texto[indice] == '\r' || texto[indice] == '\t')) {
+    indice++;
+  }
+  int fim = indice;
+  while (fim <= limite_fim && isDigit(texto[fim])) {
+    fim++;
+  }
+  if (fim == indice) {
+    return "";
+  }
+  return texto.substring(indice, fim);
+}
+
+// Marca o inicio e o fim (inclusive) do valor de um campo texto, sem copiar o conteudo.
+bool localizaTextoJsonControladoraFacial(const String &texto, const char *campo, int limite_inicio, int limite_fim,
+                                         int &inicio_valor, int &fim_valor) {
+  inicio_valor = 0;
+  fim_valor = -1;
+  if (limite_inicio < 0) {
+    limite_inicio = 0;
+  }
+  if (limite_fim < 0 || limite_fim >= (int)texto.length()) {
+    limite_fim = (int)texto.length() - 1;
+  }
+  String padrao = String("\"") + campo + "\"";
+  int indice = texto.indexOf(padrao, limite_inicio);
+  if (indice < 0 || indice > limite_fim) {
+    return false;
+  }
+  indice += padrao.length();
+  while (indice <= limite_fim &&
+         (texto[indice] == ' ' || texto[indice] == '\n' || texto[indice] == '\r' || texto[indice] == '\t')) {
+    indice++;
+  }
+  if (indice > limite_fim || texto[indice] != ':') {
+    return false;
+  }
+  indice++;
+  while (indice <= limite_fim &&
+         (texto[indice] == ' ' || texto[indice] == '\n' || texto[indice] == '\r' || texto[indice] == '\t')) {
+    indice++;
+  }
+  if (indice > limite_fim || texto[indice] != '"') {
+    return false;
+  }
+  indice++;
+  inicio_valor = indice;
+  while (indice <= limite_fim) {
+    if (texto[indice] == '\\' && indice + 1 <= limite_fim) {
+      indice += 2;
+      continue;
+    }
+    if (texto[indice] == '"') {
+      fim_valor = indice - 1;
+      return true;
+    }
+    indice++;
+  }
+  return false;
+}
+
+// Quantidade de controladoras no JSON da Preferences.
+int contaControladorasFaciaisNoJson(const String &json) {
+  int quantidade = 0;
+  int cursor = 0;
+  String padrao = "\"serial\":";
+  while (cursor < (int)json.length()) {
+    int indice = json.indexOf(padrao, cursor);
+    if (indice < 0) {
+      break;
+    }
+    quantidade++;
+    cursor = indice + padrao.length();
+  }
+  return quantidade;
+}
+
+// Acha o objeto cujo serial e o pedido. inicio e fim incluem as chaves.
+bool localizaObjetoControladoraFacial(const String &json, const String &serial, int &inicio, int &fim) {
+  int cursor = 0;
+  while (cursor < (int)json.length()) {
+    int abre = json.indexOf('{', cursor);
+    if (abre < 0) {
+      return false;
+    }
+    int fecha = indiceFimObjetoJson(json, abre);
+    if (fecha < 0) {
+      return false;
+    }
+    if (extraiTextoJsonControladoraFacial(json, "serial", abre, fecha) == serial) {
+      inicio = abre;
+      fim = fecha;
+      return true;
+    }
+    cursor = fecha + 1;
+  }
+  return false;
+}
+
+// Um leitor na lista: serial, IP, porta, modelo, firmware e se o /facials/discover ja foi aceito.
+String montaObjetoControladoraFacial(const String &serial, const String &endereco_ip, const String &porta_http,
+                                     const String &modelo, const String &firmware, const String &enviada,
+                                     const String &meio) {
+  return "{\"serial\":\"" + escapaTextoJson(serial) + "\",\"ip\":\"" + escapaTextoJson(endereco_ip) + "\",\"porta\":\"" +
+         escapaTextoJson(porta_http) + "\",\"modelo\":\"" + escapaTextoJson(modelo) + "\",\"firmware\":\"" +
+         escapaTextoJson(firmware) + "\",\"enviada\":\"" + escapaTextoJson(enviada) + "\",\"meio\":\"" +
+         escapaTextoJson(meio) + "\"}";
+}
+
+// Le o leitor pelo serial. A porta vazia vira 80. meio fica vazio nos registros antigos.
+bool leControladoraFacialNoJson(const String &json, const String &serial, String &endereco_ip, String &porta_http,
+                               String &modelo, String &firmware, String &enviada, String &meio) {
+  int inicio = 0;
+  int fim = 0;
+  if (!localizaObjetoControladoraFacial(json, serial, inicio, fim)) {
+    return false;
+  }
+  endereco_ip = extraiTextoJsonControladoraFacial(json, "ip", inicio, fim);
+  porta_http = extraiTextoJsonControladoraFacial(json, "porta", inicio, fim);
+  modelo = extraiTextoJsonControladoraFacial(json, "modelo", inicio, fim);
+  firmware = extraiTextoJsonControladoraFacial(json, "firmware", inicio, fim);
+  enviada = extraiTextoJsonControladoraFacial(json, "enviada", inicio, fim);
+  meio = extraiTextoJsonControladoraFacial(json, "meio", inicio, fim);
+  if (porta_http.length() == 0) {
+    porta_http = "80";
+  }
+  return endereco_ip.length() > 0;
+}
+
+// Inclui um leitor novo ou atualiza IP, porta, modelo e firmware do serial ja conhecido.
+// 1 = novo, 2 = atualizado, 0 = igual, -1 = recusado.
+int incorporaControladoraFacialNoJson(String &json_controladoras, const String &serial, const String &endereco_ip,
+                                      const String &porta_http, const String &modelo, const String &firmware,
+                                      const String &meio = "") {
+  if (serial.length() == 0 || endereco_ip.length() == 0) {
+    return -1;
+  }
+  if (json_controladoras.length() == 0) {
+    json_controladoras = "[]";
+  }
+  int inicio = 0;
+  int fim = 0;
+  if (localizaObjetoControladoraFacial(json_controladoras, serial, inicio, fim)) {
+    String ip_atual = extraiTextoJsonControladoraFacial(json_controladoras, "ip", inicio, fim);
+    String porta_atual = extraiTextoJsonControladoraFacial(json_controladoras, "porta", inicio, fim);
+    String modelo_atual = extraiTextoJsonControladoraFacial(json_controladoras, "modelo", inicio, fim);
+    String firmware_atual = extraiTextoJsonControladoraFacial(json_controladoras, "firmware", inicio, fim);
+    String meio_atual = extraiTextoJsonControladoraFacial(json_controladoras, "meio", inicio, fim);
+    if (ip_atual == endereco_ip && porta_atual == porta_http && modelo_atual == modelo && firmware_atual == firmware &&
+        meio_atual == meio) {
+      return 0;
+    }
+    String enviada = extraiTextoJsonControladoraFacial(json_controladoras, "enviada", inicio, fim);
+    if (enviada != "1") {
+      enviada = "0";
+    }
+    String objeto = montaObjetoControladoraFacial(serial, endereco_ip, porta_http, modelo, firmware, enviada, meio);
+    json_controladoras = json_controladoras.substring(0, inicio) + objeto + json_controladoras.substring(fim + 1);
+    return 2;
+  }
+  if (contaControladorasFaciaisNoJson(json_controladoras) >= quantidade_maxima_controladoras_faciais) {
+    return -1;
+  }
+  String objeto = montaObjetoControladoraFacial(serial, endereco_ip, porta_http, modelo, firmware, "0", meio);
+  if (contaControladorasFaciaisNoJson(json_controladoras) == 0) {
+    json_controladoras = "[" + objeto + "]";
+  } else {
+    int fecha = json_controladoras.lastIndexOf(']');
+    if (fecha < 0) {
+      json_controladoras = "[" + objeto + "]";
+    } else {
+      json_controladoras = json_controladoras.substring(0, fecha) + "," + objeto + "]";
+    }
+  }
+  return 1;
+}
+
+// Marca enviada=1 no serial, para nao repetir o /facials/discover.
+bool marcaDescobertaControladoraFacialEnviada(String &json, const String &serial) {
+  int inicio = 0;
+  int fim = 0;
+  if (!localizaObjetoControladoraFacial(json, serial, inicio, fim)) {
+    return false;
+  }
+  String endereco_ip = extraiTextoJsonControladoraFacial(json, "ip", inicio, fim);
+  String porta_http = extraiTextoJsonControladoraFacial(json, "porta", inicio, fim);
+  String modelo = extraiTextoJsonControladoraFacial(json, "modelo", inicio, fim);
+  String firmware = extraiTextoJsonControladoraFacial(json, "firmware", inicio, fim);
+  String meio = extraiTextoJsonControladoraFacial(json, "meio", inicio, fim);
+  String objeto = montaObjetoControladoraFacial(serial, endereco_ip, porta_http, modelo, firmware, "1", meio);
+  json = json.substring(0, inicio) + objeto + json.substring(fim + 1);
+  return true;
+}
+
+// Corpo de POST /api/v1/facials/discover.
+String montaCorpoDescobertaControladoraFacial(const String &serial_da_placa, const String &serial_controladora,
+                                              const String &modelo, const String &firmware) {
+  return "{\"internal_token\":\"" + escapaTextoJson(api_token) + "\",\"serial\":\"" + escapaTextoJson(serial_da_placa) +
+         "\",\"facial_serial_id\":\"" + escapaTextoJson(serial_controladora) + "\",\"facial_model_id\":\"" +
+         escapaTextoJson(modelo) + "\",\"facial_firmware\":\"" + escapaTextoJson(firmware) + "\"}";
+}
+
+// Corpo de POST /api/v1/facials/syncs/list. A fila e da placa: serial_id e quantity.
+String montaCorpoListaSincronizacoesFaciais(const String &serial_da_placa) {
+  return "{\"internal_token\":\"" + escapaTextoJson(api_token) + "\",\"serial_id\":\"" + escapaTextoJson(serial_da_placa) +
+         "\",\"quantity\":" + String(quantidade_sincronizacoes_faciais_por_consulta) + "}";
+}
+
+// Corpo de POST /api/v1/facials/syncs/update. ids separados por virgula.
+String montaCorpoAtualizacaoSincronizacoesFaciais(const String &identificadores) {
+  return "{\"internal_token\":\"" + escapaTextoJson(api_token) + "\",\"ids\":\"" + escapaTextoJson(identificadores) + "\"}";
+}
+
+// event_data do log erro_sync. Leva o texto devolvido pela facial, sem a foto.
+String montaJsonErroSincronizacaoFacial(const String &identificador_sync, const String &identificador_usuario,
+                                        const String &serial_controladora, const String &erro) {
+  return "{\"id\":\"" + escapaTextoJson(identificador_sync) + "\",\"user_id\":\"" + escapaTextoJson(identificador_usuario) +
+         "\",\"facial_serial_id\":\"" + escapaTextoJson(serial_controladora) + "\",\"erro\":\"" + escapaTextoJson(erro) +
+         "\"}";
+}
+
+// Junta um id numerico na lista que vai para /facials/syncs/update. Id vazio ou nao numerico fica de fora.
+String acrescentaIdentificadorSincronizacaoFacial(const String &lista, const String &identificador) {
+  if (identificador.length() == 0) {
+    return lista;
+  }
+  for (unsigned int indice = 0; indice < identificador.length(); indice++) {
+    if (!isDigit(identificador[indice])) {
+      return lista;
+    }
+  }
+  if (lista.length() == 0) {
+    return identificador;
+  }
+  return lista + "," + identificador;
+}
+
+// Corta em limite de bytes sem partir um caractere UTF-8 no meio.
+String limitaTextoUtf8(const String &texto, int maximo) {
+  if (maximo < 0) {
+    return "";
+  }
+  if ((int)texto.length() <= maximo) {
+    return texto;
+  }
+  int fim = maximo;
+  while (fim > 0 && ((unsigned char)texto[fim] & 0xC0) == 0x80) {
+    fim--;
+  }
+  return texto.substring(0, fim);
+}
+
+// POST /ISAPI/AccessControl/UserInfo/Record: cria o usuario com employeeNo, nome e e-mail.
+String montaCorpoUsuarioControladoraFacial(const String &identificador_usuario, const String &nome_usuario,
+                                           const String &email_usuario = "") {
+  String nome = limitaTextoUtf8(nome_usuario, limite_caracteres_nome_usuario_controladora_facial);
+  if (nome.length() == 0) {
+    nome = "Usuario " + identificador_usuario;
+  }
+  nome = limitaTextoUtf8(nome, limite_caracteres_nome_usuario_controladora_facial);
+  String corpo = "{\"UserInfo\":{\"employeeNo\":\"" + escapaTextoJson(identificador_usuario) + "\",\"name\":\"" +
+                 escapaTextoJson(nome) + "\"";
+  if (email_usuario.length() > 0) {
+    corpo += ",\"email\":\"" + escapaTextoJson(email_usuario) + "\"";
+  }
+  corpo += ",\"userType\":\"normal\",\"Valid\":{\"enable\":true,\"beginTime\":\"2020-01-01T00:00:00\","
+           "\"endTime\":\"2037-12-31T23:59:59\",\"timeType\":\"local\"},\"doorRight\":\"1\","
+           "\"RightPlan\":[{\"doorNo\":1,\"planTemplateNo\":\"1\"}]}}";
+  return corpo;
+}
+
+// POST /ISAPI/AccessControl/UserInfo/Search pelo employeeNo (user_id).
+String montaCorpoBuscaUsuarioControladoraFacial(const String &identificador_usuario) {
+  return "{\"UserInfoSearchCond\":{\"searchID\":\"1\",\"searchResultPosition\":0,\"maxResults\":1,"
+         "\"EmployeeNoList\":[{\"employeeNo\":\"" +
+         escapaTextoJson(identificador_usuario) + "\"}]}}";
+}
+
+// A busca ISAPI achou o employeeNo, ou o cadastro respondeu que ele ja existe.
+bool respostaBuscaUsuarioIndicaExistente(const String &corpo) {
+  if (corpo.indexOf("employeeNoAlreadyExist") >= 0) {
+    return true;
+  }
+  int fim = corpo.length() == 0 ? 0 : (int)corpo.length() - 1;
+  String quantidade = extraiNumeroJsonControladoraFacial(corpo, "numOfMatches", 0, fim);
+  if (quantidade.length() == 0) {
+    int tag = corpo.indexOf("<numOfMatches>");
+    if (tag >= 0) {
+      tag += 15;
+      int fecha_tag = corpo.indexOf('<', tag);
+      if (fecha_tag > tag) {
+        quantidade = corpo.substring(tag, fecha_tag);
+      }
+    }
+  }
+  if (quantidade.length() == 0) {
+    return false;
+  }
+  return quantidade.toInt() > 0;
+}
+
+// JSON FaceDataRecord do PUT /ISAPI/Intelligent/FDLib/FDSetUp. FPID e o employeeNo.
+String montaMetadadosFotoControladoraFacial(const String &identificador_usuario) {
+  return "{\"faceLibType\":\"blackFD\",\"FDID\":\"1\",\"FPID\":\"" + escapaTextoJson(identificador_usuario) + "\"}";
+}
+
+// A resposta da API Portguard com status 400 e erro, mesmo quando o HTTP veio 200.
+bool respostaPortguardIndicaErro(const String &resposta) {
+  return resposta.indexOf("\"status\":400") >= 0 || resposta.indexOf("\"status\": 400") >= 0;
+}
+
+// ISAPI: HTTP 200/201 com statusCode 1, OK, corpo sem status ou usuario que ja existia.
+bool respostaControladoraFacialIndicaSucesso(int codigo_http, const String &corpo) {
+  if (codigo_http != 200 && codigo_http != 201) {
+    return false;
+  }
+  if (corpo.indexOf("employeeNoAlreadyExist") >= 0) {
+    return true;
+  }
+  if (corpo.indexOf("\"statusCode\":1") >= 0 || corpo.indexOf("\"statusCode\": 1") >= 0 ||
+      corpo.indexOf("<statusCode>1</statusCode>") >= 0 || corpo.indexOf("\"statusString\":\"OK\"") >= 0 ||
+      corpo.indexOf("\"statusString\": \"OK\"") >= 0 || corpo.indexOf("<statusString>OK</statusString>") >= 0) {
+    return true;
+  }
+  if (corpo.indexOf("statusCode") < 0 && corpo.indexOf("statusString") < 0) {
+    return true;
+  }
+  return false;
+}
+
+// Trecho curto da resposta ISAPI para o log, sem despejar corpo grande.
+String resumeRespostaControladoraFacial(const String &corpo) {
+  if (corpo.length() <= 220) {
+    return corpo;
+  }
+  return corpo.substring(0, 220);
+}
+
+// Digito base64 ou -1.
+int valorDigitoBase64(char caractere) {
+  if (caractere >= 'A' && caractere <= 'Z') {
+    return caractere - 'A';
+  }
+  if (caractere >= 'a' && caractere <= 'z') {
+    return caractere - 'a' + 26;
+  }
+  if (caractere >= '0' && caractere <= '9') {
+    return caractere - '0' + 52;
+  }
+  if (caractere == '+') {
+    return 62;
+  }
+  if (caractere == '/') {
+    return 63;
+  }
+  return -1;
+}
+
+// Memoria para a foto. Prefere PSRAM e cai para a RAM interna.
+void *alocaMemoriaControladoraFacial(size_t tamanho) {
+  if (tamanho == 0) {
+    return nullptr;
+  }
+  void *ponteiro = heap_caps_malloc(tamanho, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (ponteiro == nullptr) {
+    ponteiro = malloc(tamanho);
+  }
+  return ponteiro;
+}
+
+// Libera o bloco da foto.
+void liberaMemoriaControladoraFacial(void *ponteiro) {
+  if (ponteiro != nullptr) {
+    free(ponteiro);
+  }
+}
+
+// Decodifica base64 entre inicio e fim, inclusive. Aceita data URI. Recusa foto acima de 200 KB.
+bool decodificaBase64ControladoraFacial(const String &texto, int inicio, int fim, uint8_t **saida, size_t *tamanho) {
+  if (saida == nullptr || tamanho == nullptr) {
+    return false;
+  }
+  *saida = nullptr;
+  *tamanho = 0;
+  if (inicio < 0 || fim < inicio || fim >= (int)texto.length()) {
+    return false;
+  }
+  if (fim - inicio >= 5 && texto[inicio] == 'd' && texto[inicio + 1] == 'a' && texto[inicio + 2] == 't' &&
+      texto[inicio + 3] == 'a' && texto[inicio + 4] == ':') {
+    int virgula = texto.indexOf(',', inicio);
+    if (virgula < 0 || virgula > fim) {
+      return false;
+    }
+    inicio = virgula + 1;
+  }
+  size_t quantidade = 0;
+  for (int indice = inicio; indice <= fim; indice++) {
+    char caractere = texto[indice];
+    if (caractere == ' ' || caractere == '\r' || caractere == '\n' || caractere == '\t' || caractere == '=') {
+      continue;
+    }
+    if (valorDigitoBase64(caractere) < 0) {
+      return false;
+    }
+    quantidade++;
+  }
+  if (quantidade == 0 || (quantidade % 4) == 1) {
+    return false;
+  }
+  size_t previsto = (quantidade / 4) * 3;
+  int resto = quantidade % 4;
+  if (resto > 0) {
+    previsto += resto - 1;
+  }
+  if (previsto == 0 || previsto > limite_bytes_foto_controladora_facial) {
+    if (previsto > limite_bytes_foto_controladora_facial) {
+      print_log("ERRO: a foto facial passa de 200 KB e a controladora Hikvision recusa esse tamanho.");
+    }
+    return false;
+  }
+  uint8_t *buffer = (uint8_t *)alocaMemoriaControladoraFacial(previsto);
+  if (buffer == nullptr) {
+    print_log("ERRO: sem memoria para decodificar a foto facial.");
+    return false;
+  }
+  int acumulado = 0;
+  int bits = 0;
+  size_t escrito = 0;
+  for (int indice = inicio; indice <= fim; indice++) {
+    char caractere = texto[indice];
+    if (caractere == ' ' || caractere == '\r' || caractere == '\n' || caractere == '\t' || caractere == '=') {
+      continue;
+    }
+    int valor = valorDigitoBase64(caractere);
+    acumulado = (acumulado << 6) | valor;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      if (escrito < previsto) {
+        buffer[escrito++] = (uint8_t)((acumulado >> bits) & 0xFF);
+      }
+      acumulado &= (bits == 0) ? 0 : ((1 << bits) - 1);
+    }
+  }
+  if (escrito == 0) {
+    liberaMemoriaControladoraFacial(buffer);
+    return false;
+  }
+  *saida = buffer;
+  *tamanho = escrito;
+  return true;
+}
+
+// Valor de um parametro do cabecalho WWW-Authenticate, com ou sem aspas.
+String extraiParametroDigest(const String &cabecalho, const char *nome) {
+  String busca = String(nome) + "=";
+  int indice = cabecalho.indexOf(busca);
+  if (indice < 0) {
+    return "";
+  }
+  indice += busca.length();
+  if (indice < (int)cabecalho.length() && cabecalho[indice] == '"') {
+    indice++;
+    int fim = cabecalho.indexOf('"', indice);
+    if (fim < 0) {
+      return "";
+    }
+    return cabecalho.substring(indice, fim);
+  }
+  int fim = indice;
+  while (fim < (int)cabecalho.length() && cabecalho[fim] != ',' && cabecalho[fim] != ' ') {
+    fim++;
+  }
+  return cabecalho.substring(indice, fim);
+}
+
+// qop lista "auth" entre outros valores. auth-int nao entra no calculo.
+bool qopDigestPermiteAuth(const String &qualidade_protecao) {
+  int indice = 0;
+  while (indice < (int)qualidade_protecao.length()) {
+    int virgula = qualidade_protecao.indexOf(',', indice);
+    String parte = virgula < 0 ? qualidade_protecao.substring(indice) : qualidade_protecao.substring(indice, virgula);
+    parte.trim();
+    if (parte == "auth") {
+      return true;
+    }
+    if (virgula < 0) {
+      break;
+    }
+    indice = virgula + 1;
+  }
+  return false;
+}
+
+// Guarda realm, nonce, qop e opaque do desafio Digest da controladora.
+bool guardaDesafioDigestControladoraFacial(const String &desafio) {
+  int inicio = desafio.indexOf("Digest");
+  String parte = inicio >= 0 ? desafio.substring(inicio) : desafio;
+  realm_digest_controladora_facial = extraiParametroDigest(parte, "realm");
+  nonce_digest_controladora_facial = extraiParametroDigest(parte, "nonce");
+  String qualidade = extraiParametroDigest(parte, "qop");
+  qop_digest_controladora_facial = qopDigestPermiteAuth(qualidade) ? "auth" : "";
+  opaque_digest_controladora_facial = extraiParametroDigest(parte, "opaque");
+  sequencia_digest_controladora_facial = 0;
+  return nonce_digest_controladora_facial.length() > 0 && realm_digest_controladora_facial.length() > 0;
+}
+
+// Cabecalho Authorization Digest para o metodo e o caminho desta requisicao.
+String montaAutorizacaoDigestControladoraFacial(const char *metodo, const char *caminho) {
+  sequencia_digest_controladora_facial++;
+  char contador_requisicao[9];
+  char nonce_cliente[9];
+  sprintf(contador_requisicao, "%08lx", (unsigned long)sequencia_digest_controladora_facial);
+  sprintf(nonce_cliente, "%08lx", (unsigned long)esp_random());
+  String resposta = calculaRespostaAutenticacaoDigest(
+      usuario_controladora_facial_hikvision, senha_controladora_facial_hikvision, realm_digest_controladora_facial,
+      nonce_digest_controladora_facial, metodo, caminho, qop_digest_controladora_facial, contador_requisicao,
+      nonce_cliente);
+  String cabecalho = "Digest username=\"";
+  cabecalho += usuario_controladora_facial_hikvision;
+  cabecalho += "\", realm=\"";
+  cabecalho += realm_digest_controladora_facial;
+  cabecalho += "\", nonce=\"";
+  cabecalho += nonce_digest_controladora_facial;
+  cabecalho += "\", uri=\"";
+  cabecalho += caminho;
+  cabecalho += "\", algorithm=MD5";
+  if (qop_digest_controladora_facial.length() > 0) {
+    cabecalho += ", qop=";
+    cabecalho += qop_digest_controladora_facial;
+    cabecalho += ", nc=";
+    cabecalho += contador_requisicao;
+    cabecalho += ", cnonce=\"";
+    cabecalho += nonce_cliente;
+    cabecalho += "\"";
+  }
+  cabecalho += ", response=\"";
+  cabecalho += resposta;
+  cabecalho += "\"";
+  if (opaque_digest_controladora_facial.length() > 0) {
+    cabecalho += ", opaque=\"";
+    cabecalho += opaque_digest_controladora_facial;
+    cabecalho += "\"";
+  }
+  return cabecalho;
+}
+
+// True quando o IPv4 local e o do leitor estao no mesmo /24.
+bool enderecoIpNoMesmoSegmento(const IPAddress &local, const String &endereco_ip) {
+  IPAddress remoto;
+  if (!remoto.fromString(endereco_ip)) {
+    return false;
+  }
+  return local[0] == remoto[0] && local[1] == remoto[1] && local[2] == remoto[2];
+}
+
+// Escolhe o IP local que alcanca o leitor. Com Wi-Fi e cabo no mesmo /24, o meio gravado na descoberta decide a saida.
+IPAddress escolheEnderecoLocalDaControladoraFacial(const IPAddress &endereco_wifi, bool wifi_ativo,
+                                                   const IPAddress &endereco_cabo, bool cabo_ativo,
+                                                   const String &endereco_facial, const String &meio) {
+  if (meio == "ethernet" && cabo_ativo && endereco_cabo != IPAddress(0, 0, 0, 0)) {
+    return endereco_cabo;
+  }
+  if (meio == "wifi" && wifi_ativo && endereco_wifi != IPAddress(0, 0, 0, 0)) {
+    return endereco_wifi;
+  }
+  bool cabo_no_segmento = cabo_ativo && enderecoIpNoMesmoSegmento(endereco_cabo, endereco_facial);
+  bool wifi_no_segmento = wifi_ativo && enderecoIpNoMesmoSegmento(endereco_wifi, endereco_facial);
+  if (cabo_no_segmento && !wifi_no_segmento) {
+    return endereco_cabo;
+  }
+  if (wifi_no_segmento && !cabo_no_segmento) {
+    return endereco_wifi;
+  }
+  if (wifi_ativo && endereco_wifi != IPAddress(0, 0, 0, 0)) {
+    return endereco_wifi;
+  }
+  return endereco_cabo;
+}
+
+// Escolhe a interface que alcanca o leitor e guarda o IP local para o TCP sair por ela.
+bool selecionaRedeDaControladoraFacial(const String &endereco_ip, const String &meio) {
+  endereco_local_requisicao_controladora_facial = escolheEnderecoLocalDaControladoraFacial(
+      wifiConectado() ? WiFi.localIP() : IPAddress(0, 0, 0, 0), wifiConectado(),
+      caboConectado() ? ETH.localIP() : IPAddress(0, 0, 0, 0), caboConectado(), endereco_ip, meio);
+  if (endereco_local_requisicao_controladora_facial == IPAddress(0, 0, 0, 0)) {
+    return false;
+  }
+  if (caboConectado() && endereco_local_requisicao_controladora_facial == ETH.localIP()) {
+    Network.setDefaultInterface(ETH);
+    return true;
+  }
+  if (wifiConectado()) {
+    Network.setDefaultInterface(WiFi.STA);
+    return true;
+  }
+  if (caboConectado()) {
+    Network.setDefaultInterface(ETH);
+    return true;
+  }
+  return false;
+}
+
+// Uma requisicao HTTP para a controladora. codigo_http, corpo e o desafio Digest voltam por referencia.
+bool executaHttpControladoraFacialUmaVez(const String &endereco_ip, const String &porta_http, const char *metodo,
+                                         const char *caminho, const char *tipo_conteudo, uint8_t *corpo, size_t tamanho,
+                                         const String &autorizacao, int &codigo_http, String &corpo_resposta,
+                                         String &desafio) {
+  codigo_http = -1;
+  corpo_resposta = "";
+  desafio = "";
+  NetworkClient cliente;
+  HTTPClient http;
+  String url = "http://" + endereco_ip + ":" + porta_http + caminho;
+  IPAddress remoto;
+  uint16_t porta_remota = (uint16_t)porta_http.toInt();
+  if (porta_remota == 0) {
+    porta_remota = 80;
+  }
+  int soquete_preso = -1;
+  if (remoto.fromString(endereco_ip) && endereco_local_requisicao_controladora_facial != IPAddress(0, 0, 0, 0)) {
+    soquete_preso = lwip_socket(AF_INET, SOCK_STREAM, 0);
+    if (soquete_preso >= 0) {
+      struct sockaddr_in origem;
+      memset(&origem, 0, sizeof(origem));
+      origem.sin_family = AF_INET;
+      origem.sin_port = htons(0);
+      origem.sin_addr.s_addr = (uint32_t)endereco_local_requisicao_controladora_facial;
+      struct sockaddr_in destino;
+      memset(&destino, 0, sizeof(destino));
+      destino.sin_family = AF_INET;
+      destino.sin_port = htons(porta_remota);
+      destino.sin_addr.s_addr = (uint32_t)remoto;
+      if (lwip_bind(soquete_preso, (struct sockaddr *)&origem, sizeof(origem)) != 0) {
+        print_log("ERRO: o TCP da facial nao prendeu o IP " + endereco_local_requisicao_controladora_facial.toString() + ".");
+        lwip_close(soquete_preso);
+        soquete_preso = -1;
+      } else {
+        lwip_fcntl(soquete_preso, F_SETFL, O_NONBLOCK);
+        int conectou = lwip_connect(soquete_preso, (struct sockaddr *)&destino, sizeof(destino));
+        if (conectou < 0 && errno != EINPROGRESS) {
+          print_log("ERRO: conexao com a facial " + endereco_ip + " pelo IP " +
+                    endereco_local_requisicao_controladora_facial.toString() + " falhou.");
+          lwip_close(soquete_preso);
+          soquete_preso = -1;
+        } else {
+          fd_set conjunto_escrita;
+          struct timeval espera;
+          FD_ZERO(&conjunto_escrita);
+          FD_SET(soquete_preso, &conjunto_escrita);
+          espera.tv_sec = 8;
+          espera.tv_usec = 0;
+          int pronto = lwip_select(soquete_preso + 1, nullptr, &conjunto_escrita, nullptr, &espera);
+          int erro_soquete = 0;
+          socklen_t tamanho_erro = sizeof(erro_soquete);
+          if (pronto <= 0 || lwip_getsockopt(soquete_preso, SOL_SOCKET, SO_ERROR, &erro_soquete, &tamanho_erro) < 0 ||
+              erro_soquete != 0) {
+            print_log("ERRO: a facial " + endereco_ip + " nao aceitou TCP pelo IP " +
+                      endereco_local_requisicao_controladora_facial.toString() + ".");
+            lwip_close(soquete_preso);
+            soquete_preso = -1;
+          } else {
+            lwip_fcntl(soquete_preso, F_SETFL, lwip_fcntl(soquete_preso, F_GETFL, 0) & ~O_NONBLOCK);
+            cliente = NetworkClient(soquete_preso);
+          }
+        }
+      }
+    }
+  }
+  if (soquete_preso < 0 && !cliente.connected()) {
+    cliente.setConnectionTimeout(8000);
+  }
+  if (!http.begin(cliente, url)) {
+    print_log("ERRO: nao foi possivel abrir a requisicao ISAPI em " + endereco_ip + ".");
+    cliente.stop();
+    return false;
+  }
+  if (cliente.connected()) {
+    http.setReuse(true);
+  }
+  http.setTimeout(tempo_limite_requisicao_controladora_facial_ms);
+  const char *nomes_cabecalhos[] = {"WWW-Authenticate"};
+  http.collectHeaders(nomes_cabecalhos, 1);
+  if (tipo_conteudo != nullptr && tipo_conteudo[0] != '\0') {
+    http.addHeader("Content-Type", tipo_conteudo);
+  }
+  if (autorizacao.length() > 0) {
+    http.addHeader("Authorization", autorizacao);
+  }
+  int codigo_local = -1;
+  if (strcmp(metodo, "GET") == 0) {
+    codigo_local = http.GET();
+  } else if (corpo != nullptr && strcmp(metodo, "POST") == 0) {
+    codigo_local = http.POST(corpo, tamanho);
+  } else if (corpo != nullptr) {
+    codigo_local = http.PUT(corpo, tamanho);
+  } else {
+    http.end();
+    cliente.stop();
+    return false;
+  }
+  codigo_http = codigo_local;
+  if (codigo_local > 0) {
+    corpo_resposta = http.getString();
+    if (corpo_resposta.length() > 1500) {
+      corpo_resposta = corpo_resposta.substring(0, 1500);
+    }
+    desafio = http.header("WWW-Authenticate");
+    if (desafio.length() == 0) {
+      int quantidade_cabecalhos = http.headers();
+      for (int indice = 0; indice < quantidade_cabecalhos; indice++) {
+        String nome = http.headerName(indice);
+        nome.toLowerCase();
+        if (nome.indexOf("authenticate") >= 0) {
+          desafio = http.header(indice);
+          break;
+        }
+      }
+    }
+  } else {
+    print_log("ERRO: controladora facial " + endereco_ip + " sem resposta (" + http.errorToString(codigo_local) + ").");
+  }
+  http.end();
+  cliente.stop();
+  return codigo_local > 0;
+}
+
+// Busca o nonce em GET /ISAPI/System/deviceInfo. HTTP 200 significa leitor sem senha.
+bool garanteDesafioDigestControladoraFacial(const String &endereco_ip, const String &porta_http) {
+  if (controladora_facial_sem_autenticacao && ip_digest_controladora_facial == endereco_ip) {
+    return true;
+  }
+  if (nonce_digest_controladora_facial.length() > 0 && ip_digest_controladora_facial == endereco_ip) {
+    return true;
+  }
+  int codigo_http = 0;
+  String corpo_resposta = "";
+  String desafio = "";
+  if (!executaHttpControladoraFacialUmaVez(endereco_ip, porta_http, "GET", caminho_desafio_controladora_facial, nullptr,
+                                           nullptr, 0, "", codigo_http, corpo_resposta, desafio)) {
+    return false;
+  }
+  ip_digest_controladora_facial = endereco_ip;
+  if (codigo_http == 200) {
+    controladora_facial_sem_autenticacao = true;
+    nonce_digest_controladora_facial = "";
+    return true;
+  }
+  if (codigo_http == 401 && guardaDesafioDigestControladoraFacial(desafio)) {
+    controladora_facial_sem_autenticacao = false;
+    return true;
+  }
+  print_log("ERRO: a controladora facial " + endereco_ip + " nao entregou o desafio de autenticacao.");
+  return false;
+}
+
+// PUT ou GET na ISAPI com Digest. Repete uma vez se o leitor recusar o nonce.
+bool enviaHttpControladoraFacial(const String &endereco_ip, const String &porta_http, const char *metodo,
+                                 const char *caminho, const char *tipo_conteudo, uint8_t *corpo, size_t tamanho,
+                                 String &resposta, const String &meio = "") {
+  resposta = "";
+  if (!selecionaRedeDaControladoraFacial(endereco_ip, meio)) {
+    print_log("ERRO: sem rede para alcancar a controladora facial " + endereco_ip + ".");
+    aplicarRotaDeRede();
+    return false;
+  }
+  if (ip_digest_controladora_facial != endereco_ip) {
+    nonce_digest_controladora_facial = "";
+    realm_digest_controladora_facial = "";
+    qop_digest_controladora_facial = "";
+    opaque_digest_controladora_facial = "";
+    controladora_facial_sem_autenticacao = false;
+    sequencia_digest_controladora_facial = 0;
+    ip_digest_controladora_facial = endereco_ip;
+  }
+  if (!(strcmp(metodo, "GET") == 0 && strcmp(caminho, caminho_desafio_controladora_facial) == 0)) {
+    if (!garanteDesafioDigestControladoraFacial(endereco_ip, porta_http)) {
+      aplicarRotaDeRede();
+      return false;
+    }
+  }
+  String autorizacao = "";
+  if (!controladora_facial_sem_autenticacao && nonce_digest_controladora_facial.length() > 0) {
+    autorizacao = montaAutorizacaoDigestControladoraFacial(metodo, caminho);
+  }
+  int codigo_http = 0;
+  String corpo_resposta = "";
+  String desafio = "";
+  bool enviou = executaHttpControladoraFacialUmaVez(endereco_ip, porta_http, metodo, caminho, tipo_conteudo, corpo,
+                                                    tamanho, autorizacao, codigo_http, corpo_resposta, desafio);
+  if (enviou && codigo_http == 401 && guardaDesafioDigestControladoraFacial(desafio)) {
+    controladora_facial_sem_autenticacao = false;
+    autorizacao = montaAutorizacaoDigestControladoraFacial(metodo, caminho);
+    enviou = executaHttpControladoraFacialUmaVez(endereco_ip, porta_http, metodo, caminho, tipo_conteudo, corpo, tamanho,
+                                                 autorizacao, codigo_http, corpo_resposta, desafio);
+  }
+  aplicarRotaDeRede();
+  resposta = corpo_resposta;
+  if (!enviou) {
+    return false;
+  }
+  return respostaControladoraFacialIndicaSucesso(codigo_http, corpo_resposta);
+}
+
+// Se o user_id ja existe, atualiza somente a face. Senao cria o usuario e envia a foto.
+// texto_erro recebe o retorno da facial quando a operacao nao conclui.
+bool enviaUsuarioEFotoParaControladoraFacial(const String &endereco_ip, const String &porta_http,
+                                            const String &identificador_usuario, const String &nome_usuario,
+                                            const String &email_usuario, const String &texto_foto, int inicio_foto,
+                                            int fim_foto, const String &tipo_mime, const String &meio,
+                                            String &texto_erro) {
+  texto_erro = "";
+  String resposta = "";
+  bool somente_face = false;
+  String corpo_busca = montaCorpoBuscaUsuarioControladoraFacial(identificador_usuario);
+  print_log("Consultando usuario " + identificador_usuario + " na controladora facial " + endereco_ip + " pelo " +
+            (meio.length() > 0 ? meio : String("rede disponivel")) + ".");
+  bool busca_concluida =
+      enviaHttpControladoraFacial(endereco_ip, porta_http, "POST", caminho_busca_usuario_controladora_facial,
+                                  tipo_conteudo_json, (uint8_t *)corpo_busca.c_str(), corpo_busca.length(), resposta, meio);
+  if (busca_concluida && respostaBuscaUsuarioIndicaExistente(resposta)) {
+    somente_face = true;
+    print_log("Status do usuario " + identificador_usuario + " na facial: ja existe. Atualizando somente a face.");
+  }
+  if (!somente_face) {
+    String corpo_usuario = montaCorpoUsuarioControladoraFacial(identificador_usuario, nome_usuario, email_usuario);
+    print_log("Status do usuario " + identificador_usuario + " na facial: novo. Cadastrando nome e e-mail.");
+    bool criou = enviaHttpControladoraFacial(endereco_ip, porta_http, "POST", caminho_criacao_usuario_controladora_facial,
+                                             tipo_conteudo_json, (uint8_t *)corpo_usuario.c_str(), corpo_usuario.length(),
+                                             resposta, meio);
+    if (!criou) {
+      if (resposta.indexOf("employeeNoAlreadyExist") >= 0) {
+        print_log("Status do usuario " + identificador_usuario + " na facial: ja existe. Atualizando somente a face.");
+      } else {
+        texto_erro = resumeRespostaControladoraFacial(resposta);
+        if (texto_erro.length() == 0) {
+          texto_erro = "sem resposta da facial ao cadastrar o usuario";
+        }
+        print_log("Status do usuario " + identificador_usuario + " na facial: erro no cadastro. " + texto_erro);
+        return false;
+      }
+    }
+  }
+
+  uint8_t *foto = nullptr;
+  size_t tamanho_foto = 0;
+  if (!decodificaBase64ControladoraFacial(texto_foto, inicio_foto, fim_foto, &foto, &tamanho_foto)) {
+    texto_erro = "foto da sincronizacao invalida";
+    print_log("Status da foto do usuario " + identificador_usuario + " na facial: " + texto_erro + ".");
+    return false;
+  }
+
+  String metadados = montaMetadadosFotoControladoraFacial(identificador_usuario);
+  String nome_arquivo = "face.jpg";
+  String tipo_imagem = "image/jpeg";
+  if (tipo_mime.indexOf("png") >= 0) {
+    nome_arquivo = "face.png";
+    tipo_imagem = "image/png";
+  } else if (tipo_mime.indexOf("webp") >= 0) {
+    nome_arquivo = "face.webp";
+    tipo_imagem = "image/webp";
+  }
+  String cabecalho_foto = "--PortguardFacial\r\n";
+  cabecalho_foto += "Content-Disposition: form-data; name=\"FaceDataRecord\"\r\n";
+  cabecalho_foto += "Content-Type: application/json\r\n\r\n";
+  cabecalho_foto += metadados;
+  cabecalho_foto += "\r\n--PortguardFacial\r\n";
+  cabecalho_foto += "Content-Disposition: form-data; name=\"FaceImage\"; filename=\"";
+  cabecalho_foto += nome_arquivo;
+  cabecalho_foto += "\"\r\nContent-Type: ";
+  cabecalho_foto += tipo_imagem;
+  cabecalho_foto += "\r\n\r\n";
+  String rodape_foto = "\r\n--PortguardFacial--\r\n";
+  size_t total = cabecalho_foto.length() + tamanho_foto + rodape_foto.length();
+  uint8_t *pacote = (uint8_t *)alocaMemoriaControladoraFacial(total);
+  if (pacote == nullptr) {
+    liberaMemoriaControladoraFacial(foto);
+    print_log("ERRO: sem memoria para enviar a foto do usuario " + identificador_usuario + ".");
+    texto_erro = "sem memoria para enviar a foto";
+    return false;
+  }
+  memcpy(pacote, cabecalho_foto.c_str(), cabecalho_foto.length());
+  memcpy(pacote + cabecalho_foto.length(), foto, tamanho_foto);
+  memcpy(pacote + cabecalho_foto.length() + tamanho_foto, rodape_foto.c_str(), rodape_foto.length());
+  liberaMemoriaControladoraFacial(foto);
+
+  String tipo_conteudo_foto = "multipart/form-data; boundary=PortguardFacial";
+  print_log("Enviando foto do usuario " + identificador_usuario + " para a controladora facial " + endereco_ip + ".");
+  bool foto_aceita = enviaHttpControladoraFacial(endereco_ip, porta_http, "PUT", caminho_cadastro_foto_controladora_facial,
+                                                 tipo_conteudo_foto.c_str(), pacote, total, resposta, meio);
+  liberaMemoriaControladoraFacial(pacote);
+  if (!foto_aceita) {
+    texto_erro = resumeRespostaControladoraFacial(resposta);
+    if (texto_erro.length() == 0) {
+      texto_erro = "sem resposta da facial ao gravar a face";
+    }
+    print_log("Status da face do usuario " + identificador_usuario + " na facial: erro. " + texto_erro);
+    return false;
+  }
+  print_log("Status da face do usuario " + identificador_usuario + " na facial: aceita.");
+  return true;
+}
+
+// Grava a lista e so devolve true se a leitura voltar igual.
+bool persisteJsonControladorasFaciais(const String &json) {
+  if (!preferences.begin("portguard", false)) {
+    print_log("ERRO: nao foi possivel abrir a Preferences das controladoras faciais.");
+    return false;
+  }
+  preferences.putString(chave_controladoras_faciais, json);
+  String lido = preferences.getString(chave_controladoras_faciais, "");
+  preferences.end();
+  if (lido != json) {
+    print_log("ERRO: a Preferences nao confirmou a lista de controladoras faciais.");
+    return false;
+  }
+  return true;
+}
+
+// Carrega faciais_rede para a memoria. Lista invalida vira vazia.
+void carregaControladorasFaciais() {
+  json_controladoras_faciais = "[]";
+  if (!preferences.begin("portguard", true)) {
+    print_log("ERRO: nao foi possivel ler as controladoras faciais da Preferences.");
+    return;
+  }
+  json_controladoras_faciais = preferences.getString(chave_controladoras_faciais, "[]");
+  preferences.end();
+  if (json_controladoras_faciais.length() == 0 || json_controladoras_faciais.indexOf('[') < 0) {
+    json_controladoras_faciais = "[]";
+  }
+  print_log("Controladoras faciais carregadas da Preferences: " +
+            String(contaControladorasFaciaisNoJson(json_controladoras_faciais)) + ".");
+}
+
+// Broadcast da rede da interface. Wi-Fi e cabo na mesma faixa continuam com broadcasts distintos porque cada um sai pelo proprio IP.
+IPAddress enderecoBroadcastDaInterface(const IPAddress &endereco, const IPAddress &mascara) {
+  IPAddress broadcast;
+  for (int indice = 0; indice < 4; indice++) {
+    broadcast[indice] = (uint8_t)(endereco[indice] | (uint8_t)~mascara[indice]);
+  }
+  return broadcast;
+}
+
+// Uma controladora achada nesta rodada. meio e wifi ou ethernet.
+String acrescentaPlacaNaBuscaFacial(const String &lista, const String &serial, const String &endereco_ip,
+                                    const String &porta_http, const String &modelo, const String &firmware,
+                                    const String &meio) {
+  if (serial.length() == 0 || endereco_ip.length() == 0) {
+    return lista.length() == 0 ? String("[]") : lista;
+  }
+  String base = lista.length() == 0 ? String("[]") : lista;
+  String serial_escapado = escapaTextoJson(serial);
+  if (base.indexOf("\"serial\":\"" + serial_escapado + "\"") >= 0) {
+    return base;
+  }
+  String objeto = "{\"serial\":\"" + serial_escapado + "\",\"ip\":\"" + escapaTextoJson(endereco_ip) + "\",\"porta\":\"" +
+                  escapaTextoJson(porta_http) + "\",\"modelo\":\"" + escapaTextoJson(modelo) + "\",\"firmware\":\"" +
+                  escapaTextoJson(firmware) + "\",\"meio\":\"" + escapaTextoJson(meio) + "\"}";
+  if (base == "[]" || base.indexOf('{') < 0) {
+    return "[" + objeto + "]";
+  }
+  int fecha = base.lastIndexOf(']');
+  if (fecha < 0) {
+    return "[" + objeto + "]";
+  }
+  return base.substring(0, fecha) + "," + objeto + "]";
+}
+
+// JSON do log facial_search. Lista vazia vira {"placas":[]}.
+String montaJsonLogBuscaFacial(const String &lista) {
+  String base = lista.length() == 0 ? String("[]") : lista;
+  return "{\"placas\":" + base + "}";
+}
+
+// Pacote SADP recebido no pcb preso na interface. A fila e curta: a escuta esvazia antes de encher.
+struct PacoteSondagemFacialRecebido {
+  char dados[2048];
+  int tamanho;
+  ip4_addr_t origem;
+};
+
+PacoteSondagemFacialRecebido fila_sondagem_facial[4];
+PacoteSondagemFacialRecebido pacote_sondagem_em_leitura;
+uint8_t inicio_fila_sondagem_facial = 0;
+volatile uint8_t quantidade_fila_sondagem_facial = 0;
+
+// Callback do UDP SADP. So copia o XML; o tratamento fica fora do nucleo TCP/IP.
+void recebePacoteSondagemFacial(void *argumento, struct udp_pcb *controle, struct pbuf *pacote, const ip_addr_t *origem,
+                                u16_t porta) {
+  (void)argumento;
+  (void)controle;
+  (void)porta;
+  if (pacote == nullptr) {
+    return;
+  }
+  if (quantidade_fila_sondagem_facial < 4) {
+    uint8_t indice = (uint8_t)((inicio_fila_sondagem_facial + quantidade_fila_sondagem_facial) % 4);
+    int tamanho = pacote->tot_len;
+    if (tamanho > 2047) {
+      tamanho = 2047;
+    }
+    pbuf_copy_partial(pacote, fila_sondagem_facial[indice].dados, tamanho, 0);
+    fila_sondagem_facial[indice].dados[tamanho] = 0;
+    fila_sondagem_facial[indice].tamanho = tamanho;
+    if (origem != nullptr) {
+      fila_sondagem_facial[indice].origem = *ip_2_ip4(origem);
+    } else {
+      ip4_addr_set_any(&fila_sondagem_facial[indice].origem);
+    }
+    quantidade_fila_sondagem_facial++;
+  }
+  pbuf_free(pacote);
+}
+
+// Acha a netif cujo IPv4 e o da interface. Wi-Fi e cabo na mesma faixa continuam sendo duas netifs.
+struct netif *encontraNetifPeloEnderecoIpv4(const IPAddress &endereco) {
+  struct netif *iface = nullptr;
+  NETIF_FOREACH(iface) {
+    const ip4_addr_t *ip4 = netif_ip4_addr(iface);
+    if (ip4 == nullptr) {
+      continue;
+    }
+    if (ip4_addr1(ip4) == endereco[0] && ip4_addr2(ip4) == endereco[1] && ip4_addr3(ip4) == endereco[2] &&
+        ip4_addr4(ip4) == endereco[3]) {
+      return iface;
+    }
+  }
+  return nullptr;
+}
+
+// SADP (UDP 37020) saindo pela netif pedida. O roteamento do /24 compartilhado nao troca a interface.
+bool enviaSondagemFacialPelaInterface(struct udp_pcb *controle, struct netif *iface, const IPAddress &destino) {
+  u16_t tamanho = (u16_t)strlen(sonda_controladora_facial_hikvision);
+  struct pbuf *buffer = pbuf_alloc(PBUF_TRANSPORT, tamanho, PBUF_RAM);
+  if (buffer == nullptr) {
+    return false;
+  }
+  pbuf_take(buffer, sonda_controladora_facial_hikvision, tamanho);
+  ip_addr_t ip_destino;
+  IP_ADDR4(&ip_destino, destino[0], destino[1], destino[2], destino[3]);
+  LOCK_TCPIP_CORE();
+  err_t erro = udp_sendto_if(controle, buffer, &ip_destino, porta_sondagem_controladora_facial_hikvision, iface);
+  UNLOCK_TCPIP_CORE();
+  pbuf_free(buffer);
+  return erro == ERR_OK;
+}
+
+// SADP preso no IP da interface. Wi-Fi e cabo na mesma rede nao compartilham o soquete: o cabo sai pelo IP do cabo.
+void sondaControladorasFaciaisNoMeio(bool usar_wifi, String &lista_placas_encontradas) {
+  if (usar_wifi) {
+    if (!wifiConectado()) {
+      return;
+    }
+  } else if (!caboConectado()) {
+    return;
+  }
+
+  IPAddress endereco_local = usar_wifi ? WiFi.localIP() : ETH.localIP();
+  IPAddress mascara = usar_wifi ? WiFi.subnetMask() : ETH.subnetMask();
+  String nome_meio = usar_wifi ? "wifi" : "ethernet";
+  String nome_meio_log = usar_wifi ? "Wi-Fi" : "cabo";
+  if (endereco_local == IPAddress(0, 0, 0, 0)) {
+    print_log("ERRO: sonda facial no " + nome_meio_log + " sem IP.");
+    return;
+  }
+
+  struct netif *iface = encontraNetifPeloEnderecoIpv4(endereco_local);
+  if (iface == nullptr) {
+    print_log("ERRO: a sonda facial no " + nome_meio_log + " nao achou a interface do IP " + endereco_local.toString() + ".");
+    return;
+  }
+  String nome_iface = String((char)iface->name[0]) + String((char)iface->name[1]) + String((int)iface->num);
+  IPAddress broadcast_rede = enderecoBroadcastDaInterface(endereco_local, mascara);
+  print_log("Sonda SADP no " + nome_meio_log + " pela interface " + nome_iface + " IP " + endereco_local.toString() +
+            " mascara " + mascara.toString() + " broadcast " + broadcast_rede.toString() + ".");
+
+  ip_addr_t ip_local;
+  IP_ADDR4(&ip_local, endereco_local[0], endereco_local[1], endereco_local[2], endereco_local[3]);
+  ip4_addr_t grupo_multicast;
+  IP4_ADDR(&grupo_multicast, 239, 255, 255, 250);
+  LOCK_TCPIP_CORE();
+  inicio_fila_sondagem_facial = 0;
+  quantidade_fila_sondagem_facial = 0;
+  struct udp_pcb *controle = udp_new();
+  err_t erro_bind = ERR_VAL;
+  if (controle != nullptr) {
+    ip_set_option(controle, SOF_REUSEADDR | SOF_BROADCAST);
+    erro_bind = udp_bind(controle, &ip_local, porta_sondagem_controladora_facial_hikvision);
+    if (erro_bind != ERR_OK) {
+      erro_bind = udp_bind(controle, &ip_local, 0);
+    }
+    if (erro_bind == ERR_OK) {
+      udp_bind_netif(controle, iface);
+      udp_recv(controle, recebePacoteSondagemFacial, nullptr);
+    }
+  }
+  err_t erro_grupo = igmp_joingroup_netif(iface, &grupo_multicast);
+  UNLOCK_TCPIP_CORE();
+  if (controle == nullptr || erro_bind != ERR_OK) {
+    print_log("ERRO: nao foi possivel prender a sonda SADP no IP " + endereco_local.toString() + " do " + nome_meio_log + ".");
+    if (controle != nullptr) {
+      LOCK_TCPIP_CORE();
+      udp_remove(controle);
+      UNLOCK_TCPIP_CORE();
+    }
+    return;
+  }
+  if (erro_grupo != ERR_OK) {
+    print_log("Sonda facial no " + nome_meio_log + " sem grupo multicast. O broadcast desta interface segue.");
+  }
+  print_log("Sonda SADP no " + nome_meio_log + " escutando na porta " + String(controle->local_port) + ".");
+
+  bool enviou_multicast = enviaSondagemFacialPelaInterface(controle, iface, IPAddress(239, 255, 255, 250));
+  bool enviou_broadcast_rede = false;
+  if (broadcast_rede != IPAddress(255, 255, 255, 255) && broadcast_rede != IPAddress(0, 0, 0, 0)) {
+    enviou_broadcast_rede = enviaSondagemFacialPelaInterface(controle, iface, broadcast_rede);
+  }
+  bool enviou_broadcast_global = enviaSondagemFacialPelaInterface(controle, iface, IPAddress(255, 255, 255, 255));
+  print_log("Sonda SADP no " + nome_meio_log + ": multicast " + String(enviou_multicast ? "ok" : "falhou") +
+            ", broadcast da rede " + String(enviou_broadcast_rede ? "ok" : "falhou") + ", broadcast global " +
+            String(enviou_broadcast_global ? "ok" : "falhou") + ".");
+
+  unsigned long inicio = millis();
+  int respostas = 0;
+  int faciais = 0;
+  int ignoradas = 0;
+  bool reenviou = false;
+  while (millis() - inicio < tempo_escuta_sondagem_controladora_facial_ms) {
+    if (!reenviou && millis() - inicio > 400 && faciais == 0) {
+      reenviou = true;
+      enviaSondagemFacialPelaInterface(controle, iface, IPAddress(239, 255, 255, 250));
+      if (broadcast_rede != IPAddress(255, 255, 255, 255) && broadcast_rede != IPAddress(0, 0, 0, 0)) {
+        enviaSondagemFacialPelaInterface(controle, iface, broadcast_rede);
+      }
+      enviaSondagemFacialPelaInterface(controle, iface, IPAddress(255, 255, 255, 255));
+    }
+    bool tem_pacote = false;
+    LOCK_TCPIP_CORE();
+    if (quantidade_fila_sondagem_facial > 0) {
+      pacote_sondagem_em_leitura = fila_sondagem_facial[inicio_fila_sondagem_facial];
+      inicio_fila_sondagem_facial = (uint8_t)((inicio_fila_sondagem_facial + 1) % 4);
+      quantidade_fila_sondagem_facial--;
+      tem_pacote = true;
+    }
+    UNLOCK_TCPIP_CORE();
+    if (!tem_pacote) {
+      delay(15);
+      continue;
+    }
+    String xml = String(pacote_sondagem_em_leitura.dados);
+    String origem = String(ip4_addr1(&pacote_sondagem_em_leitura.origem)) + "." +
+                    String(ip4_addr2(&pacote_sondagem_em_leitura.origem)) + "." +
+                    String(ip4_addr3(&pacote_sondagem_em_leitura.origem)) + "." +
+                    String(ip4_addr4(&pacote_sondagem_em_leitura.origem));
+    print_log("Pacote SADP no " + nome_meio_log + " vindo de " + origem + " (" +
+              String(pacote_sondagem_em_leitura.tamanho) + " bytes).");
+    if (xml.indexOf("ProbeMatch") < 0) {
+      continue;
+    }
+    respostas++;
+    String serial = "";
+    String endereco_ip = "";
+    String porta_http = "";
+    String modelo = "";
+    String firmware = "";
+    if (!interpretaSondagemControladoraFacial(xml, serial, endereco_ip, porta_http, modelo, firmware)) {
+      ignoradas++;
+      print_log("Dispositivo Hikvision ignorado na sonda facial: modelo " + extraiConteudoTagXml(xml, "DeviceDescription") +
+                ", tipo " + extraiConteudoTagXml(xml, "DeviceType") + ", serial " + extraiConteudoTagXml(xml, "DeviceSN") +
+                ".");
+      continue;
+    }
+    faciais++;
+    lista_placas_encontradas = acrescentaPlacaNaBuscaFacial(lista_placas_encontradas, serial, endereco_ip, porta_http,
+                                                           modelo, firmware, nome_meio);
+    String novo_json = json_controladoras_faciais;
+    int situacao = incorporaControladoraFacialNoJson(novo_json, serial, endereco_ip, porta_http, modelo, firmware, nome_meio);
+    if (situacao == 1 || situacao == 2) {
+      if (!persisteJsonControladorasFaciais(novo_json)) {
+        continue;
+      }
+      json_controladoras_faciais = novo_json;
+      if (situacao == 1) {
+        print_log("Controladora facial nova no " + nome_meio_log + ": serial " + serial + ", IP " + endereco_ip +
+                  ", modelo " + modelo + ".");
+      } else {
+        print_log("Controladora facial " + serial + " atualizada para o IP " + endereco_ip + " pelo " + nome_meio_log + ".");
+      }
+    } else if (situacao < 0) {
+      print_log("ERRO: sem espaco na Preferences para a controladora facial " + serial + ".");
+    }
+  }
+  LOCK_TCPIP_CORE();
+  udp_remove(controle);
+  UNLOCK_TCPIP_CORE();
+  print_log("Sondagem facial no " + nome_meio_log + " (" + endereco_local.toString() + "): " + String(respostas) +
+            " resposta(s), " + String(faciais) + " facial(is), " + String(ignoradas) + " ignorada(s).");
+}
+
+// Sonda o Wi-Fi e o cabo, cada um no proprio IP, e registra a rodada no log facial_search.
+void sondaControladorasFaciaisHikvision() {
+  String lista_placas_encontradas = "[]";
+  if (caboConectado()) {
+    sondaControladorasFaciaisNoMeio(false, lista_placas_encontradas);
+  }
+  if (wifiConectado()) {
+    sondaControladorasFaciaisNoMeio(true, lista_placas_encontradas);
+  }
+  String json_busca = montaJsonLogBuscaFacial(lista_placas_encontradas);
+  print_log("Busca facial: " + json_busca);
+  enviarEventoLog(tipo_evento_busca_facial, 0, nullptr, json_busca.c_str(), "Busca de controladoras faciais");
+}
+
+// Envia para /facials/discover cada leitor ainda nao confirmado pela API.
+void enviaDescobertasControladorasFaciaisPendentes() {
+  String seriais[quantidade_maxima_controladoras_faciais];
+  String modelos[quantidade_maxima_controladoras_faciais];
+  String firmwares[quantidade_maxima_controladoras_faciais];
+  int quantidade = 0;
+  int cursor = 0;
+  while (quantidade < quantidade_maxima_controladoras_faciais) {
+    int abre = json_controladoras_faciais.indexOf('{', cursor);
+    if (abre < 0) {
+      break;
+    }
+    int fecha = indiceFimObjetoJson(json_controladoras_faciais, abre);
+    if (fecha < 0) {
+      break;
+    }
+    if (extraiTextoJsonControladoraFacial(json_controladoras_faciais, "enviada", abre, fecha) != "1") {
+      seriais[quantidade] = extraiTextoJsonControladoraFacial(json_controladoras_faciais, "serial", abre, fecha);
+      modelos[quantidade] = extraiTextoJsonControladoraFacial(json_controladoras_faciais, "modelo", abre, fecha);
+      firmwares[quantidade] = extraiTextoJsonControladoraFacial(json_controladoras_faciais, "firmware", abre, fecha);
+      quantidade++;
+    }
+    cursor = fecha + 1;
+  }
+
+  for (int indice = 0; indice < quantidade; indice++) {
+    if (seriais[indice].length() == 0) {
+      continue;
+    }
+    String url = api_url + rota_descoberta_controladora_facial;
+    String corpo = montaCorpoDescobertaControladoraFacial(serial_placa, seriais[indice], modelos[indice], firmwares[indice]);
+    String resposta = "";
+    print_log("Enviando controladora facial descoberta " + seriais[indice] + " para a API.");
+    bool enviou = executarPostHttp(rota_descoberta_controladora_facial, url, corpo, 15000, &resposta, tipo_conteudo_json);
+    if (!enviou || respostaPortguardIndicaErro(resposta)) {
+      print_log("ERRO: a API nao registrou a controladora facial " + seriais[indice] + ". Nova tentativa no proximo ciclo.");
+      continue;
+    }
+    String novo_json = json_controladoras_faciais;
+    if (!marcaDescobertaControladoraFacialEnviada(novo_json, seriais[indice])) {
+      continue;
+    }
+    if (persisteJsonControladorasFaciais(novo_json)) {
+      json_controladoras_faciais = novo_json;
+      print_log("Controladora facial " + seriais[indice] + " registrada na API.");
+    }
+  }
+}
+
+// Le um objeto da lista pending. O nome preferido e name; user_name so entra se name vier vazio.
+bool leItemSincronizacaoFacial(const String &texto, int abre, int fecha, ItemSincronizacaoFacial &item) {
+  item.identificador_sync = extraiNumeroJsonControladoraFacial(texto, "id", abre, fecha);
+  if (item.identificador_sync.length() == 0) {
+    item.identificador_sync = extraiTextoJsonControladoraFacial(texto, "id", abre, fecha);
+  }
+  item.identificador_usuario = extraiNumeroJsonControladoraFacial(texto, "user_id", abre, fecha);
+  if (item.identificador_usuario.length() == 0) {
+    item.identificador_usuario = extraiTextoJsonControladoraFacial(texto, "user_id", abre, fecha);
+  }
+  item.serial_controladora = extraiTextoJsonControladoraFacial(texto, "facial_serial_id", abre, fecha);
+  item.nome_usuario = extraiTextoJsonControladoraFacial(texto, "name", abre, fecha);
+  if (item.nome_usuario.length() == 0) {
+    item.nome_usuario = extraiTextoJsonControladoraFacial(texto, "user_name", abre, fecha);
+  }
+  item.email_usuario = extraiTextoJsonControladoraFacial(texto, "user_email", abre, fecha);
+  item.tipo_mime = extraiTextoJsonControladoraFacial(texto, "mime_type", abre, fecha);
+  item.inicio_foto = 0;
+  item.fim_foto = 0;
+  item.tem_foto = localizaTextoJsonControladoraFacial(texto, "image_base64", abre, fecha, item.inicio_foto, item.fim_foto) &&
+                  item.fim_foto >= item.inicio_foto;
+  return item.identificador_sync.length() > 0 && item.identificador_usuario.length() > 0 &&
+         item.serial_controladora.length() > 0;
+}
+
+// POST /facials/syncs/update de um id. A rota marca o id como sincronizado.
+bool confirmaSincronizacaoFacialNaApi(const String &identificador_sync) {
+  String url = api_url + rota_atualizacao_sincronizacoes_faciais;
+  String corpo = montaCorpoAtualizacaoSincronizacoesFaciais(identificador_sync);
+  String resposta = "";
+  print_log("Confirmando sincronizacao facial " + identificador_sync + " na API.");
+  bool atualizou =
+      executarPostHttp(rota_atualizacao_sincronizacoes_faciais, url, corpo, 15000, &resposta, tipo_conteudo_json);
+  if (!atualizou || respostaPortguardIndicaErro(resposta)) {
+    print_log("ERRO: a API nao marcou a sincronizacao facial " + identificador_sync + " como realizada.");
+    return false;
+  }
+  print_log("Sincronizacao facial " + identificador_sync + " marcada como realizada.");
+  return true;
+}
+
+// A cada ciclo: lista os pending, envia cada um ao leitor do facial_serial_id e confirma o retorno da facial.
+void sincronizaFotosFaciaisPendentes() {
+  String url = api_url + rota_lista_sincronizacoes_faciais;
+  String corpo = montaCorpoListaSincronizacoesFaciais(serial_placa);
+  String resposta = "";
+  bool silencioso = requisicao_sem_log_de_sucesso;
+  requisicao_sem_log_de_sucesso = true;
+  print_log("Consultando sincronizacoes faciais pendentes da placa " + serial_placa + ".");
+  bool listou = executarPostHttp(rota_lista_sincronizacoes_faciais, url, corpo, 20000, &resposta, tipo_conteudo_json);
+  requisicao_sem_log_de_sucesso = silencioso;
+  if (!listou || respostaPortguardIndicaErro(resposta)) {
+    String trecho = resposta.length() > 180 ? resposta.substring(0, 180) : resposta;
+    print_log("ERRO: nao foi possivel listar as sincronizacoes faciais. " + trecho);
+    return;
+  }
+
+  int fim_resposta = resposta.length() == 0 ? 0 : (int)resposta.length() - 1;
+  String total = extraiNumeroJsonControladoraFacial(resposta, "total", 0, fim_resposta);
+  print_log("Sincronizacoes faciais pendentes na API: " + (total.length() > 0 ? total : String("0")) + " (" +
+            String(resposta.length()) + " bytes).");
+
+  int cursor_lista = resposta.indexOf("\"list\"");
+  int abre_lista = cursor_lista < 0 ? -1 : resposta.indexOf('[', cursor_lista);
+  if (abre_lista < 0) {
+    print_log("Nenhuma sincronizacao facial pendente.");
+    return;
+  }
+
+  int cursor = abre_lista + 1;
+  int quantidade = 0;
+  while (quantidade < quantidade_sincronizacoes_faciais_por_consulta) {
+    int abre = resposta.indexOf('{', cursor);
+    if (abre < 0) {
+      break;
+    }
+    int fecha = indiceFimObjetoJson(resposta, abre);
+    if (fecha < 0) {
+      break;
+    }
+    cursor = fecha + 1;
+    quantidade++;
+
+    ItemSincronizacaoFacial item;
+    if (!leItemSincronizacaoFacial(resposta, abre, fecha, item)) {
+      print_log("-------- SYNC FACIAL --------");
+      print_log("Sync encontrado incompleto. Registro mantido pendente.");
+      print_log("-----------------------------");
+      continue;
+    }
+    print_log("-------- SYNC FACIAL --------");
+    print_log("Sync encontrado id=" + item.identificador_sync + " usuario=" + item.identificador_usuario + " nome=" +
+              item.nome_usuario + " email=" + item.email_usuario + " facial=" + item.serial_controladora + ".");
+    if (!item.tem_foto) {
+      String erro_foto = "sincronizacao sem foto";
+      print_log("Status do sync " + item.identificador_sync + " na facial: " + erro_foto + ".");
+      String json_erro = montaJsonErroSincronizacaoFacial(item.identificador_sync, item.identificador_usuario,
+                                                         item.serial_controladora, erro_foto);
+      enviarEventoLog(tipo_evento_erro_sincronizacao_facial, 0, nullptr, json_erro.c_str(), "Erro de sincronizacao facial");
+      print_log("Log erro_sync gravado para o sync " + item.identificador_sync + ".");
+      print_log("-----------------------------");
+      continue;
+    }
+
+    String endereco_ip = "";
+    String porta_http = "";
+    String modelo = "";
+    String firmware = "";
+    String enviada = "";
+    String meio = "";
+    if (!leControladoraFacialNoJson(json_controladoras_faciais, item.serial_controladora, endereco_ip, porta_http, modelo,
+                                    firmware, enviada, meio)) {
+      String erro_leitor = "leitor " + item.serial_controladora + " ainda nao encontrado na rede";
+      print_log("Status do sync " + item.identificador_sync + " na facial: " + erro_leitor + ".");
+      String json_erro = montaJsonErroSincronizacaoFacial(item.identificador_sync, item.identificador_usuario,
+                                                         item.serial_controladora, erro_leitor);
+      enviarEventoLog(tipo_evento_erro_sincronizacao_facial, 0, nullptr, json_erro.c_str(), "Erro de sincronizacao facial");
+      print_log("Log erro_sync gravado para o sync " + item.identificador_sync + ".");
+      print_log("-----------------------------");
+      continue;
+    }
+    print_log("Sync " + item.identificador_sync + " vai para " + endereco_ip + " pelo " +
+              (meio.length() > 0 ? meio : String("rede disponivel")) + ".");
+    String erro_facial = "";
+    if (enviaUsuarioEFotoParaControladoraFacial(endereco_ip, porta_http, item.identificador_usuario, item.nome_usuario,
+                                               item.email_usuario, resposta, item.inicio_foto, item.fim_foto,
+                                               item.tipo_mime, meio, erro_facial)) {
+      print_log("Status do sync " + item.identificador_sync + " na facial: aceito.");
+      if (confirmaSincronizacaoFacialNaApi(item.identificador_sync)) {
+        print_log("Status do sync " + item.identificador_sync + " na API: marcado como sincronizado.");
+      } else {
+        print_log("Status do sync " + item.identificador_sync + " na API: a facial aceitou, mas a confirmacao falhou.");
+      }
+    } else {
+      print_log("Status do sync " + item.identificador_sync + " na facial: erro. " + erro_facial);
+      String json_erro = montaJsonErroSincronizacaoFacial(item.identificador_sync, item.identificador_usuario,
+                                                         item.serial_controladora, erro_facial);
+      enviarEventoLog(tipo_evento_erro_sincronizacao_facial, 0, nullptr, json_erro.c_str(), "Erro de sincronizacao facial");
+      print_log("Log erro_sync gravado para o sync " + item.identificador_sync + ".");
+      print_log("Sincronizacao facial " + item.identificador_sync + " permanece pendente.");
+    }
+    print_log("-----------------------------");
+  }
+
+  if (quantidade == 0) {
+    print_log("Nenhuma sincronizacao facial pendente.");
+  }
+}
+
+// A cada 10 s: sonda a rede, avisa a API dos leitores novos e sincroniza ate 5 fotos pendentes.
+void processaControladorasFaciais() {
+  if (!serialPortguardConfigurado()) {
+    return;
+  }
+  if (!wifiConectado() && !caboConectado()) {
+    return;
+  }
+  unsigned long agora = millis();
+  if (momento_ultimo_ciclo_controladoras_faciais != 0 &&
+      agora - momento_ultimo_ciclo_controladoras_faciais < intervalo_controladoras_faciais_ms) {
+    return;
+  }
+  momento_ultimo_ciclo_controladoras_faciais = agora;
+  sondaControladorasFaciaisHikvision();
+  enviaDescobertasControladorasFaciaisPendentes();
+  sincronizaFotosFaciaisPendentes();
+  aplicarRotaDeRede();
+}
+
+// Confere sonda, Preferences, corpos da API, Digest, base64 e o cadastro ISAPI. Nao grava Preferences nem usa a rede.
+bool teste_controladoras_faciais_hikvision() {
+  String json_original = json_controladoras_faciais;
+  bool sucesso = true;
+
+  if (intervalo_controladoras_faciais_ms != 10000 || quantidade_sincronizacoes_faciais_por_consulta != 5 ||
+      strlen(chave_controladoras_faciais) > 15 || strcmp(chave_controladoras_faciais, "faciais_rede") != 0) {
+    print_log("teste_controladoras_faciais_hikvision: intervalo, quantidade ou chave da Preferences incorretos.");
+    sucesso = false;
+  }
+  if (sucesso && (strlen(usuario_controladora_facial_hikvision) == 0 || strlen(senha_controladora_facial_hikvision) == 0 ||
+                  strcmp(caminho_busca_usuario_controladora_facial, "/ISAPI/AccessControl/UserInfo/Search?format=json") != 0 ||
+                  strcmp(caminho_criacao_usuario_controladora_facial, "/ISAPI/AccessControl/UserInfo/Record?format=json") != 0 ||
+                  strcmp(caminho_cadastro_foto_controladora_facial, "/ISAPI/Intelligent/FDLib/FDSetUp?format=json") != 0)) {
+    print_log("teste_controladoras_faciais_hikvision: rota ISAPI ou credencial da controladora vazia.");
+    sucesso = false;
+  }
+
+  String serial = "";
+  String endereco_ip = "";
+  String porta_http = "";
+  String modelo = "";
+  String firmware = "";
+  String xml_facial =
+      "<ProbeMatch><DeviceSN>DS-K1T34320220001</DeviceSN><IPv4Address>192.168.0.64</IPv4Address><HttpPort>80</HttpPort>"
+      "<DeviceDescription>DS-K1T343MWX</DeviceDescription><SoftwareVersion>V3.2.30</SoftwareVersion><DeviceType>ACS</DeviceType></ProbeMatch>";
+  String xml_camera =
+      "<ProbeMatch><DeviceSN>CAM1</DeviceSN><IPv4Address>192.168.0.20</IPv4Address><HttpPort>80</HttpPort>"
+      "<DeviceDescription>DS-2CD2143</DeviceDescription><SoftwareVersion>V1</SoftwareVersion>"
+      "<DeviceType>Face Detection</DeviceType></ProbeMatch>";
+  String xml_face =
+      "<ProbeMatch><DeviceSN>FAC-1001</DeviceSN><IPv4Address>192.168.0.65</IPv4Address><HttpPort></HttpPort>"
+      "<DeviceDescription></DeviceDescription><SoftwareVersion>V1.0.4</SoftwareVersion>"
+      "<DeviceType>Face Recognition Terminal</DeviceType></ProbeMatch>";
+  if (sucesso && (!interpretaSondagemControladoraFacial(xml_facial, serial, endereco_ip, porta_http, modelo, firmware) ||
+                  serial != "DS-K1T34320220001" || endereco_ip != "192.168.0.64" || porta_http != "80" ||
+                  modelo != "DS-K1T343MWX" || firmware != "V3.2.30")) {
+    print_log("teste_controladoras_faciais_hikvision: a sonda SADP nao leu o leitor DS-K1T.");
+    sucesso = false;
+  }
+  if (sucesso && interpretaSondagemControladoraFacial(xml_camera, serial, endereco_ip, porta_http, modelo, firmware)) {
+    print_log("teste_controladoras_faciais_hikvision: camera IP foi aceita como controladora facial.");
+    sucesso = false;
+  }
+  if (sucesso && (!interpretaSondagemControladoraFacial(xml_face, serial, endereco_ip, porta_http, modelo, firmware) ||
+                  serial != "FAC-1001" || porta_http != "80" || modelo != "Face Recognition Terminal")) {
+    print_log("teste_controladoras_faciais_hikvision: terminal facial sem modelo na descricao foi recusado.");
+    sucesso = false;
+  }
+  String xml_673 =
+      "<ProbeMatch><hik:DeviceSN id=\"1\">DS-K1T673DWX20220001</hik:DeviceSN><IPv4Address>192.168.15.79</IPv4Address>"
+      "<HttpPort>80</HttpPort><DeviceDescription></DeviceDescription><SoftwareVersion>V3.16.1</SoftwareVersion>"
+      "<DeviceType>57347</DeviceType></ProbeMatch>";
+  if (sucesso && (!interpretaSondagemControladoraFacial(xml_673, serial, endereco_ip, porta_http, modelo, firmware) ||
+                  serial != "DS-K1T673DWX20220001" || endereco_ip != "192.168.15.79" || modelo != "DS-K1T673DWX20220001")) {
+    print_log("teste_controladoras_faciais_hikvision: o leitor DS-K1T673 nao foi aceito pelo serial.");
+    sucesso = false;
+  }
+  if (sucesso && interpretaSondagemControladoraFacial("<Probe></Probe>", serial, endereco_ip, porta_http, modelo, firmware)) {
+    print_log("teste_controladoras_faciais_hikvision: pacote que nao e resposta de sonda foi aceito.");
+    sucesso = false;
+  }
+
+  String json = "[]";
+  if (sucesso && incorporaControladoraFacialNoJson(json, "DS-K1T34320220001", "192.168.0.64", "80", "DS-K1T343MWX", "V3.2.30") != 1) {
+    print_log("teste_controladoras_faciais_hikvision: leitor novo nao entrou na lista.");
+    sucesso = false;
+  }
+  String ip_lido = "";
+  String porta_lida = "";
+  String modelo_lido = "";
+  String firmware_lido = "";
+  String enviada = "";
+  String meio_lido = "";
+  if (sucesso && (!leControladoraFacialNoJson(json, "DS-K1T34320220001", ip_lido, porta_lida, modelo_lido, firmware_lido, enviada, meio_lido) ||
+                  ip_lido != "192.168.0.64" || enviada != "0")) {
+    print_log("teste_controladoras_faciais_hikvision: o serial nao devolveu o IP gravado.");
+    sucesso = false;
+  }
+  if (sucesso && incorporaControladoraFacialNoJson(json, "DS-K1T34320220001", "192.168.0.64", "80", "DS-K1T343MWX", "V3.2.30") != 0) {
+    print_log("teste_controladoras_faciais_hikvision: o mesmo leitor foi gravado de novo.");
+    sucesso = false;
+  }
+  if (sucesso && incorporaControladoraFacialNoJson(json, "DS-K1T34320220001", "192.168.0.70", "80", "DS-K1T343MWX", "V3.2.30") != 2) {
+    print_log("teste_controladoras_faciais_hikvision: troca de IP nao atualizou o leitor conhecido.");
+    sucesso = false;
+  }
+  if (sucesso && !marcaDescobertaControladoraFacialEnviada(json, "DS-K1T34320220001")) {
+    print_log("teste_controladoras_faciais_hikvision: a descoberta nao foi marcada como enviada.");
+    sucesso = false;
+  }
+  if (sucesso && incorporaControladoraFacialNoJson(json, "DS-K1T34320220001", "192.168.0.71", "80", "DS-K1T343MWX", "V3.2.30") != 2) {
+    print_log("teste_controladoras_faciais_hikvision: o IP novo nao foi aceito depois da descoberta.");
+    sucesso = false;
+  }
+  if (sucesso && (!leControladoraFacialNoJson(json, "DS-K1T34320220001", ip_lido, porta_lida, modelo_lido, firmware_lido, enviada, meio_lido) ||
+                  ip_lido != "192.168.0.71" || enviada != "1")) {
+    print_log("teste_controladoras_faciais_hikvision: a troca de IP reabriu a descoberta ou perdeu o endereco.");
+    sucesso = false;
+  }
+  if (sucesso && marcaDescobertaControladoraFacialEnviada(json, "NAO-EXISTE")) {
+    print_log("teste_controladoras_faciais_hikvision: serial ausente foi marcado como enviado.");
+    sucesso = false;
+  }
+  String json_meio = "[]";
+  if (sucesso && incorporaControladoraFacialNoJson(json_meio, "DS-K1T342CABO", "192.168.15.79", "80", "DS-K1T342MWX", "V3.16.1",
+                                                   "ethernet") != 1) {
+    print_log("teste_controladoras_faciais_hikvision: o leitor do cabo nao entrou com o meio ethernet.");
+    sucesso = false;
+  }
+  if (sucesso && (!leControladoraFacialNoJson(json_meio, "DS-K1T342CABO", ip_lido, porta_lida, modelo_lido, firmware_lido,
+                                              enviada, meio_lido) ||
+                  meio_lido != "ethernet" || ip_lido != "192.168.15.79")) {
+    print_log("teste_controladoras_faciais_hikvision: o meio ethernet do leitor nao foi gravado.");
+    sucesso = false;
+  }
+  if (sucesso && incorporaControladoraFacialNoJson(json_meio, "DS-K1T342CABO", "192.168.15.79", "80", "DS-K1T342MWX", "V3.16.1",
+                                                   "ethernet") != 0) {
+    print_log("teste_controladoras_faciais_hikvision: o mesmo leitor do cabo foi gravado de novo.");
+    sucesso = false;
+  }
+  IPAddress local_cabo = escolheEnderecoLocalDaControladoraFacial(IPAddress(192, 168, 15, 10), true, IPAddress(192, 168, 15, 20),
+                                                                  true, "192.168.15.79", "ethernet");
+  IPAddress local_wifi = escolheEnderecoLocalDaControladoraFacial(IPAddress(192, 168, 15, 10), true, IPAddress(192, 168, 15, 20),
+                                                                  true, "192.168.15.79", "wifi");
+  IPAddress local_so_cabo = escolheEnderecoLocalDaControladoraFacial(IPAddress(10, 0, 0, 2), true, IPAddress(192, 168, 15, 20),
+                                                                     true, "192.168.15.79", "");
+  if (sucesso && (local_cabo != IPAddress(192, 168, 15, 20) || local_wifi != IPAddress(192, 168, 15, 10) ||
+                  local_so_cabo != IPAddress(192, 168, 15, 20))) {
+    print_log("teste_controladoras_faciais_hikvision: o acesso ao leitor nao ficou na interface do cabo.");
+    sucesso = false;
+  }
+  String json_erro = montaJsonErroSincronizacaoFacial("2", "1", "DS-K1T342CABO", "statusCode 6");
+  if (sucesso && (strcmp(tipo_evento_erro_sincronizacao_facial, "erro_sync") != 0 || json_erro.indexOf("\"id\":\"2\"") < 0 ||
+                  json_erro.indexOf("\"user_id\":\"1\"") < 0 || json_erro.indexOf("\"erro\":\"statusCode 6\"") < 0 ||
+                  json_erro.indexOf("DS-K1T342CABO") < 0)) {
+    print_log("teste_controladoras_faciais_hikvision: o log erro_sync nao leva o retorno da facial.");
+    sucesso = false;
+  }
+
+  String json_limite = "[]";
+  for (int indice = 1; sucesso && indice <= quantidade_maxima_controladoras_faciais; indice++) {
+    if (incorporaControladoraFacialNoJson(json_limite, "SER" + String(indice), "10.0.0." + String(indice), "80", "DS-K1T671",
+                                          "V1") != 1) {
+      print_log("teste_controladoras_faciais_hikvision: a lista nao aceitou os leitores dentro do limite.");
+      sucesso = false;
+    }
+  }
+  if (sucesso && (incorporaControladoraFacialNoJson(json_limite, "SER9", "10.0.0.9", "80", "DS-K1T671", "V1") != -1 ||
+                  json_limite.indexOf("SER9") >= 0)) {
+    print_log("teste_controladoras_faciais_hikvision: a lista passou do limite de controladoras.");
+    sucesso = false;
+  }
+
+  String corpo_descoberta = montaCorpoDescobertaControladoraFacial("PG1-DV7FATQW95MP", "FAC-1001", "DS-K1T343MWX", "V1.0.4");
+  if (sucesso && (corpo_descoberta.indexOf("\"internal_token\":\"" + api_token + "\"") < 0 ||
+                  corpo_descoberta.indexOf("\"serial\":\"PG1-DV7FATQW95MP\"") < 0 ||
+                  corpo_descoberta.indexOf("\"facial_serial_id\":\"FAC-1001\"") < 0 ||
+                  corpo_descoberta.indexOf("\"facial_model_id\":\"DS-K1T343MWX\"") < 0 ||
+                  corpo_descoberta.indexOf("\"facial_firmware\":\"V1.0.4\"") < 0)) {
+    print_log("teste_controladoras_faciais_hikvision: corpo de /facials/discover incompleto.");
+    sucesso = false;
+  }
+  String corpo_lista = montaCorpoListaSincronizacoesFaciais("3port-9SCMGWLVEX8J");
+  if (sucesso && (corpo_lista != "{\"internal_token\":\"" + api_token +
+                                   "\",\"serial_id\":\"3port-9SCMGWLVEX8J\",\"quantity\":5}")) {
+    print_log("teste_controladoras_faciais_hikvision: /facials/syncs/list nao pede o serial da placa e quantity 5.");
+    sucesso = false;
+  }
+  String identificadores = acrescentaIdentificadorSincronizacaoFacial("", "10");
+  identificadores = acrescentaIdentificadorSincronizacaoFacial(identificadores, "11");
+  identificadores = acrescentaIdentificadorSincronizacaoFacial(identificadores, "");
+  identificadores = acrescentaIdentificadorSincronizacaoFacial(identificadores, "12a");
+  if (sucesso && (identificadores != "10,11" ||
+                  montaCorpoAtualizacaoSincronizacoesFaciais(identificadores).indexOf("\"ids\":\"10,11\"") < 0)) {
+    print_log("teste_controladoras_faciais_hikvision: /facials/syncs/update nao leva so os ids processados.");
+    sucesso = false;
+  }
+
+  String corpo_usuario = montaCorpoUsuarioControladoraFacial("42", "Ana \"Silva\"", "ana@ana.com");
+  if (sucesso && (corpo_usuario.indexOf("\"employeeNo\":\"42\"") < 0 || corpo_usuario.indexOf("Ana \\\"Silva\\\"") < 0 ||
+                  corpo_usuario.indexOf("\"email\":\"ana@ana.com\"") < 0 || corpo_usuario.indexOf("\"doorRight\":\"1\"") < 0 ||
+                  strcmp(caminho_criacao_usuario_controladora_facial, "/ISAPI/AccessControl/UserInfo/Record?format=json") != 0)) {
+    print_log("teste_controladoras_faciais_hikvision: o cadastro ISAPI do usuario nao leva employeeNo, nome e e-mail.");
+    sucesso = false;
+  }
+  if (sucesso && montaCorpoUsuarioControladoraFacial("42", "Ana").indexOf("\"email\"") >= 0) {
+    print_log("teste_controladoras_faciais_hikvision: o cadastro ISAPI incluiu e-mail vazio.");
+    sucesso = false;
+  }
+  if (sucesso && (montaCorpoBuscaUsuarioControladoraFacial("1").indexOf("\"employeeNo\":\"1\"") < 0 ||
+                  !respostaBuscaUsuarioIndicaExistente("{\"UserInfoSearch\":{\"numOfMatches\":1}}") ||
+                  respostaBuscaUsuarioIndicaExistente("{\"UserInfoSearch\":{\"numOfMatches\":0}}") ||
+                  !respostaBuscaUsuarioIndicaExistente("{\"subStatusCode\":\"employeeNoAlreadyExist\"}"))) {
+    print_log("teste_controladoras_faciais_hikvision: a busca do usuario nao distingue quem ja existe.");
+    sucesso = false;
+  }
+  String nome_longo = "ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890";
+  String nome_lido = extraiTextoJsonControladoraFacial(montaCorpoUsuarioControladoraFacial("7", nome_longo), "name", 0, 4000);
+  if (sucesso && (nome_lido.length() == 0 || nome_lido.length() > limite_caracteres_nome_usuario_controladora_facial)) {
+    print_log("teste_controladoras_faciais_hikvision: o nome do usuario passou do limite da controladora.");
+    sucesso = false;
+  }
+  String nome_acento = "";
+  for (int indice = 0; indice < 31; indice++) {
+    nome_acento += "A";
+  }
+  nome_acento += (char)0xC3;
+  nome_acento += (char)0xA1;
+  String nome_cortado = extraiTextoJsonControladoraFacial(montaCorpoUsuarioControladoraFacial("8", nome_acento), "name", 0, 4000);
+  if (sucesso && nome_cortado.length() != 31) {
+    print_log("teste_controladoras_faciais_hikvision: o corte do nome partiu o caractere acentuado.");
+    sucesso = false;
+  }
+  if (sucesso && montaMetadadosFotoControladoraFacial("42").indexOf("\"FPID\":\"42\"") < 0) {
+    print_log("teste_controladoras_faciais_hikvision: a foto nao usa o employeeNo como FPID.");
+    sucesso = false;
+  }
+
+  String exemplo_sync =
+      "{ \"id\": 10, \"user_id\": 42, \"name\": \"Maria Silva\", \"facial_serial_id\": \"FAC-1001\", \"image_base64\": \"YWI=\" }";
+  if (sucesso && (extraiTextoJsonControladoraFacial(exemplo_sync, "facial_serial_id", 0, exemplo_sync.length() - 1) != "FAC-1001" ||
+                  extraiTextoJsonControladoraFacial(exemplo_sync, "name", 0, exemplo_sync.length() - 1) != "Maria Silva" ||
+                  extraiNumeroJsonControladoraFacial(exemplo_sync, "user_id", 0, exemplo_sync.length() - 1) != "42" ||
+                  extraiNumeroJsonControladoraFacial(exemplo_sync, "id", 0, exemplo_sync.length() - 1) != "10")) {
+    print_log("teste_controladoras_faciais_hikvision: a leitura do sync pendente perdeu serial, usuario ou id.");
+    sucesso = false;
+  }
+  String exemplo_pedro =
+      "{\"id\":2,\"facial_id\":1,\"user_id\":1,\"status\":\"pending\","
+      "\"facial_serial_id\":\"DS-K1T342MWX20251216V031601ENGR3410269\",\"name\":\"pedro\",\"user_name\":\"outro\","
+      "\"user_email\":\"pedro@pedro.com\",\"image_base64\":\"YWI=\",\"mime_type\":\"image/jpeg\"}";
+  ItemSincronizacaoFacial item_pedro;
+  if (sucesso && (!leItemSincronizacaoFacial(exemplo_pedro, 0, (int)exemplo_pedro.length() - 1, item_pedro) ||
+                  item_pedro.identificador_sync != "2" || item_pedro.identificador_usuario != "1" ||
+                  item_pedro.nome_usuario != "pedro" || item_pedro.email_usuario != "pedro@pedro.com" ||
+                  item_pedro.serial_controladora != "DS-K1T342MWX20251216V031601ENGR3410269" ||
+                  item_pedro.tipo_mime != "image/jpeg" || !item_pedro.tem_foto ||
+                  montaCorpoAtualizacaoSincronizacoesFaciais(item_pedro.identificador_sync).indexOf("\"ids\":\"2\"") < 0)) {
+    print_log("teste_controladoras_faciais_hikvision: o item pending nao leva user_id, nome, e-mail e serial da facial.");
+    sucesso = false;
+  }
+
+  uint8_t *foto = nullptr;
+  size_t tamanho_foto = 0;
+  String codificado = "YWI=";
+  if (sucesso && (!decodificaBase64ControladoraFacial(codificado, 0, (int)codificado.length() - 1, &foto, &tamanho_foto) ||
+                  tamanho_foto != 2 || foto == nullptr || foto[0] != 'a' || foto[1] != 'b')) {
+    print_log("teste_controladoras_faciais_hikvision: a foto base64 nao voltou os bytes da imagem.");
+    sucesso = false;
+  }
+  liberaMemoriaControladoraFacial(foto);
+  foto = nullptr;
+  String codificado_uri = "data:image/jpeg;base64,YQ==";
+  if (sucesso && (!decodificaBase64ControladoraFacial(codificado_uri, 0, (int)codificado_uri.length() - 1, &foto, &tamanho_foto) ||
+                  tamanho_foto != 1 || foto == nullptr || foto[0] != 'a')) {
+    print_log("teste_controladoras_faciais_hikvision: data URI da foto nao foi decodificado.");
+    sucesso = false;
+  }
+  liberaMemoriaControladoraFacial(foto);
+  foto = nullptr;
+  tamanho_foto = 99;
+  if (sucesso && decodificaBase64ControladoraFacial(String("%%%%"), 0, 3, &foto, &tamanho_foto)) {
+    print_log("teste_controladoras_faciais_hikvision: base64 invalido foi aceito.");
+    sucesso = false;
+  }
+  liberaMemoriaControladoraFacial(foto);
+
+  String resposta_digest = calculaRespostaAutenticacaoDigest(
+      "Mufasa", "Circle Of Life", "testrealm@host.com", "dcd98b7102dd2f0e8b11d0f600bfb0c093", "GET", "/dir/index.html",
+      "auth", "00000001", "0a4f113b");
+  if (sucesso && resposta_digest != "6629fae49393a05397450978507c4ef1") {
+    print_log("teste_controladoras_faciais_hikvision: a autenticacao Digest da ISAPI nao confere.");
+    sucesso = false;
+  }
+  if (sucesso && (!respostaControladoraFacialIndicaSucesso(200, "{\"statusCode\":1,\"statusString\":\"OK\"}") ||
+                  !respostaControladoraFacialIndicaSucesso(200, "{\"statusCode\":6,\"subStatusCode\":\"employeeNoAlreadyExist\"}") ||
+                  respostaControladoraFacialIndicaSucesso(401, "{\"statusCode\":1}") ||
+                  respostaControladoraFacialIndicaSucesso(200, "{\"statusCode\":6,\"statusString\":\"Invalid Content\"}"))) {
+    print_log("teste_controladoras_faciais_hikvision: o retorno ISAPI de usuario novo ou ja existente foi lido errado.");
+    sucesso = false;
+  }
+
+  IPAddress broadcast_mesma_rede = enderecoBroadcastDaInterface(IPAddress(192, 168, 1, 20), IPAddress(255, 255, 255, 0));
+  IPAddress broadcast_cabo_mesma_rede = enderecoBroadcastDaInterface(IPAddress(192, 168, 1, 30), IPAddress(255, 255, 255, 0));
+  IPAddress broadcast_faixa_maior = enderecoBroadcastDaInterface(IPAddress(10, 1, 2, 3), IPAddress(255, 255, 0, 0));
+  if (sucesso && (broadcast_mesma_rede != IPAddress(192, 168, 1, 255) ||
+                  broadcast_cabo_mesma_rede != IPAddress(192, 168, 1, 255) ||
+                  broadcast_faixa_maior != IPAddress(10, 1, 255, 255))) {
+    print_log("teste_controladoras_faciais_hikvision: o broadcast da interface nao ficou na rede dela.");
+    sucesso = false;
+  }
+  String lista_busca = acrescentaPlacaNaBuscaFacial("[]", "FAC-WIFI", "192.168.1.50", "80", "DS-K1T343", "V1", "wifi");
+  lista_busca = acrescentaPlacaNaBuscaFacial(lista_busca, "FAC-CABO", "192.168.1.51", "80", "DS-K1T671", "V2", "ethernet");
+  lista_busca = acrescentaPlacaNaBuscaFacial(lista_busca, "FAC-WIFI", "192.168.1.50", "80", "DS-K1T343", "V1", "wifi");
+  lista_busca = acrescentaPlacaNaBuscaFacial(lista_busca, "", "192.168.1.52", "80", "DS-K1T343", "V1", "ethernet");
+  String json_busca = montaJsonLogBuscaFacial(lista_busca);
+  if (sucesso && (strcmp(tipo_evento_busca_facial, "facial_search") != 0 || montaJsonLogBuscaFacial("[]") != "{\"placas\":[]}" ||
+                  json_busca.indexOf("\"meio\":\"wifi\"") < 0 || json_busca.indexOf("\"meio\":\"ethernet\"") < 0 ||
+                  json_busca.indexOf("FAC-WIFI") < 0 || json_busca.indexOf("FAC-CABO") < 0 ||
+                  json_busca.indexOf("FAC-WIFI") != json_busca.lastIndexOf("FAC-WIFI") ||
+                  json_busca.indexOf("192.168.1.52") >= 0)) {
+    print_log("teste_controladoras_faciais_hikvision: o log facial_search nao leva o leitor do cabo junto com o do Wi-Fi.");
+    sucesso = false;
+  }
+
+  if (json_controladoras_faciais != json_original) {
+    json_controladoras_faciais = json_original;
+    print_log("teste_controladoras_faciais_hikvision: o teste alterou a lista de controladoras da placa.");
+    sucesso = false;
+  }
+  return sucesso;
 }
 
 // ============================================================
@@ -8471,6 +10537,7 @@ void setup() {
 
   carregarConfigWifi();
   carregaSerialPortguard();
+  carregaControladorasFaciais();
   registraEventosWifiEsp32S3();
   iniciarEthernet();
 
@@ -8517,7 +10584,8 @@ void setup() {
 // ============================================================
 
 // Loop dedicado à rede. Sem serial em serial_portguard, só mantém a conexão e consulta a instalação.
-// Com serial, segue a fila da API, o heartbeat e o envio dos eventos. Entradas e saídas ficam na tarefaControlePortoes.
+// Com serial, segue a fila da API, o heartbeat, o envio dos eventos e o ciclo das controladoras faciais.
+// Entradas e saídas ficam na tarefaControlePortoes.
 void loop() {
   verificarRede();
   if (!serialPortguardConfigurado() || conclusao_instalacao_placa_pendente) {
@@ -8542,5 +10610,6 @@ void loop() {
   }
   enviaCadastrosBotoesControlePendentes();
   enviaLogsPulsosBotoesControle();
+  processaControladorasFaciais();
   delay(10);
 }
