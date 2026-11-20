@@ -10,6 +10,7 @@ Implementada em `script.cpp`.
 - O valor é o meio que está no ar no instante do envio: `wifi` ou `ethernet`.
 - Se os dois estão no ar, vai `wifi`, porque o envio tenta o Wi-Fi primeiro.
 - O campo não entra na fila. Ele é colocado na hora em que o log sai.
+- O heartbeat também leva `event_data` `{"connection_type":"wifi","ssid":"NomeDaRede"}`. Sem Wi-Fi associado, `ssid` vai vazio. O `connection_type` do formulário continua sendo o meio.
 
 ## last_wifi_config
 - Quando uma configuração de Wi-Fi associa de verdade, SSID e senha vão para a Preferences no JSON `{"ssid":"...","password":"..."}`.
@@ -37,3 +38,4 @@ Implementada em `script.cpp`.
 
 ## Teste
 - `teste_comunicacao_api_wifi_e_fila_logs` em `teste_completo()`: URL, `connection_type`, chave de 15 caracteres, JSON do Wi-Fi, `wifi_error` com a rede que falhou e limite da fila. Não grava Preferences nem chama a rede.
+- `teste_heartbeat_ssid_e_sync_facial` em `teste_completo()`: o `event_data` do heartbeat leva o meio e o SSID, e um sync com objeto aninhado ainda entrega a facial e a foto.

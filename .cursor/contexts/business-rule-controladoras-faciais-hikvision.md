@@ -23,20 +23,23 @@ Implementada em `script.cpp`.
 
 ## API Portguard
 - Leitor novo (ou ainda não confirmado): `POST /api/v1/facials/discover` com `internal_token`, `serial` da placa, `facial_serial_id`, `facial_model_id` e `facial_firmware`.
-- No mesmo ciclo de 10 s: `POST /api/v1/facials/syncs/list` com `internal_token`, `serial_id` da placa e `quantity` 5. A fila dessa placa vem em `list`.
-- Para cada item de `list`: `user_id`, `name` (ou `user_name` se `name` vier vazio), `user_email`, `image_base64` e `facial_serial_id`. O serial acha o IP na Preferences. Sem leitor local, sem foto ou com retorno de erro da facial, o id continua pendente.
+- No mesmo ciclo de 10 s: `POST /api/v1/facials/syncs/list` com `internal_token`, `serial_id` da placa, `quantity` 5, `quantidade` 5 e `status` `pending`. A fila dessa placa vem em `list`.
+- Para cada item de `list`: `user_id`, `name` (ou `user_name` se `name` vier vazio), `user_email`, `image_base64` e `facial_serial_id`. O objeto pode ter campos aninhados; o fim do item é a chave que fecha o objeto inteiro. O serial acha o IP na Preferences. Sem leitor local, sem foto ou com retorno de erro da facial, o id continua pendente.
+- A resposta com a foto fica num bloco de memória (PSRAM quando existe). A `String` do núcleo não precisa segurar o base64 inteiro.
 - Cada item aceito pela facial gera na hora `POST /api/v1/facials/syncs/update` com `ids` desse item. A rota marca o id como sincronizado. Id que a facial recusou não entra nesse POST.
-- O monitor serial abre um bloco `SYNC FACIAL` para cada item encontrado, com o id, o usuário, a facial e o status na facial (novo, já existe, aceito ou o erro).
+- O monitor serial abre um bloco `SYNC FACIAL` para cada item encontrado. As linhas dizem que o sync foi recebido, em qual facial (serial e IP) a tentativa vai ocorrer e qual foi o retorno da facial.
 - Erro da facial, leitor ainda não descoberto ou foto ausente gera o log `erro_sync` em `/plaque-events-logs/save`. O `event_data` é `{"id","user_id","facial_serial_id","erro"}` e `erro` é o texto devolvido pela facial.
 
 ## ISAPI Hikvision
 - Antes de gravar, `POST /ISAPI/AccessControl/UserInfo/Search?format=json` procura o `employeeNo` (`user_id`). `numOfMatches` maior que zero, ou `employeeNoAlreadyExist`, significa que o usuário já está no leitor.
 - Usuário novo: `POST /ISAPI/AccessControl/UserInfo/Record?format=json` com `employeeNo`, `name` e `email` (`user_email`). O nome vai em até 32 bytes.
 - Usuário que já existe: a placa não reenvia o cadastro. Só a face muda.
-- Foto, nos dois casos: `PUT /ISAPI/Intelligent/FDLib/FDSetUp?format=json`, multipart `FaceDataRecord` (`faceLibType` `blackFD`, `FDID` `1`, `FPID` = `employeeNo`) e `FaceImage`. Cria a face ou substitui a que já está no leitor.
+- Foto, nos dois casos: a imagem chega em `image_base64` e é decodificada. O envio é `PUT /ISAPI/Intelligent/FDLib/FDSetUp?format=json`, multipart `FaceDataRecord` (`faceLibType` `blackFD`, `FDID` `1`, `FPID` = `employeeNo`) e `FaceImage`. Esse é o cadastro da Hikvision: cria a face ou substitui a que já está no leitor.
+- Se o terminal recusar o `FDSetUp`, a mesma foto segue em `POST /ISAPI/Intelligent/FDLib/FaceDataRecord?format=json`, com o mesmo multipart. O retorno HTTP das duas tentativas aparece no monitor.
 - A foto vem em `image_base64` (aceita data URI). Acima de 200 KB a Hikvision recusa e o sync fica pendente.
 - Autenticação HTTP Digest. Usuário `admin`, senha `Portguard@123` (`usuario_controladora_facial_hikvision` e `senha_controladora_facial_hikvision`). O leitor precisa estar ativado com essa conta. O nonce sai de `GET /ISAPI/System/deviceInfo?format=json`.
 - A requisição ISAPI sai pela interface em que o leitor foi descoberto. Com os dois meios no mesmo /24, o TCP é aberto já preso no IP dessa interface.
 
 ## Teste
-`teste_controladoras_faciais_hikvision` (em `teste_completo()`): intervalo, chave, sonda DS-K1T, recusa de câmera, lista por serial, limite de 8, troca de IP sem reabrir descoberta já enviada, meio ethernet no mesmo /24 do Wi-Fi, corpos de discover/list/update, busca do usuário, Record com e-mail, item pending com nome, e-mail e serial, log `erro_sync`, FPID, Digest RFC 2617, base64, broadcast da interface e o JSON `facial_search` com leitor de Wi-Fi e de cabo na mesma rede. Não grava Preferences e não chama a rede.
+`teste_controladoras_faciais_hikvision` (em `teste_completo()`): intervalo, chave, sonda DS-K1T, recusa de câmera, lista por serial, limite de 8, troca de IP sem reabrir descoberta já enviada, meio ethernet no mesmo /24 do Wi-Fi, corpos de discover/list/update, busca do usuário, Record com e-mail, item pending com nome, e-mail e serial, log `erro_sync`, FPID, `FDSetUp` e `FaceDataRecord`, Digest RFC 2617, base64, broadcast da interface e o JSON `facial_search` com leitor de Wi-Fi e de cabo na mesma rede. Não grava Preferences e não chama a rede.
+`teste_heartbeat_ssid_e_sync_facial` (em `teste_completo()`): heartbeat com meio e SSID, e sync cujo JSON tem objeto interno ainda entrega serial, usuário e foto.

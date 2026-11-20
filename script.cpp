@@ -157,6 +157,7 @@
        O open_or_close_gate guarda o user_id da ação e o gate_open ou
        gate_close seguinte leva esse user_id no event_data.
      - Todo log leva connection_type (wifi ou ethernet) do meio ativo no envio.
+       O heartbeat também grava o SSID do Wi-Fi associado no event_data.
        Sem internet, o log vai para a Preferences queue_logs e sai antes
        das outras chamadas quando a rede volta.
      - Wi-Fi que conectou fica em last_wifi_config. Se a configuração nova
@@ -165,11 +166,14 @@
        Hikvision no Wi-Fi e no cabo, cada um pelo proprio IP (mesma rede
        nao esconde o cabo). Grava serial e IP novos, envia /facials/discover
        e um log facial_search com as placas achadas na rodada.
-       No mesmo ciclo busca ate 5 syncs em /facials/syncs/list
-       com internal_token, serial_id da placa e quantity. Usuario novo
-       vai com user_id, nome e e-mail; usuario que ja existe so atualiza a
-       face. Cada item aceito pela facial e confirmado em /facials/syncs/update.
-       Erro da facial vira o log erro_sync e uma linha no monitor serial.
+       No mesmo ciclo busca ate 5 syncs pending em /facials/syncs/list
+       com internal_token, serial_id da placa, quantity e quantidade.
+       O monitor registra o sync recebido, a facial de destino e o retorno.
+       Usuario novo vai com user_id, nome e e-mail; usuario que ja existe
+       so atualiza a face. A foto sai do image_base64 para o FDSetUp e, se
+       o terminal recusar, para o FaceDataRecord. Cada item aceito pela
+       facial e confirmado em /facials/syncs/update. Erro da facial vira
+       o log erro_sync.
   ============================================================
 */
 
@@ -241,6 +245,7 @@ const char rota_atualizacao_sincronizacoes_faciais[] = "/facials/syncs/update";
 const char caminho_busca_usuario_controladora_facial[] = "/ISAPI/AccessControl/UserInfo/Search?format=json";
 const char caminho_criacao_usuario_controladora_facial[] = "/ISAPI/AccessControl/UserInfo/Record?format=json";
 const char caminho_cadastro_foto_controladora_facial[] = "/ISAPI/Intelligent/FDLib/FDSetUp?format=json";
+const char caminho_cadastro_foto_novo_controladora_facial[] = "/ISAPI/Intelligent/FDLib/FaceDataRecord?format=json";
 const char caminho_desafio_controladora_facial[] = "/ISAPI/System/deviceInfo?format=json";
 const char tipo_evento_busca_facial[] = "facial_search";
 const char tipo_evento_erro_sincronizacao_facial[] = "erro_sync";
@@ -258,7 +263,11 @@ String opaque_digest_controladora_facial = "";
 String ip_digest_controladora_facial = "";
 uint32_t sequencia_digest_controladora_facial = 0;
 bool controladora_facial_sem_autenticacao = false;
+String retorno_ultima_requisicao_controladora_facial = "";
 IPAddress endereco_local_requisicao_controladora_facial(0, 0, 0, 0);
+char *corpo_resposta_http_bruto = nullptr;
+int tamanho_corpo_resposta_http_bruto = 0;
+bool guardar_corpo_resposta_http_bruto = false;
 const char operacao_api_botao_cadastrar = 'c';
 const char operacao_api_botao_resetar = 'r';
 
@@ -781,9 +790,9 @@ void reportarErroRede(const char *mensagem) {
   }
 
   ultimoErroRede = agora;
-  Serial.println();
-  Serial.print("ERRO: ");
-  Serial.println(mensagem);
+  // Serial.println();
+  // Serial.print("ERRO: ");
+  // Serial.println(mensagem);
 }
 
 void aplicarRotaDeRede() {
@@ -819,15 +828,15 @@ void onEthEvent(arduino_event_id_t event, arduino_event_info_t info) {
 
   switch (event) {
     case ARDUINO_EVENT_ETH_START:
-      Serial.println();
-      Serial.println("[ETH] W5500 iniciado.");
+      // Serial.println();
+      // Serial.println("[ETH] W5500 iniciado.");
       ETH.setHostname("portguard");
       break;
 
     case ARDUINO_EVENT_ETH_CONNECTED:
-      Serial.println();
-      Serial.println("[ETH] Cabo de rede conectado.");
-      Serial.println("[ETH] Aguardando DHCP...");
+      // Serial.println();
+      // Serial.println("[ETH] Cabo de rede conectado.");
+      // Serial.println("[ETH] Aguardando DHCP...");
       break;
 
     case ARDUINO_EVENT_ETH_GOT_IP:
@@ -847,30 +856,30 @@ void onEthEvent(arduino_event_id_t event, arduino_event_info_t info) {
 
       cicloApiAssimQueRedeSubir = true;
 
-      Serial.println();
-      Serial.println("======================================");
-      Serial.println("CABO DE REDE CONECTADO COM SUCESSO");
-      Serial.println("======================================");
-      Serial.print("IP: ");
-      Serial.println(ETH.localIP());
-      Serial.print("Gateway: ");
-      Serial.println(ETH.gatewayIP());
-      Serial.print("Mascara: ");
-      Serial.println(ETH.subnetMask());
-      Serial.print("DNS: ");
-      Serial.println(ETH.dnsIP());
-      Serial.print("MAC: ");
-      Serial.println(ETH.macAddress());
-      Serial.print("Velocidade: ");
-      Serial.print(ETH.linkSpeed());
-      Serial.println(" Mbps");
-      Serial.println("======================================");
+      // Serial.println();
+      // Serial.println("======================================");
+      // Serial.println("CABO DE REDE CONECTADO COM SUCESSO");
+      // Serial.println("======================================");
+      // Serial.print("IP: ");
+      // Serial.println(ETH.localIP());
+      // Serial.print("Gateway: ");
+      // Serial.println(ETH.gatewayIP());
+      // Serial.print("Mascara: ");
+      // Serial.println(ETH.subnetMask());
+      // Serial.print("DNS: ");
+      // Serial.println(ETH.dnsIP());
+      // Serial.print("MAC: ");
+      // Serial.println(ETH.macAddress());
+      // Serial.print("Velocidade: ");
+      // Serial.print(ETH.linkSpeed());
+      // Serial.println(" Mbps");
+      // Serial.println("======================================");
       break;
 
     case ARDUINO_EVENT_ETH_LOST_IP:
       ethComIp = false;
-      Serial.println();
-      Serial.println("[ETH] IP perdido.");
+      // Serial.println();
+      // Serial.println("[ETH] IP perdido.");
       if (!wifiConectado()) {
         reportarErroRede("nao ha conexao com a internet.");
       }
@@ -878,8 +887,8 @@ void onEthEvent(arduino_event_id_t event, arduino_event_info_t info) {
 
     case ARDUINO_EVENT_ETH_DISCONNECTED:
       ethComIp = false;
-      Serial.println();
-      Serial.println("[ETH] Cabo desconectado.");
+      // Serial.println();
+      // Serial.println("[ETH] Cabo desconectado.");
       if (!wifiConectado()) {
         reportarErroRede("nao ha conexao com a internet.");
       }
@@ -887,8 +896,8 @@ void onEthEvent(arduino_event_id_t event, arduino_event_info_t info) {
 
     case ARDUINO_EVENT_ETH_STOP:
       ethComIp = false;
-      Serial.println();
-      Serial.println("[ETH] Ethernet parado.");
+      // Serial.println();
+      // Serial.println("[ETH] Ethernet parado.");
       if (!wifiConectado()) {
         reportarErroRede("nao ha conexao com a internet.");
       }
@@ -904,39 +913,39 @@ void onEthEvent(arduino_event_id_t event, arduino_event_info_t info) {
 // ============================================================
 
 void diagnosticarEthernet() {
-  Serial.println();
-  Serial.println("-------- DEBUG ETHERNET --------");
-  Serial.print("W5500 iniciado: ");
-  Serial.println(ethBeginOk ? "SIM" : "NAO");
-  Serial.print("Link fisico: ");
-  Serial.println(ETH.linkUp() ? "SIM" : "NAO");
-  Serial.print("DHCP/IP: ");
-  Serial.println(ethComIp ? "SIM" : "NAO");
+  // Serial.println();
+  // Serial.println("-------- DEBUG ETHERNET --------");
+  // Serial.print("W5500 iniciado: ");
+  // Serial.println(ethBeginOk ? "SIM" : "NAO");
+  // Serial.print("Link fisico: ");
+  // Serial.println(ETH.linkUp() ? "SIM" : "NAO");
+  // Serial.print("DHCP/IP: ");
+  // Serial.println(ethComIp ? "SIM" : "NAO");
 
   if (ethBeginOk) {
-    Serial.print("IP: ");
-    Serial.println(ETH.localIP());
-    Serial.print("Gateway: ");
-    Serial.println(ETH.gatewayIP());
-    Serial.print("Mascara: ");
-    Serial.println(ETH.subnetMask());
-    Serial.print("DNS: ");
-    Serial.println(ETH.dnsIP());
-    Serial.print("MAC: ");
-    Serial.println(ETH.macAddress());
+    // Serial.print("IP: ");
+    // Serial.println(ETH.localIP());
+    // Serial.print("Gateway: ");
+    // Serial.println(ETH.gatewayIP());
+    // Serial.print("Mascara: ");
+    // Serial.println(ETH.subnetMask());
+    // Serial.print("DNS: ");
+    // Serial.println(ETH.dnsIP());
+    // Serial.print("MAC: ");
+    // Serial.println(ETH.macAddress());
 
     if (ETH.linkUp()) {
-      Serial.print("Velocidade: ");
-      Serial.print(ETH.linkSpeed());
-      Serial.println(" Mbps");
+      // Serial.print("Velocidade: ");
+      // Serial.print(ETH.linkSpeed());
+      // Serial.println(" Mbps");
     }
   }
 
-  Serial.print("Rede atual: ");
-  Serial.println(redeAtual());
-  Serial.print("Heap livre: ");
-  Serial.println(ESP.getFreeHeap());
-  Serial.println("--------------------------------");
+  // Serial.print("Rede atual: ");
+  // Serial.println(redeAtual());
+  // Serial.print("Heap livre: ");
+  // Serial.println(ESP.getFreeHeap());
+  // Serial.println("--------------------------------");
 }
 
 void iniciarEthernet() {
@@ -946,18 +955,18 @@ void iniciarEthernet() {
 
   ethIniciado = true;
 
-  Serial.println();
-  Serial.println("======================================");
-  Serial.println("INICIANDO ETHERNET W5500");
-  Serial.println("======================================");
-  Serial.println("MAV1022 / ESP32-S3");
-  Serial.println("SPI:");
-  Serial.println("SCK  = GPIO13");
-  Serial.println("MISO = GPIO12");
-  Serial.println("MOSI = GPIO11");
-  Serial.println("CS   = GPIO14");
-  Serial.println("INT  = GPIO10");
-  Serial.println("RST  = GPIO7");
+  // Serial.println();
+  // Serial.println("======================================");
+  // Serial.println("INICIANDO ETHERNET W5500");
+  // Serial.println("======================================");
+  // Serial.println("MAV1022 / ESP32-S3");
+  // Serial.println("SPI:");
+  // Serial.println("SCK  = GPIO13");
+  // Serial.println("MISO = GPIO12");
+  // Serial.println("MOSI = GPIO11");
+  // Serial.println("CS   = GPIO14");
+  // Serial.println("INT  = GPIO10");
+  // Serial.println("RST  = GPIO7");
 
   Network.onEvent(onEthEvent);
   SPI.begin(ETH_SPI_SCK, ETH_SPI_MISO, ETH_SPI_MOSI);
@@ -971,14 +980,14 @@ void iniciarEthernet() {
       SPI
   );
 
-  Serial.println();
+  // Serial.println();
   if (ethBeginOk) {
-    Serial.println("W5500 inicializado.");
-    Serial.println("Aguardando cabo e DHCP...");
+    // Serial.println("W5500 inicializado.");
+    // Serial.println("Aguardando cabo e DHCP...");
   } else {
-    Serial.println("ERRO: W5500 nao iniciou.");
+    // Serial.println("ERRO: W5500 nao iniciou.");
   }
-  Serial.println("======================================");
+  // Serial.println("======================================");
 }
 
 // ============================================================
@@ -2489,6 +2498,12 @@ String escapaTextoJson(const String &texto) {
   return saida;
 }
 
+// event_data do heartbeat: o meio que está no ar e o SSID do Wi-Fi associado.
+String montaEventDataHeartbeat(const char *tipo_conexao, const String &ssid_wifi) {
+  String meio = tipo_conexao == nullptr ? "" : tipo_conexao;
+  return "{\"connection_type\":\"" + escapaTextoJson(meio) + "\",\"ssid\":\"" + escapaTextoJson(ssid_wifi) + "\"}";
+}
+
 // JSON de SSID e senha usado em last_wifi_config e no event_data de wifi_error.
 String montaJsonWifi(const String &ssid, const String &senha) {
   return "{\"ssid\":\"" + escapaTextoJson(ssid) + "\",\"password\":\"" + escapaTextoJson(senha) + "\"}";
@@ -2517,13 +2532,38 @@ String extraiCampoJsonSimples(const String &objeto, const char *campo) {
   return valor;
 }
 
-// Fecha o objeto que começa em inicio. Ignora } que esteja dentro de uma string.
-int indiceFimObjetoJson(const String &texto, int inicio) {
-  if (inicio < 0 || inicio >= (int)texto.length() || texto[inicio] != '{') {
+// Primeira ocorrência de padrao a partir de inicio. -1 quando não existe na faixa.
+int indiceNoTexto(const char *texto, int tamanho, const char *padrao, int inicio) {
+  if (texto == nullptr || padrao == nullptr || inicio < 0 || tamanho <= 0) {
+    return -1;
+  }
+  int tamanho_padrao = (int)strlen(padrao);
+  if (tamanho_padrao <= 0 || inicio > tamanho - tamanho_padrao) {
+    return -1;
+  }
+  for (int indice = inicio; indice <= tamanho - tamanho_padrao; indice++) {
+    bool confere = true;
+    for (int letra = 0; letra < tamanho_padrao; letra++) {
+      if (texto[indice + letra] != padrao[letra]) {
+        confere = false;
+        break;
+      }
+    }
+    if (confere) {
+      return indice;
+    }
+  }
+  return -1;
+}
+
+// Fecha o objeto que começa em inicio, respeitando objetos aninhados e strings.
+int indiceFimObjetoJson(const char *texto, int tamanho, int inicio) {
+  if (texto == nullptr || inicio < 0 || inicio >= tamanho || texto[inicio] != '{') {
     return -1;
   }
   bool dentro_de_texto = false;
-  for (int indice = inicio; indice < (int)texto.length(); indice++) {
+  int profundidade = 0;
+  for (int indice = inicio; indice < tamanho; indice++) {
     char caractere = texto[indice];
     if (dentro_de_texto) {
       if (caractere == '\\') {
@@ -2539,11 +2579,23 @@ int indiceFimObjetoJson(const String &texto, int inicio) {
       dentro_de_texto = true;
       continue;
     }
+    if (caractere == '{') {
+      profundidade++;
+      continue;
+    }
     if (caractere == '}') {
-      return indice;
+      profundidade--;
+      if (profundidade == 0) {
+        return indice;
+      }
     }
   }
   return -1;
+}
+
+// Fecha o objeto que começa em inicio. Ignora } que esteja dentro de uma string.
+int indiceFimObjetoJson(const String &texto, int inicio) {
+  return indiceFimObjetoJson(texto.c_str(), (int)texto.length(), inicio);
 }
 
 // Separa ssid e password do JSON de last_wifi_config.
@@ -2675,7 +2727,7 @@ void carregarConfigWifi() {
   }
 
   if (setup_finished && wifi_ssid.length() > 0) {
-    Serial.println("WiFi carregado da Preferences.");
+    // Serial.println("WiFi carregado da Preferences.");
     if (json_last_wifi_config.length() == 0 && wifi_password.length() > 0) {
       json_last_wifi_config = montaJsonWifi(wifi_ssid, wifi_password);
       preferences.begin("portguard", false);
@@ -2687,15 +2739,15 @@ void carregarConfigWifi() {
     setup_finished = false;
     wifi_ssid = "";
     wifi_password = "";
-    Serial.println("WiFi ainda nao persistido.");
+    // Serial.println("WiFi ainda nao persistido.");
   }
 
-  Serial.print("setup_finished=");
-  Serial.println(setup_finished ? "sim" : "nao");
-  Serial.print("SSID=");
-  Serial.println(wifi_ssid.length() ? wifi_ssid : "(vazio)");
-  Serial.print("ethernet_ok persistido=");
-  Serial.println(ethernetDetectado ? "sim" : "nao");
+  // Serial.print("setup_finished=");
+  // Serial.println(setup_finished ? "sim" : "nao");
+  // Serial.print("SSID=");
+  // Serial.println(wifi_ssid.length() ? wifi_ssid : "(vazio)");
+  // Serial.print("ethernet_ok persistido=");
+  // Serial.println(ethernetDetectado ? "sim" : "nao");
 }
 
 void salvarConfigWifi() {
@@ -2704,7 +2756,7 @@ void salvarConfigWifi() {
   preferences.putString("wifi_ssid", wifi_ssid);
   preferences.putString("wifi_password", wifi_password);
   preferences.end();
-  Serial.println("WiFi persistido na Preferences.");
+  // Serial.println("WiFi persistido na Preferences.");
 }
 
 // Grava last_wifi_config só quando o SSID e a senha são de uma conexão que já deu certo.
@@ -2899,7 +2951,7 @@ void limparConfigWifi() {
   }
 
   aplicarRotaDeRede();
-  Serial.println("WiFi removido. Usando cabo de rede ate novo config_plaque.");
+  // Serial.println("WiFi removido. Usando cabo de rede ate novo config_plaque.");
 }
 
 void salvarFlagEthernet(bool detectado) {
@@ -2908,8 +2960,8 @@ void salvarFlagEthernet(bool detectado) {
   preferences.putBool("ethernet_ok", ethernetDetectado);
   preferences.end();
 
-  Serial.print("Flag ethernet_ok persistida=");
-  Serial.println(ethernetDetectado ? "sim" : "nao");
+  // Serial.print("Flag ethernet_ok persistida=");
+  // Serial.println(ethernetDetectado ? "sim" : "nao");
 }
 
 bool precisaConfigurarWifi() {
@@ -2942,21 +2994,21 @@ String statusWifiTexto() {
 }
 
 void diagnosticarWifi() {
-  Serial.println();
-  Serial.println("-------- DEBUG WIFI --------");
-  Serial.print("SSID: ");
-  Serial.println(wifi_ssid);
-  Serial.print("Status: ");
-  Serial.println(statusWifiTexto());
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
-  Serial.print("RSSI: ");
-  Serial.println(WiFi.RSSI());
-  Serial.print("MAC: ");
-  Serial.println(WiFi.macAddress());
-  Serial.print("Heap livre: ");
-  Serial.println(ESP.getFreeHeap());
-  Serial.println("----------------------------");
+  // Serial.println();
+  // Serial.println("-------- DEBUG WIFI --------");
+  // Serial.print("SSID: ");
+  // Serial.println(wifi_ssid);
+  // Serial.print("Status: ");
+  // Serial.println(statusWifiTexto());
+  // Serial.print("IP: ");
+  // Serial.println(WiFi.localIP());
+  // Serial.print("RSSI: ");
+  // Serial.println(WiFi.RSSI());
+  // Serial.print("MAC: ");
+  // Serial.println(WiFi.macAddress());
+  // Serial.print("Heap livre: ");
+  // Serial.println(ESP.getFreeHeap());
+  // Serial.println("----------------------------");
 }
 
 // ============================================================
@@ -3027,19 +3079,19 @@ void imprimirCabecalhoRequisicao(const char *destino, bool usarWifi) {
   if (requisicao_sem_log_de_sucesso) {
     return;
   }
-  Serial.println();
-  Serial.print("Requisição: ");
-  Serial.println(destino);
-  Serial.print("Meio: ");
-  Serial.println(usarWifi ? "WIFI" : "CABO DE REDE");
-  Serial.print("IP: ");
-  Serial.println(usarWifi ? WiFi.localIP() : ETH.localIP());
+  // Serial.println();
+  // Serial.print("Requisição: ");
+  // Serial.println(destino);
+  // Serial.print("Meio: ");
+  // Serial.println(usarWifi ? "WIFI" : "CABO DE REDE");
+  // Serial.print("IP: ");
+  // Serial.println(usarWifi ? WiFi.localIP() : ETH.localIP());
   if (usarWifi) {
-    Serial.print("ssid: ");
-    Serial.println(wifi_ssid.length() ? wifi_ssid : "(vazio)");
-    Serial.print("rssi: ");
-    Serial.print(WiFi.RSSI());
-    Serial.println(" dBm");
+    // Serial.print("ssid: ");
+    // Serial.println(wifi_ssid.length() ? wifi_ssid : "(vazio)");
+    // Serial.print("rssi: ");
+    // Serial.print(WiFi.RSSI());
+    // Serial.println(" dBm");
   }
 }
 
@@ -3054,19 +3106,19 @@ void imprimirStatusRequisicao(bool ok, const String &erro) {
     }
     return;
   }
-  Serial.print("status requisição: ");
+  // Serial.print("status requisição: ");
   if (ok) {
-    Serial.println("sucesso");
+    // Serial.println("sucesso");
     return;
   }
 
-  Serial.print("erro");
+  // Serial.print("erro");
   if (erro.length() > 0) {
-    Serial.print(" (");
-    Serial.print(erro);
-    Serial.print(")");
+    // Serial.print(" (");
+    // Serial.print(erro);
+    // Serial.print(")");
   }
-  Serial.println();
+  // Serial.println();
 }
 
 String motivoCaboIndisponivel() {
@@ -3080,6 +3132,92 @@ String motivoCaboIndisponivel() {
     return "cabo ligado, mas sem IP (DHCP)";
   }
   return "cabo indisponivel";
+}
+
+// Guarda o corpo HTTP em memória, de preferência na PSRAM, sem passar pela String do núcleo.
+class GravadorCorpoHttp : public Stream {
+ public:
+  char *buffer;
+  size_t capacidade;
+  size_t usado;
+  bool falhou;
+
+  GravadorCorpoHttp() : buffer(nullptr), capacidade(0), usado(0), falhou(false) {}
+
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void flush() override {}
+
+  size_t write(uint8_t dado) override { return acrescenta(&dado, 1); }
+
+  size_t write(const uint8_t *dados, size_t quantidade) { return acrescenta(dados, quantidade); }
+
+ private:
+  // Cresce o bloco e copia. Não chama write(), para não reentrar no Print.
+  size_t acrescenta(const uint8_t *dados, size_t quantidade) {
+    if (falhou || dados == nullptr || quantidade == 0) {
+      return falhou ? 0 : quantidade;
+    }
+    if (usado + quantidade + 1 > capacidade) {
+      size_t nova_capacidade = capacidade == 0 ? 4096 : capacidade * 2;
+      while (nova_capacidade < usado + quantidade + 1) {
+        nova_capacidade *= 2;
+      }
+      char *maior = (char *)heap_caps_malloc(nova_capacidade, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (maior == nullptr) {
+        maior = (char *)malloc(nova_capacidade);
+      }
+      if (maior == nullptr) {
+        falhou = true;
+        return 0;
+      }
+      if (buffer != nullptr && usado > 0) {
+        memcpy(maior, buffer, usado);
+      }
+      if (buffer != nullptr) {
+        free(buffer);
+      }
+      buffer = maior;
+      capacidade = nova_capacidade;
+    }
+    memcpy(buffer + usado, dados, quantidade);
+    usado += quantidade;
+    buffer[usado] = 0;
+    return quantidade;
+  }
+};
+
+// Libera o corpo HTTP grande guardado para ler a foto do sync facial.
+void liberaCorpoRespostaHttpBruto() {
+  if (corpo_resposta_http_bruto != nullptr) {
+    free(corpo_resposta_http_bruto);
+    corpo_resposta_http_bruto = nullptr;
+  }
+  tamanho_corpo_resposta_http_bruto = 0;
+}
+
+// Lê o corpo HTTP num bloco, preferindo a PSRAM. A String do núcleo não segura a foto em base64.
+bool leCorpoHttpEmBuffer(HTTPClient &http, char **saida, int *tamanho) {
+  if (saida == nullptr || tamanho == nullptr) {
+    return false;
+  }
+  *saida = nullptr;
+  *tamanho = 0;
+  GravadorCorpoHttp gravador;
+  int escrito = http.writeToStream(&gravador);
+  if (escrito < 0 || gravador.falhou) {
+    if (gravador.buffer != nullptr) {
+      free(gravador.buffer);
+    }
+    return false;
+  }
+  if (gravador.buffer == nullptr) {
+    return true;
+  }
+  *saida = gravador.buffer;
+  *tamanho = (int)gravador.usado;
+  return true;
 }
 
 bool postHttpNoMeio(bool usarWifi, const char *destino, const String &url, const String &body, int timeoutMs, String *payloadOut,
@@ -3134,17 +3272,44 @@ bool postHttpNoMeio(bool usarWifi, const char *destino, const String &url, const
 
   requisicao_http_obteve_resposta = true;
 
-  String payload = http.getString();
+  char *bruto = nullptr;
+  int tamanho_bruto = 0;
+  bool leu_bruto = leCorpoHttpEmBuffer(http, &bruto, &tamanho_bruto);
   http.end();
   httpsClient.stop();
+
+  String payload = "";
+  bool corpo_grande = guardar_corpo_resposta_http_bruto && tamanho_bruto > 48000;
+  bool copia_completa = false;
+  if (leu_bruto && bruto != nullptr && !corpo_grande) {
+    payload = String(bruto);
+    copia_completa = (int)payload.length() == tamanho_bruto;
+    if (!copia_completa) {
+      payload = "";
+    }
+  }
+  if (guardar_corpo_resposta_http_bruto && bruto != nullptr && (corpo_grande || !copia_completa)) {
+    liberaCorpoRespostaHttpBruto();
+    corpo_resposta_http_bruto = bruto;
+    tamanho_corpo_resposta_http_bruto = tamanho_bruto;
+    bruto = nullptr;
+  } else if (guardar_corpo_resposta_http_bruto && copia_completa) {
+    liberaCorpoRespostaHttpBruto();
+  }
+  if (bruto != nullptr) {
+    free(bruto);
+  }
+  if (!leu_bruto || (tamanho_bruto > 0 && payload.length() == 0 && corpo_resposta_http_bruto == nullptr)) {
+    print_log("ERRO: resposta HTTP de " + String(tamanho_bruto) + " bytes nao foi lida.");
+  }
 
   if (httpCode != HTTP_CODE_OK && httpCode != HTTP_CODE_CREATED) {
     if (payloadOut != nullptr) {
       *payloadOut = payload;
     }
     imprimirStatusRequisicao(false, String("HTTP ") + String(httpCode));
-    Serial.print("Resposta: ");
-    Serial.println(payload);
+    // Serial.print("Resposta: ");
+    // Serial.println(payload);
     return false;
   }
 
@@ -3154,8 +3319,8 @@ bool postHttpNoMeio(bool usarWifi, const char *destino, const String &url, const
 
   imprimirStatusRequisicao(true, "");
   if (!requisicao_sem_log_de_sucesso) {
-    Serial.print("Resposta: ");
-    Serial.println(payload);
+    // Serial.print("Resposta: ");
+    // Serial.println(payload);
   }
   return true;
 }
@@ -3180,13 +3345,13 @@ bool executarPostHttp(const char *destino, const String &url, const String &body
     return true;
   }
 
-  Serial.println("ERRO: WiFi e cabo falharam. Requisicao nao enviada.");
+  // Serial.println("ERRO: WiFi e cabo falharam. Requisicao nao enviada.");
   return false;
 }
 
 bool atualizarStatusFila(long queueId, const char *actionStatus) {
   if (queueId <= 0) {
-    Serial.println("Sem queue_id para atualizar status da fila.");
+    // Serial.println("Sem queue_id para atualizar status da fila.");
     queueIdPendente = 0;
     return false;
   }
@@ -3196,11 +3361,11 @@ bool atualizarStatusFila(long queueId, const char *actionStatus) {
                 + "&queue_id=" + String(queueId)
                 + "&action_status=" + String(actionStatus);
 
-  Serial.println("-------- API FILA SAVE --------");
-  Serial.print("queue_id=");
-  Serial.print(queueId);
-  Serial.print(" action_status=");
-  Serial.println(actionStatus);
+  // Serial.println("-------- API FILA SAVE --------");
+  // Serial.print("queue_id=");
+  // Serial.print(queueId);
+  // Serial.print(" action_status=");
+  // Serial.println(actionStatus);
 
   bool ok = executarPostHttp("/plaque-queues-actions/save", url, body, 10000, nullptr);
   queueIdPendente = 0;
@@ -3309,6 +3474,16 @@ bool enviarEventoLog(const char *eventType, uint8_t numero_portao, const char *i
                                                                 identificador_usuario);
     print_log("Requisicao " + String(eventType) + " do portao " + String(numero_portao) + ": event_data " +
               dados_evento_texto + ".");
+  } else if (strcmp(eventType, "heartbeat") == 0) {
+    String ssid_heartbeat = "";
+    if (wifiConectado()) {
+      ssid_heartbeat = ssidWifiAssociadoAgora();
+      if (ssid_heartbeat.length() == 0) {
+        ssid_heartbeat = wifi_ssid;
+      }
+    }
+    dados_evento_texto = montaEventDataHeartbeat(tipoConexaoAtivaParaLog(), ssid_heartbeat);
+    titulo_evento_texto = "Heartbeat";
   } else if (numero_portao > 0) {
     dados_evento_texto = "{\"port\":" + String(numero_portao) + "}";
   }
@@ -3322,9 +3497,9 @@ bool enviarEventoLog(const char *eventType, uint8_t numero_portao, const char *i
     body += "&event_data=" + codificaTextoParaUrl(dados_evento_texto);
   }
 
-  Serial.println("-------- DEBUG EVENT LOG --------");
-  Serial.print("Evento: ");
-  Serial.println(eventType);
+  // Serial.println("-------- DEBUG EVENT LOG --------");
+  // Serial.print("Evento: ");
+  // Serial.println(eventType);
   if (numero_portao > 0) {
     print_log("Portao: " + String(numero_portao));
   }
@@ -3338,14 +3513,14 @@ bool enviarEventoLog(const char *eventType, uint8_t numero_portao, const char *i
   bool falta_internet = sem_rede || (!ok && !requisicao_http_obteve_resposta);
   if (!ok && falta_internet) {
     guardaLogEventoNaFilaLocal(eventType, dados_evento_texto, titulo_evento_texto);
-    Serial.println("--------------------------------");
+    // Serial.println("--------------------------------");
     return strcmp(eventType, "heartbeat") == 0 ? false : true;
   }
   if (ok && evento_gate_broken) {
     gate_broken_ja_enviado = true;
     momento_ultimo_gate_broken_enviado = millis();
   }
-  Serial.println("--------------------------------");
+  // Serial.println("--------------------------------");
   return ok;
 }
 
@@ -3373,9 +3548,9 @@ bool chamarApiListagem(String *payloadOut) {
 }
 
 bool processarResetPlaque(long queueId) {
-  Serial.println();
-  Serial.println("Evento reset_plaque recebido.");
-  Serial.println("Limpando configuracao WiFi da placa.");
+  // Serial.println();
+  // Serial.println("Evento reset_plaque recebido.");
+  // Serial.println("Limpando configuracao WiFi da placa.");
 
   if (queueId > 0 && queueId != ultimoQueueIdNotificado) {
     if (atualizarStatusFila(queueId, "completed")) {
@@ -4788,14 +4963,14 @@ bool buscarConfigWifiNaApi() {
   bool primeira_leitura_da_acao = queueId != ultimo_queue_id_exibido_no_log;
   ultimo_queue_id_exibido_no_log = queueId;
   if (primeira_leitura_da_acao) {
-    Serial.print("action_type recebido: ");
-    Serial.println(actionType.length() ? actionType : "(vazio)");
-    Serial.print("wifi_ssid recebido: ");
-    Serial.println(ssid.length() ? ssid : "(vazio)");
-    Serial.print("wifi_password: ");
-    Serial.println(password.length() ? "(preenchida)" : "(vazia)");
-    Serial.print("queue_id recebido: ");
-    Serial.println(queueId > 0 ? String(queueId) : "(vazio)");
+    // Serial.print("action_type recebido: ");
+    // Serial.println(actionType.length() ? actionType : "(vazio)");
+    // Serial.print("wifi_ssid recebido: ");
+    // Serial.println(ssid.length() ? ssid : "(vazio)");
+    // Serial.print("wifi_password: ");
+    // Serial.println(password.length() ? "(preenchida)" : "(vazia)");
+    // Serial.print("queue_id recebido: ");
+    // Serial.println(queueId > 0 ? String(queueId) : "(vazio)");
     String criado_em = extrairValorJsonString(payload, "created_at");
     if (criado_em.length() > 0) {
       print_log("created_at: " + criado_em);
@@ -4850,7 +5025,7 @@ bool buscarConfigWifiNaApi() {
   }
 
   if (ssid.length() == 0) {
-    Serial.println("Nenhuma configuracao WiFi encontrada na API.");
+    // Serial.println("Nenhuma configuracao WiFi encontrada na API.");
     if (confirmaConfiguracaoPeloCabo(queueId)) {
       return true;
     }
@@ -4862,7 +5037,7 @@ bool buscarConfigWifiNaApi() {
   }
 
   if (ssid == wifiSsidRejeitado && password == wifiPasswordRejeitado) {
-    Serial.println("Credenciais WiFi ja rejeitadas. Nao vou tentar de novo.");
+    // Serial.println("Credenciais WiFi ja rejeitadas. Nao vou tentar de novo.");
     if (confirmaConfiguracaoPeloCabo(queueId)) {
       return true;
     }
@@ -4876,7 +5051,7 @@ bool buscarConfigWifiNaApi() {
   bool mesmaConfig = wifi_ssid == ssid && wifi_password == password;
   if (mesmaConfig && setup_finished && !wifiCredenciaisPendentes) {
     if (primeira_leitura_da_acao) {
-      Serial.println("Configuracao WiFi da API igual a persistida.");
+      // Serial.println("Configuracao WiFi da API igual a persistida.");
     }
 
     if (queueId > 0 && queueId != ultimoQueueIdNotificado) {
@@ -4887,10 +5062,10 @@ bool buscarConfigWifiNaApi() {
     return true;
   }
 
-  Serial.println();
-  Serial.println("Nova configuracao WiFi recebida da API (config_plaque).");
-  Serial.print("SSID: ");
-  Serial.println(ssid);
+  // Serial.println();
+  // Serial.println("Nova configuracao WiFi recebida da API (config_plaque).");
+  // Serial.print("SSID: ");
+  // Serial.println(ssid);
 
   memorizaWifiAssociadoNoRadio();
   if (wifi_ssid_ultimo_online.length() == 0 && wifi_ssid.length() > 0 && wifi_password.length() > 0 &&
@@ -4937,10 +5112,10 @@ void falharConfigWifiRecebida() {
   wifiCredenciaisPendentes = false;
   momentoInicioConfigWifi = 0;
 
-  Serial.println();
-  Serial.println("Credenciais WiFi invalidas. PARANDO tentativas.");
-  Serial.print("SSID rejeitado: ");
-  Serial.println(wifiSsidRejeitado);
+  // Serial.println();
+  // Serial.println("Credenciais WiFi invalidas. PARANDO tentativas.");
+  // Serial.print("SSID rejeitado: ");
+  // Serial.println(wifiSsidRejeitado);
 
   if (queueId > 0 && !confirmaConfiguracaoPeloCabo(queueId) && queueId != ultimoQueueIdNotificado) {
     atualizarStatusFila(queueId, statusDaConfiguracaoQuandoWifiNaoSobe(false));
@@ -4961,8 +5136,8 @@ void falharConfigWifiRecebida() {
 
   if (wifiEstaConfigurado() &&
       !(wifi_ssid == wifiSsidRejeitado && wifi_password == wifiPasswordRejeitado)) {
-    Serial.print("Restaurando WiFi persistido: ");
-    Serial.println(wifi_ssid);
+    // Serial.print("Restaurando WiFi persistido: ");
+    // Serial.println(wifi_ssid);
     wifiConfigFalhou = false;
     ultimaTentativaWifi = 0;
     conectarWifi();
@@ -4972,7 +5147,7 @@ void falharConfigWifiRecebida() {
   wifi_ssid = "";
   wifi_password = "";
   setup_finished = false;
-  Serial.println("Sem WiFi valido. Voltando para cabo de rede.");
+  // Serial.println("Sem WiFi valido. Voltando para cabo de rede.");
   if (!ethIniciado) {
     iniciarEthernet();
   }
@@ -5043,9 +5218,9 @@ void conectarWifi() {
       momentoInicioConfigWifi = millis();
     }
 
-    Serial.println();
-    Serial.print("Tentando WiFi recebido do aplicativo: ");
-    Serial.println(wifi_ssid);
+    // Serial.println();
+    // Serial.print("Tentando WiFi recebido do aplicativo: ");
+    // Serial.println(wifi_ssid);
 
     wifi_persistido_ja_iniciado = true;
     WiFi.mode(WIFI_STA);
@@ -5064,9 +5239,9 @@ void conectarWifi() {
     wifi_persistido_ja_iniciado = true;
     ultimaTentativaWifi = millis();
 
-    Serial.println();
-    Serial.print("Conectando ao WiFi persistido: ");
-    Serial.println(wifi_ssid);
+    // Serial.println();
+    // Serial.print("Conectando ao WiFi persistido: ");
+    // Serial.println(wifi_ssid);
 
     WiFi.mode(WIFI_STA);
     configuraEstabilidadeWifiEsp32S3();
@@ -5383,7 +5558,7 @@ void verificarRede() {
       configuraEstabilidadeWifiEsp32S3();
       salvarConfigWifi();
       memorizaWifiQueDeixouOnline();
-      Serial.println("WiFi conectado. Credenciais persistidas.");
+      // Serial.println("WiFi conectado. Credenciais persistidas.");
       atualizarStatusFila(queueIdPendente, "completed");
       momentoInicioConfigWifi = 0;
       momento_perda_wifi = 0;
@@ -5437,9 +5612,9 @@ void verificarRede() {
   if (horaDoCiclo) {
     ultimoCicloApi = agora;
     cicloApiAssimQueRedeSubir = false;
-    Serial.println();
-    Serial.print("Ciclo API. Meio atual: ");
-    Serial.println(redeAtual());
+    // Serial.println();
+    // Serial.print("Ciclo API. Meio atual: ");
+    // Serial.println(redeAtual());
     if (!redeOk) {
       buscarConfigWifiNaApi();
     }
@@ -8250,6 +8425,36 @@ bool teste_user_id_abertura_fechamento() {
   return true;
 }
 
+// Confere o SSID no heartbeat e a leitura de um sync facial com objeto aninhado.
+bool teste_heartbeat_ssid_e_sync_facial() {
+  String heartbeat_wifi = montaEventDataHeartbeat("wifi", "Rede \"Boa\"");
+  String heartbeat_cabo = montaEventDataHeartbeat("ethernet", "");
+  if (heartbeat_wifi.indexOf("\"connection_type\":\"wifi\"") < 0 || heartbeat_wifi.indexOf("\"ssid\":\"Rede \\\"Boa\\\"\"") < 0 ||
+      heartbeat_cabo.indexOf("\"connection_type\":\"ethernet\"") < 0 || heartbeat_cabo.indexOf("\"ssid\":\"\"") < 0) {
+    print_log("teste_heartbeat_ssid_e_sync_facial: o heartbeat nao leva o meio e o SSID.");
+    return false;
+  }
+
+  String aninhado =
+      "{\"id\":10,\"usuario\":{\"apelido\":\"Ana\"},\"user_id\":42,\"facial_serial_id\":\"FAC-1001\","
+      "\"name\":\"Maria Silva\",\"image_base64\":\"YWI=\"}";
+  int fim = indiceFimObjetoJson(aninhado, 0);
+  ItemSincronizacaoFacial item;
+  if (fim != (int)aninhado.length() - 1 ||
+      !leItemSincronizacaoFacial(aninhado, 0, fim, item) || item.identificador_sync != "10" ||
+      item.identificador_usuario != "42" || item.serial_controladora != "FAC-1001" || item.nome_usuario != "Maria Silva" ||
+      !item.tem_foto || aninhado.substring(item.inicio_foto, item.fim_foto + 1) != "YWI=") {
+    print_log("teste_heartbeat_ssid_e_sync_facial: o sync com objeto aninhado perdeu a facial ou a foto.");
+    return false;
+  }
+  if (strcmp(caminho_cadastro_foto_controladora_facial, "/ISAPI/Intelligent/FDLib/FDSetUp?format=json") != 0 ||
+      strcmp(caminho_cadastro_foto_novo_controladora_facial, "/ISAPI/Intelligent/FDLib/FaceDataRecord?format=json") != 0) {
+    print_log("teste_heartbeat_ssid_e_sync_facial: a foto nao usa o cadastro ISAPI da Hikvision.");
+    return false;
+  }
+  return true;
+}
+
 bool teste_completo() {
   print_log("");
   print_log("======== TESTE COMPLETO ========");
@@ -8388,6 +8593,10 @@ bool teste_completo() {
   }
   if (!teste_comunicacao_api_wifi_e_fila_logs()) {
     print_log("FALHA: teste_comunicacao_api_wifi_e_fila_logs - URL, connection_type, last_wifi_config ou queue_logs incorretos.");
+    return false;
+  }
+  if (!teste_heartbeat_ssid_e_sync_facial()) {
+    print_log("FALHA: teste_heartbeat_ssid_e_sync_facial - heartbeat sem SSID ou sync facial aninhado incompleto.");
     return false;
   }
   if (!teste_user_id_abertura_fechamento()) {
@@ -8645,18 +8854,22 @@ bool interpretaSondagemControladoraFacial(const String &xml, String &serial, Str
 }
 
 // Campo de texto JSON entre limite_inicio e limite_fim, aceitando espaco depois dos dois pontos.
-String extraiTextoJsonControladoraFacial(const String &texto, const char *campo, int limite_inicio, int limite_fim) {
+String extraiTextoJsonControladoraFacial(const char *texto, int tamanho, const char *campo, int limite_inicio,
+                                         int limite_fim) {
+  if (texto == nullptr || campo == nullptr || tamanho <= 0) {
+    return "";
+  }
   if (limite_inicio < 0) {
     limite_inicio = 0;
   }
-  if (limite_fim < 0 || limite_fim >= (int)texto.length()) {
-    limite_fim = (int)texto.length() - 1;
+  if (limite_fim < 0 || limite_fim >= tamanho) {
+    limite_fim = tamanho - 1;
   }
   if (limite_fim < limite_inicio) {
     return "";
   }
   String padrao = String("\"") + campo + "\"";
-  int indice = texto.indexOf(padrao, limite_inicio);
+  int indice = indiceNoTexto(texto, tamanho, padrao.c_str(), limite_inicio);
   if (indice < 0 || indice > limite_fim) {
     return "";
   }
@@ -8693,16 +8906,25 @@ String extraiTextoJsonControladoraFacial(const String &texto, const char *campo,
   return valor;
 }
 
+// Campo de texto JSON entre limite_inicio e limite_fim, aceitando espaco depois dos dois pontos.
+String extraiTextoJsonControladoraFacial(const String &texto, const char *campo, int limite_inicio, int limite_fim) {
+  return extraiTextoJsonControladoraFacial(texto.c_str(), (int)texto.length(), campo, limite_inicio, limite_fim);
+}
+
 // Campo numerico JSON na faixa, sem aspas. Vazio quando o valor veio entre aspas.
-String extraiNumeroJsonControladoraFacial(const String &texto, const char *campo, int limite_inicio, int limite_fim) {
+String extraiNumeroJsonControladoraFacial(const char *texto, int tamanho, const char *campo, int limite_inicio,
+                                          int limite_fim) {
+  if (texto == nullptr || campo == nullptr || tamanho <= 0) {
+    return "";
+  }
   if (limite_inicio < 0) {
     limite_inicio = 0;
   }
-  if (limite_fim < 0 || limite_fim >= (int)texto.length()) {
-    limite_fim = (int)texto.length() - 1;
+  if (limite_fim < 0 || limite_fim >= tamanho) {
+    limite_fim = tamanho - 1;
   }
   String padrao = String("\"") + campo + "\"";
-  int indice = texto.indexOf(padrao, limite_inicio);
+  int indice = indiceNoTexto(texto, tamanho, padrao.c_str(), limite_inicio);
   if (indice < 0 || indice > limite_fim) {
     return "";
   }
@@ -8726,22 +8948,34 @@ String extraiNumeroJsonControladoraFacial(const String &texto, const char *campo
   if (fim == indice) {
     return "";
   }
-  return texto.substring(indice, fim);
+  String valor = "";
+  for (int cursor = indice; cursor < fim; cursor++) {
+    valor += texto[cursor];
+  }
+  return valor;
+}
+
+// Campo numerico JSON na faixa, sem aspas. Vazio quando o valor veio entre aspas.
+String extraiNumeroJsonControladoraFacial(const String &texto, const char *campo, int limite_inicio, int limite_fim) {
+  return extraiNumeroJsonControladoraFacial(texto.c_str(), (int)texto.length(), campo, limite_inicio, limite_fim);
 }
 
 // Marca o inicio e o fim (inclusive) do valor de um campo texto, sem copiar o conteudo.
-bool localizaTextoJsonControladoraFacial(const String &texto, const char *campo, int limite_inicio, int limite_fim,
-                                         int &inicio_valor, int &fim_valor) {
+bool localizaTextoJsonControladoraFacial(const char *texto, int tamanho, const char *campo, int limite_inicio,
+                                         int limite_fim, int &inicio_valor, int &fim_valor) {
   inicio_valor = 0;
   fim_valor = -1;
+  if (texto == nullptr || campo == nullptr || tamanho <= 0) {
+    return false;
+  }
   if (limite_inicio < 0) {
     limite_inicio = 0;
   }
-  if (limite_fim < 0 || limite_fim >= (int)texto.length()) {
-    limite_fim = (int)texto.length() - 1;
+  if (limite_fim < 0 || limite_fim >= tamanho) {
+    limite_fim = tamanho - 1;
   }
   String padrao = String("\"") + campo + "\"";
-  int indice = texto.indexOf(padrao, limite_inicio);
+  int indice = indiceNoTexto(texto, tamanho, padrao.c_str(), limite_inicio);
   if (indice < 0 || indice > limite_fim) {
     return false;
   }
@@ -8775,6 +9009,13 @@ bool localizaTextoJsonControladoraFacial(const String &texto, const char *campo,
     indice++;
   }
   return false;
+}
+
+// Marca o inicio e o fim (inclusive) do valor de um campo texto, sem copiar o conteudo.
+bool localizaTextoJsonControladoraFacial(const String &texto, const char *campo, int limite_inicio, int limite_fim,
+                                         int &inicio_valor, int &fim_valor) {
+  return localizaTextoJsonControladoraFacial(texto.c_str(), (int)texto.length(), campo, limite_inicio, limite_fim,
+                                             inicio_valor, fim_valor);
 }
 
 // Quantidade de controladoras no JSON da Preferences.
@@ -8918,10 +9159,11 @@ String montaCorpoDescobertaControladoraFacial(const String &serial_da_placa, con
          escapaTextoJson(modelo) + "\",\"facial_firmware\":\"" + escapaTextoJson(firmware) + "\"}";
 }
 
-// Corpo de POST /api/v1/facials/syncs/list. A fila e da placa: serial_id e quantity.
+// Corpo de POST /api/v1/facials/syncs/list. A fila e da placa: serial_id, quantity e os pending.
 String montaCorpoListaSincronizacoesFaciais(const String &serial_da_placa) {
   return "{\"internal_token\":\"" + escapaTextoJson(api_token) + "\",\"serial_id\":\"" + escapaTextoJson(serial_da_placa) +
-         "\",\"quantity\":" + String(quantidade_sincronizacoes_faciais_por_consulta) + "}";
+         "\",\"quantity\":" + String(quantidade_sincronizacoes_faciais_por_consulta) + ",\"quantidade\":" +
+         String(quantidade_sincronizacoes_faciais_por_consulta) + ",\"status\":\"pending\"}";
 }
 
 // Corpo de POST /api/v1/facials/syncs/update. ids separados por virgula.
@@ -9094,18 +9336,19 @@ void liberaMemoriaControladoraFacial(void *ponteiro) {
 }
 
 // Decodifica base64 entre inicio e fim, inclusive. Aceita data URI. Recusa foto acima de 200 KB.
-bool decodificaBase64ControladoraFacial(const String &texto, int inicio, int fim, uint8_t **saida, size_t *tamanho) {
-  if (saida == nullptr || tamanho == nullptr) {
+bool decodificaBase64ControladoraFacial(const char *texto, int tamanho_texto, int inicio, int fim, uint8_t **saida,
+                                        size_t *tamanho) {
+  if (saida == nullptr || tamanho == nullptr || texto == nullptr) {
     return false;
   }
   *saida = nullptr;
   *tamanho = 0;
-  if (inicio < 0 || fim < inicio || fim >= (int)texto.length()) {
+  if (inicio < 0 || fim < inicio || fim >= tamanho_texto) {
     return false;
   }
   if (fim - inicio >= 5 && texto[inicio] == 'd' && texto[inicio + 1] == 'a' && texto[inicio + 2] == 't' &&
       texto[inicio + 3] == 'a' && texto[inicio + 4] == ':') {
-    int virgula = texto.indexOf(',', inicio);
+    int virgula = indiceNoTexto(texto, tamanho_texto, ",", inicio);
     if (virgula < 0 || virgula > fim) {
       return false;
     }
@@ -9167,6 +9410,11 @@ bool decodificaBase64ControladoraFacial(const String &texto, int inicio, int fim
   *saida = buffer;
   *tamanho = escrito;
   return true;
+}
+
+// Decodifica base64 de uma String. A leitura grande usa o ponteiro para nao copiar a foto.
+bool decodificaBase64ControladoraFacial(const String &texto, int inicio, int fim, uint8_t **saida, size_t *tamanho) {
+  return decodificaBase64ControladoraFacial(texto.c_str(), (int)texto.length(), inicio, fim, saida, tamanho);
 }
 
 // Valor de um parametro do cabecalho WWW-Authenticate, com ou sem aspas.
@@ -9478,6 +9726,7 @@ bool enviaHttpControladoraFacial(const String &endereco_ip, const String &porta_
                                  String &resposta, const String &meio = "") {
   resposta = "";
   if (!selecionaRedeDaControladoraFacial(endereco_ip, meio)) {
+    retorno_ultima_requisicao_controladora_facial = "sem rede para alcancar a facial";
     print_log("ERRO: sem rede para alcancar a controladora facial " + endereco_ip + ".");
     aplicarRotaDeRede();
     return false;
@@ -9493,6 +9742,7 @@ bool enviaHttpControladoraFacial(const String &endereco_ip, const String &porta_
   }
   if (!(strcmp(metodo, "GET") == 0 && strcmp(caminho, caminho_desafio_controladora_facial) == 0)) {
     if (!garanteDesafioDigestControladoraFacial(endereco_ip, porta_http)) {
+      retorno_ultima_requisicao_controladora_facial = "a facial nao entregou o desafio de autenticacao";
       aplicarRotaDeRede();
       return false;
     }
@@ -9514,20 +9764,27 @@ bool enviaHttpControladoraFacial(const String &endereco_ip, const String &porta_
   }
   aplicarRotaDeRede();
   resposta = corpo_resposta;
+  retorno_ultima_requisicao_controladora_facial =
+      "HTTP " + String(codigo_http) + " " + resumeRespostaControladoraFacial(corpo_resposta);
   if (!enviou) {
+    if (retorno_ultima_requisicao_controladora_facial.length() < 8) {
+      retorno_ultima_requisicao_controladora_facial = "sem resposta da facial";
+    }
     return false;
   }
   return respostaControladoraFacialIndicaSucesso(codigo_http, corpo_resposta);
 }
 
-// Se o user_id ja existe, atualiza somente a face. Senao cria o usuario e envia a foto.
+// Se o user_id ja existe, substitui a face. Senao cria o usuario e envia a foto.
+// A foto chega em base64 e vai no multipart da ISAPI, que e o formato da Hikvision.
 // texto_erro recebe o retorno da facial quando a operacao nao conclui.
 bool enviaUsuarioEFotoParaControladoraFacial(const String &endereco_ip, const String &porta_http,
                                             const String &identificador_usuario, const String &nome_usuario,
-                                            const String &email_usuario, const String &texto_foto, int inicio_foto,
-                                            int fim_foto, const String &tipo_mime, const String &meio,
+                                            const String &email_usuario, const char *texto_foto, int tamanho_texto_foto,
+                                            int inicio_foto, int fim_foto, const String &tipo_mime, const String &meio,
                                             String &texto_erro) {
   texto_erro = "";
+  retorno_ultima_requisicao_controladora_facial = "";
   String resposta = "";
   bool somente_face = false;
   String corpo_busca = montaCorpoBuscaUsuarioControladoraFacial(identificador_usuario);
@@ -9538,7 +9795,7 @@ bool enviaUsuarioEFotoParaControladoraFacial(const String &endereco_ip, const St
                                   tipo_conteudo_json, (uint8_t *)corpo_busca.c_str(), corpo_busca.length(), resposta, meio);
   if (busca_concluida && respostaBuscaUsuarioIndicaExistente(resposta)) {
     somente_face = true;
-    print_log("Status do usuario " + identificador_usuario + " na facial: ja existe. Atualizando somente a face.");
+    print_log("Status do usuario " + identificador_usuario + " na facial: ja existe. A face sera substituida.");
   }
   if (!somente_face) {
     String corpo_usuario = montaCorpoUsuarioControladoraFacial(identificador_usuario, nome_usuario, email_usuario);
@@ -9548,9 +9805,12 @@ bool enviaUsuarioEFotoParaControladoraFacial(const String &endereco_ip, const St
                                              resposta, meio);
     if (!criou) {
       if (resposta.indexOf("employeeNoAlreadyExist") >= 0) {
-        print_log("Status do usuario " + identificador_usuario + " na facial: ja existe. Atualizando somente a face.");
+        print_log("Status do usuario " + identificador_usuario + " na facial: ja existe. A face sera substituida.");
       } else {
-        texto_erro = resumeRespostaControladoraFacial(resposta);
+        texto_erro = retorno_ultima_requisicao_controladora_facial;
+        if (texto_erro.length() == 0) {
+          texto_erro = resumeRespostaControladoraFacial(resposta);
+        }
         if (texto_erro.length() == 0) {
           texto_erro = "sem resposta da facial ao cadastrar o usuario";
         }
@@ -9562,8 +9822,9 @@ bool enviaUsuarioEFotoParaControladoraFacial(const String &endereco_ip, const St
 
   uint8_t *foto = nullptr;
   size_t tamanho_foto = 0;
-  if (!decodificaBase64ControladoraFacial(texto_foto, inicio_foto, fim_foto, &foto, &tamanho_foto)) {
+  if (!decodificaBase64ControladoraFacial(texto_foto, tamanho_texto_foto, inicio_foto, fim_foto, &foto, &tamanho_foto)) {
     texto_erro = "foto da sincronizacao invalida";
+    retorno_ultima_requisicao_controladora_facial = texto_erro;
     print_log("Status da foto do usuario " + identificador_usuario + " na facial: " + texto_erro + ".");
     return false;
   }
@@ -9595,6 +9856,7 @@ bool enviaUsuarioEFotoParaControladoraFacial(const String &endereco_ip, const St
     liberaMemoriaControladoraFacial(foto);
     print_log("ERRO: sem memoria para enviar a foto do usuario " + identificador_usuario + ".");
     texto_erro = "sem memoria para enviar a foto";
+    retorno_ultima_requisicao_controladora_facial = texto_erro;
     return false;
   }
   memcpy(pacote, cabecalho_foto.c_str(), cabecalho_foto.length());
@@ -9606,16 +9868,27 @@ bool enviaUsuarioEFotoParaControladoraFacial(const String &endereco_ip, const St
   print_log("Enviando foto do usuario " + identificador_usuario + " para a controladora facial " + endereco_ip + ".");
   bool foto_aceita = enviaHttpControladoraFacial(endereco_ip, porta_http, "PUT", caminho_cadastro_foto_controladora_facial,
                                                  tipo_conteudo_foto.c_str(), pacote, total, resposta, meio);
+  if (!foto_aceita) {
+    print_log("Retorno do FDSetUp na facial " + endereco_ip + ": " + retorno_ultima_requisicao_controladora_facial);
+    print_log("Nova tentativa de cadastro da face pela rota FaceDataRecord.");
+    foto_aceita = enviaHttpControladoraFacial(endereco_ip, porta_http, "POST",
+                                              caminho_cadastro_foto_novo_controladora_facial, tipo_conteudo_foto.c_str(),
+                                              pacote, total, resposta, meio);
+  }
   liberaMemoriaControladoraFacial(pacote);
   if (!foto_aceita) {
-    texto_erro = resumeRespostaControladoraFacial(resposta);
+    texto_erro = retorno_ultima_requisicao_controladora_facial;
+    if (texto_erro.length() == 0) {
+      texto_erro = resumeRespostaControladoraFacial(resposta);
+    }
     if (texto_erro.length() == 0) {
       texto_erro = "sem resposta da facial ao gravar a face";
     }
     print_log("Status da face do usuario " + identificador_usuario + " na facial: erro. " + texto_erro);
     return false;
   }
-  print_log("Status da face do usuario " + identificador_usuario + " na facial: aceita.");
+  print_log("Status da face do usuario " + identificador_usuario + " na facial: aceita. " +
+            retorno_ultima_requisicao_controladora_facial);
   return true;
 }
 
@@ -9980,28 +10253,34 @@ void enviaDescobertasControladorasFaciaisPendentes() {
 }
 
 // Le um objeto da lista pending. O nome preferido e name; user_name so entra se name vier vazio.
-bool leItemSincronizacaoFacial(const String &texto, int abre, int fecha, ItemSincronizacaoFacial &item) {
-  item.identificador_sync = extraiNumeroJsonControladoraFacial(texto, "id", abre, fecha);
+bool leItemSincronizacaoFacial(const char *texto, int tamanho, int abre, int fecha, ItemSincronizacaoFacial &item) {
+  item.identificador_sync = extraiNumeroJsonControladoraFacial(texto, tamanho, "id", abre, fecha);
   if (item.identificador_sync.length() == 0) {
-    item.identificador_sync = extraiTextoJsonControladoraFacial(texto, "id", abre, fecha);
+    item.identificador_sync = extraiTextoJsonControladoraFacial(texto, tamanho, "id", abre, fecha);
   }
-  item.identificador_usuario = extraiNumeroJsonControladoraFacial(texto, "user_id", abre, fecha);
+  item.identificador_usuario = extraiNumeroJsonControladoraFacial(texto, tamanho, "user_id", abre, fecha);
   if (item.identificador_usuario.length() == 0) {
-    item.identificador_usuario = extraiTextoJsonControladoraFacial(texto, "user_id", abre, fecha);
+    item.identificador_usuario = extraiTextoJsonControladoraFacial(texto, tamanho, "user_id", abre, fecha);
   }
-  item.serial_controladora = extraiTextoJsonControladoraFacial(texto, "facial_serial_id", abre, fecha);
-  item.nome_usuario = extraiTextoJsonControladoraFacial(texto, "name", abre, fecha);
+  item.serial_controladora = extraiTextoJsonControladoraFacial(texto, tamanho, "facial_serial_id", abre, fecha);
+  item.nome_usuario = extraiTextoJsonControladoraFacial(texto, tamanho, "name", abre, fecha);
   if (item.nome_usuario.length() == 0) {
-    item.nome_usuario = extraiTextoJsonControladoraFacial(texto, "user_name", abre, fecha);
+    item.nome_usuario = extraiTextoJsonControladoraFacial(texto, tamanho, "user_name", abre, fecha);
   }
-  item.email_usuario = extraiTextoJsonControladoraFacial(texto, "user_email", abre, fecha);
-  item.tipo_mime = extraiTextoJsonControladoraFacial(texto, "mime_type", abre, fecha);
+  item.email_usuario = extraiTextoJsonControladoraFacial(texto, tamanho, "user_email", abre, fecha);
+  item.tipo_mime = extraiTextoJsonControladoraFacial(texto, tamanho, "mime_type", abre, fecha);
   item.inicio_foto = 0;
   item.fim_foto = 0;
-  item.tem_foto = localizaTextoJsonControladoraFacial(texto, "image_base64", abre, fecha, item.inicio_foto, item.fim_foto) &&
+  item.tem_foto = localizaTextoJsonControladoraFacial(texto, tamanho, "image_base64", abre, fecha, item.inicio_foto,
+                                                      item.fim_foto) &&
                   item.fim_foto >= item.inicio_foto;
   return item.identificador_sync.length() > 0 && item.identificador_usuario.length() > 0 &&
          item.serial_controladora.length() > 0;
+}
+
+// Le um objeto da lista pending a partir de uma String.
+bool leItemSincronizacaoFacial(const String &texto, int abre, int fecha, ItemSincronizacaoFacial &item) {
+  return leItemSincronizacaoFacial(texto.c_str(), (int)texto.length(), abre, fecha, item);
 }
 
 // POST /facials/syncs/update de um id. A rota marca o id como sincronizado.
@@ -10022,59 +10301,83 @@ bool confirmaSincronizacaoFacialNaApi(const String &identificador_sync) {
 
 // A cada ciclo: lista os pending, envia cada um ao leitor do facial_serial_id e confirma o retorno da facial.
 void sincronizaFotosFaciaisPendentes() {
+  liberaCorpoRespostaHttpBruto();
   String url = api_url + rota_lista_sincronizacoes_faciais;
   String corpo = montaCorpoListaSincronizacoesFaciais(serial_placa);
   String resposta = "";
   bool silencioso = requisicao_sem_log_de_sucesso;
   requisicao_sem_log_de_sucesso = true;
+  guardar_corpo_resposta_http_bruto = true;
   print_log("Consultando sincronizacoes faciais pendentes da placa " + serial_placa + ".");
   bool listou = executarPostHttp(rota_lista_sincronizacoes_faciais, url, corpo, 20000, &resposta, tipo_conteudo_json);
+  guardar_corpo_resposta_http_bruto = false;
   requisicao_sem_log_de_sucesso = silencioso;
-  if (!listou || respostaPortguardIndicaErro(resposta)) {
-    String trecho = resposta.length() > 180 ? resposta.substring(0, 180) : resposta;
-    print_log("ERRO: nao foi possivel listar as sincronizacoes faciais. " + trecho);
+
+  const char *fonte = nullptr;
+  int tamanho_fonte = 0;
+  if (corpo_resposta_http_bruto != nullptr && tamanho_corpo_resposta_http_bruto > 0) {
+    fonte = corpo_resposta_http_bruto;
+    tamanho_fonte = tamanho_corpo_resposta_http_bruto;
+  } else if (resposta.length() > 0) {
+    fonte = resposta.c_str();
+    tamanho_fonte = (int)resposta.length();
+  }
+
+  String prefixo_resposta = "";
+  int limite_prefixo = tamanho_fonte < 180 ? tamanho_fonte : 180;
+  for (int indice = 0; indice < limite_prefixo; indice++) {
+    prefixo_resposta += fonte[indice];
+  }
+  if (!listou || fonte == nullptr || respostaPortguardIndicaErro(prefixo_resposta)) {
+    print_log("ERRO: nao foi possivel listar as sincronizacoes faciais. " + prefixo_resposta);
+    liberaCorpoRespostaHttpBruto();
     return;
   }
 
-  int fim_resposta = resposta.length() == 0 ? 0 : (int)resposta.length() - 1;
-  String total = extraiNumeroJsonControladoraFacial(resposta, "total", 0, fim_resposta);
+  int fim_resposta = tamanho_fonte == 0 ? 0 : tamanho_fonte - 1;
+  String total = extraiNumeroJsonControladoraFacial(fonte, tamanho_fonte, "total", 0, fim_resposta);
   print_log("Sincronizacoes faciais pendentes na API: " + (total.length() > 0 ? total : String("0")) + " (" +
-            String(resposta.length()) + " bytes).");
+            String(tamanho_fonte) + " bytes).");
 
-  int cursor_lista = resposta.indexOf("\"list\"");
-  int abre_lista = cursor_lista < 0 ? -1 : resposta.indexOf('[', cursor_lista);
+  int cursor_lista = indiceNoTexto(fonte, tamanho_fonte, "\"list\"", 0);
+  int abre_lista = cursor_lista < 0 ? -1 : indiceNoTexto(fonte, tamanho_fonte, "[", cursor_lista);
   if (abre_lista < 0) {
     print_log("Nenhuma sincronizacao facial pendente.");
+    liberaCorpoRespostaHttpBruto();
     return;
   }
 
   int cursor = abre_lista + 1;
   int quantidade = 0;
   while (quantidade < quantidade_sincronizacoes_faciais_por_consulta) {
-    int abre = resposta.indexOf('{', cursor);
+    int abre = indiceNoTexto(fonte, tamanho_fonte, "{", cursor);
     if (abre < 0) {
       break;
     }
-    int fecha = indiceFimObjetoJson(resposta, abre);
+    int fecha = indiceFimObjetoJson(fonte, tamanho_fonte, abre);
     if (fecha < 0) {
+      print_log("Sync facial recebido com resposta incompleta. Nenhum cadastro foi enviado a facial.");
       break;
     }
     cursor = fecha + 1;
     quantidade++;
 
     ItemSincronizacaoFacial item;
-    if (!leItemSincronizacaoFacial(resposta, abre, fecha, item)) {
+    if (!leItemSincronizacaoFacial(fonte, tamanho_fonte, abre, fecha, item)) {
       print_log("-------- SYNC FACIAL --------");
-      print_log("Sync encontrado incompleto. Registro mantido pendente.");
+      print_log("Sync facial recebido incompleto. Registro mantido pendente.");
       print_log("-----------------------------");
       continue;
     }
     print_log("-------- SYNC FACIAL --------");
-    print_log("Sync encontrado id=" + item.identificador_sync + " usuario=" + item.identificador_usuario + " nome=" +
-              item.nome_usuario + " email=" + item.email_usuario + " facial=" + item.serial_controladora + ".");
+    print_log("Sync facial recebido. id=" + item.identificador_sync + " usuario=" + item.identificador_usuario +
+              " nome=" + item.nome_usuario + " email=" + item.email_usuario + ".");
+    print_log("Sincronizacao facial " + item.identificador_sync + " sera tentada na facial " + item.serial_controladora +
+              ".");
     if (!item.tem_foto) {
       String erro_foto = "sincronizacao sem foto";
-      print_log("Status do sync " + item.identificador_sync + " na facial: " + erro_foto + ".");
+      print_log("Retorno da tentativa de sync facial " + item.identificador_sync + " na facial " +
+                item.serial_controladora + ": " + erro_foto + ".");
       String json_erro = montaJsonErroSincronizacaoFacial(item.identificador_sync, item.identificador_usuario,
                                                          item.serial_controladora, erro_foto);
       enviarEventoLog(tipo_evento_erro_sincronizacao_facial, 0, nullptr, json_erro.c_str(), "Erro de sincronizacao facial");
@@ -10092,7 +10395,8 @@ void sincronizaFotosFaciaisPendentes() {
     if (!leControladoraFacialNoJson(json_controladoras_faciais, item.serial_controladora, endereco_ip, porta_http, modelo,
                                     firmware, enviada, meio)) {
       String erro_leitor = "leitor " + item.serial_controladora + " ainda nao encontrado na rede";
-      print_log("Status do sync " + item.identificador_sync + " na facial: " + erro_leitor + ".");
+      print_log("Retorno da tentativa de sync facial " + item.identificador_sync + " na facial " +
+                item.serial_controladora + ": " + erro_leitor + ".");
       String json_erro = montaJsonErroSincronizacaoFacial(item.identificador_sync, item.identificador_usuario,
                                                          item.serial_controladora, erro_leitor);
       enviarEventoLog(tipo_evento_erro_sincronizacao_facial, 0, nullptr, json_erro.c_str(), "Erro de sincronizacao facial");
@@ -10100,20 +10404,25 @@ void sincronizaFotosFaciaisPendentes() {
       print_log("-----------------------------");
       continue;
     }
-    print_log("Sync " + item.identificador_sync + " vai para " + endereco_ip + " pelo " +
-              (meio.length() > 0 ? meio : String("rede disponivel")) + ".");
+    print_log("Sincronizacao facial " + item.identificador_sync + " sera tentada na facial " + item.serial_controladora +
+              " no IP " + endereco_ip + " pelo " + (meio.length() > 0 ? meio : String("rede disponivel")) + ".");
     String erro_facial = "";
-    if (enviaUsuarioEFotoParaControladoraFacial(endereco_ip, porta_http, item.identificador_usuario, item.nome_usuario,
-                                               item.email_usuario, resposta, item.inicio_foto, item.fim_foto,
-                                               item.tipo_mime, meio, erro_facial)) {
-      print_log("Status do sync " + item.identificador_sync + " na facial: aceito.");
+    bool aceito = enviaUsuarioEFotoParaControladoraFacial(
+        endereco_ip, porta_http, item.identificador_usuario, item.nome_usuario, item.email_usuario, fonte, tamanho_fonte,
+        item.inicio_foto, item.fim_foto, item.tipo_mime, meio, erro_facial);
+    String retorno = retorno_ultima_requisicao_controladora_facial;
+    if (retorno.length() == 0) {
+      retorno = aceito ? String("aceito") : erro_facial;
+    }
+    print_log("Retorno da tentativa de sync facial " + item.identificador_sync + " na facial " + item.serial_controladora +
+              ": " + retorno + ".");
+    if (aceito) {
       if (confirmaSincronizacaoFacialNaApi(item.identificador_sync)) {
         print_log("Status do sync " + item.identificador_sync + " na API: marcado como sincronizado.");
       } else {
         print_log("Status do sync " + item.identificador_sync + " na API: a facial aceitou, mas a confirmacao falhou.");
       }
     } else {
-      print_log("Status do sync " + item.identificador_sync + " na facial: erro. " + erro_facial);
       String json_erro = montaJsonErroSincronizacaoFacial(item.identificador_sync, item.identificador_usuario,
                                                          item.serial_controladora, erro_facial);
       enviarEventoLog(tipo_evento_erro_sincronizacao_facial, 0, nullptr, json_erro.c_str(), "Erro de sincronizacao facial");
@@ -10126,6 +10435,7 @@ void sincronizaFotosFaciaisPendentes() {
   if (quantidade == 0) {
     print_log("Nenhuma sincronizacao facial pendente.");
   }
+  liberaCorpoRespostaHttpBruto();
 }
 
 // A cada 10 s: sonda a rede, avisa a API dos leitores novos e sincroniza ate 5 fotos pendentes.
@@ -10161,7 +10471,8 @@ bool teste_controladoras_faciais_hikvision() {
   if (sucesso && (strlen(usuario_controladora_facial_hikvision) == 0 || strlen(senha_controladora_facial_hikvision) == 0 ||
                   strcmp(caminho_busca_usuario_controladora_facial, "/ISAPI/AccessControl/UserInfo/Search?format=json") != 0 ||
                   strcmp(caminho_criacao_usuario_controladora_facial, "/ISAPI/AccessControl/UserInfo/Record?format=json") != 0 ||
-                  strcmp(caminho_cadastro_foto_controladora_facial, "/ISAPI/Intelligent/FDLib/FDSetUp?format=json") != 0)) {
+                  strcmp(caminho_cadastro_foto_controladora_facial, "/ISAPI/Intelligent/FDLib/FDSetUp?format=json") != 0 ||
+                  strcmp(caminho_cadastro_foto_novo_controladora_facial, "/ISAPI/Intelligent/FDLib/FaceDataRecord?format=json") != 0)) {
     print_log("teste_controladoras_faciais_hikvision: rota ISAPI ou credencial da controladora vazia.");
     sucesso = false;
   }
@@ -10313,7 +10624,7 @@ bool teste_controladoras_faciais_hikvision() {
   }
   String corpo_lista = montaCorpoListaSincronizacoesFaciais("3port-9SCMGWLVEX8J");
   if (sucesso && (corpo_lista != "{\"internal_token\":\"" + api_token +
-                                   "\",\"serial_id\":\"3port-9SCMGWLVEX8J\",\"quantity\":5}")) {
+                                   "\",\"serial_id\":\"3port-9SCMGWLVEX8J\",\"quantity\":5,\"quantidade\":5,\"status\":\"pending\"}")) {
     print_log("teste_controladoras_faciais_hikvision: /facials/syncs/list nao pede o serial da placa e quantity 5.");
     sucesso = false;
   }
@@ -10542,15 +10853,15 @@ void setup() {
   iniciarEthernet();
 
   if (wifiEstaConfigurado()) {
-    Serial.println();
-    Serial.print("Modo de conexao: WIFI (");
-    Serial.print(wifi_ssid);
-    Serial.println("), cabo como fallback.");
+    // Serial.println();
+    // Serial.print("Modo de conexao: WIFI (");
+    // Serial.print(wifi_ssid);
+    // Serial.println("), cabo como fallback.");
     conectarWifi();
   } else {
-    Serial.println();
-    Serial.println("Modo de conexao: CABO DE REDE");
-    Serial.println("WiFi ainda nao persistido na Preferences.");
+    // Serial.println();
+    // Serial.println("Modo de conexao: CABO DE REDE");
+    // Serial.println("WiFi ainda nao persistido na Preferences.");
   }
 
   print_log("");
